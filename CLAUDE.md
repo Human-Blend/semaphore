@@ -42,6 +42,22 @@ backend is an encrypted shared folder (SMB) — there is no server. Read
 
 Private channels · message-content search · screen-share audio · blob dedup ·
 DM forward-secrecy prekeys · day-bundle compaction for multi-month cold starts
-· beam transfers over RTCDataChannel (currently folder-only) · bundled GIF
-pack content (`resources/gifs-starter/manifest.json` format: array of
-`{id, category, url, w, h}` — picker + `gifs:packList` already consume it).
+· beam transfers over RTCDataChannel (currently folder-only) · online GIF
+search (needs a Giphy/Tenor key; the bundled pack is the offline path).
+
+## GIF pack
+
+`node scripts/fetch-gif-pack.mjs` refreshes `resources/gifs-starter/` from
+Google's Noto Animated Emoji (CC BY 4.0, committed so builds work offline).
+Files over 1.2 MB are skipped — they render at ~160px. The renderer loads them
+over the `sfgif://pack/<id>.gif` protocol (`src/main/services/gifProtocol.ts`);
+a pack GIF is sent as its `packId`, so it costs zero shared-folder I/O.
+
+## macOS screen-recording permission
+
+Never check `getMediaAccessStatus('screen')` *before* attempting a capture:
+macOS only lists an app under Privacy → Screen Recording once it has tried,
+so checking-then-bailing sends people to a pane where Semaphore isn't listed.
+`scripts/after-pack.mjs` strips electron-builder's boilerplate Camera /
+Microphone / Audio / Bluetooth usage strings for the same reason — they made
+the app show up under Microphone and nowhere else.

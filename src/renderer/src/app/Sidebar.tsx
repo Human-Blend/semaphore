@@ -274,6 +274,57 @@ function StatusPopover({
   )
 }
 
+/**
+ * Team name + share health. Lives inside the sidebar (spec §2.2) rather than
+ * in the titlebar strip, so it can never collide with the macOS traffic
+ * lights regardless of how the OS insets them.
+ */
+function TeamBlock() {
+  const boot = useStore((s) => s.boot)
+  const health = useStore((s) => s.health)
+  const self = selfOf(boot)
+  const slow = health.reachable && health.latencyMs !== null && health.latencyMs >= 500
+  const color = !health.reachable ? 'var(--danger)' : slow ? 'var(--warning)' : 'var(--success)'
+  const label = !health.reachable
+    ? 'Share unreachable'
+    : slow
+      ? `Share slow · ${health.latencyMs}ms`
+      : `Share connected${health.latencyMs !== null ? ` · ${health.latencyMs}ms` : ''}`
+
+  return (
+    <div
+      style={{
+        height: 52,
+        flexShrink: 0,
+        display: 'flex',
+        flexDirection: 'column',
+        justifyContent: 'center',
+        gap: 2,
+        padding: '0 12px 0 16px',
+        minWidth: 0,
+        userSelect: 'none',
+      }}
+    >
+      <span style={{ ...truncate, fontSize: 15, fontWeight: 600, color: 'var(--text-1)' }}>
+        {self?.teamName ?? 'Semaphore'}
+      </span>
+      <span
+        title={
+          !health.reachable
+            ? 'The team folder cannot be reached right now. Messages queue on this machine.'
+            : slow
+              ? 'The share is responding slowly — messages may take a few seconds to appear.'
+              : 'Connected to the team folder.'
+        }
+        style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-3)', minWidth: 0 }}
+      >
+        <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }} />
+        <span style={truncate}>{label}</span>
+      </span>
+    </div>
+  )
+}
+
 export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
   const channels = useStore((s) => s.channels)
   const presence = useStore((s) => s.presence)
@@ -334,6 +385,7 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
         minHeight: 0,
       }}
     >
+      <TeamBlock />
       <QuickSwitcher />
 
       <div className="sem-scroll" style={{ flex: 1, minHeight: 0, padding: '4px 8px 8px' }}>

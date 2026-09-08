@@ -23,6 +23,7 @@ const bridge: BridgeApi = {
     getBoot: () => invoke('app:getBoot'),
     unlock: (passphrase) => invoke('app:unlock', passphrase),
     changeTeamFolder: () => invoke('app:changeTeamFolder'),
+    relaunch: () => invoke('app:relaunch'),
     openExternal: (url) => invoke('app:openExternal', url),
     copyText: (text) => invoke('app:copyText', text),
     showInFolder: (path) => invoke('app:showInFolder', path),

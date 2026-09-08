@@ -12,6 +12,7 @@ files:
 extraResources:
   - from: resources/
     to: .
+afterPack: scripts/after-pack.mjs
 asar: true
 npmRebuild: false
 nodeGypRebuild: false
@@ -32,6 +33,4 @@ mac:
   identity: '-' # explicit ad-hoc signature: arm64 kernel refuses unsigned code
   hardenedRuntime: false # hardened runtime without a real cert can prevent launch
   gatekeeperAssess: false
-  extendInfo:
-    NSMicrophoneUsageDescription: 'Semaphore uses the microphone for screen-share audio.'
   artifactName: Semaphore-${version}-mac-${arch}.zip

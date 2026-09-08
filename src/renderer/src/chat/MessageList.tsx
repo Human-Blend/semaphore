@@ -28,7 +28,6 @@ interface Props {
   loaded: boolean
   selfId: string
   anchorRead: string
-  label: string
   editingId: string | null
   chipOf: (device: string) => ChipData
   nameOf: (device: string) => string
@@ -36,7 +35,6 @@ interface Props {
   onReply: (id: string) => void
   onEditStart: (id: string) => void
   onEditDone: () => void
-  onSeed: (text: string) => void
 }
 
 export function MessageList({
@@ -45,7 +43,6 @@ export function MessageList({
   loaded,
   selfId,
   anchorRead,
-  label,
   editingId,
   chipOf,
   nameOf,
@@ -53,7 +50,6 @@ export function MessageList({
   onReply,
   onEditStart,
   onEditDone,
-  onSeed,
 }: Props) {
   const virtuosoRef = useRef<VirtuosoHandle>(null)
   const seenRef = useRef<Set<string>>(new Set())
@@ -199,7 +195,9 @@ export function MessageList({
   )
 
   if (!loaded && items.length === 0) return <SkeletonRows />
-  if (loaded && items.length === 0) return <EmptyState conv={conv} label={label} onSeed={onSeed} />
+  // The empty conversation state is rendered once by EmptyConvOverlay (shell),
+  // layered over this pane so the composer stays reachable underneath.
+  if (loaded && items.length === 0) return null
 
   return (
     <div style={{ position: 'absolute', inset: 0 }}>
@@ -314,49 +312,3 @@ function SkeletonRows() {
   )
 }
 
-function EmptyState({ conv, label, onSeed }: { conv: ConvId; label: string; onSeed: (text: string) => void }) {
-  const isDm = conv.startsWith('dm:')
-  return (
-    <div
-      style={{
-        position: 'absolute',
-        inset: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: 10,
-        textAlign: 'center',
-        padding: '0 32px',
-        userSelect: 'none',
-      }}
-    >
-      <div style={{ fontSize: 22, fontWeight: 600, color: 'var(--text-1)' }}>
-        This is the very beginning of {label}
-      </div>
-      <div style={{ fontSize: 13, color: 'var(--text-3)' }}>
-        {isDm
-          ? 'Messages here are end-to-end encrypted; beams go device-to-device.'
-          : 'Every message here is encrypted on the shared folder.'}
-      </div>
-      <button
-        className="sem-hello"
-        title="Pre-fill the composer with a greeting"
-        onClick={() => onSeed('Hello team! \u{1F44B}')}
-        style={{
-          marginTop: 8,
-          padding: '6px 14px',
-          borderRadius: 'var(--r-full)',
-          border: '1px solid var(--border-strong)',
-          background: 'transparent',
-          color: 'var(--text-2)',
-          fontSize: 13,
-          fontFamily: 'var(--font-ui)',
-          cursor: 'pointer',
-        }}
-      >
-        Say hello {'\u{1F44B}'}
-      </button>
-    </div>
-  )
-}

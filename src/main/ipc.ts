@@ -25,6 +25,10 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('app:getBoot', () => controller.getBoot())
   ipcMain.handle('app:unlock', (_e, passphrase: string) => controller.unlock(passphrase))
   ipcMain.handle('app:changeTeamFolder', () => controller.changeTeamFolder())
+  ipcMain.handle('app:relaunch', () => {
+    app.relaunch()
+    app.exit(0)
+  })
   ipcMain.handle('app:openExternal', (_e, url: string) => {
     if (url.startsWith('http:') || url.startsWith('https:')) return shell.openExternal(url)
   })

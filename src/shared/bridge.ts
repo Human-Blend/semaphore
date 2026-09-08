@@ -181,6 +181,8 @@ export interface BridgeApi {
     unlock(passphrase: string): Promise<boolean>
     /** Disconnect from the current team folder and re-enter setup (name kept). */
     changeTeamFolder(): Promise<void>
+    /** Quit and relaunch (macOS requires it after granting Screen Recording). */
+    relaunch(): Promise<void>
     openExternal(url: string): Promise<void>
     copyText(text: string): Promise<void>
     showInFolder(path: string): Promise<void>

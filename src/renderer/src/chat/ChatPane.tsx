@@ -192,7 +192,6 @@ export default function ChatPane({ conv }: { conv: ConvId }) {
           loaded={loaded}
           selfId={selfId}
           anchorRead={anchor.conv === conv ? anchor.read : ''}
-          label={label}
           editingId={editingId}
           chipOf={chipOf}
           nameOf={nameOf}
@@ -203,7 +202,6 @@ export default function ChatPane({ conv }: { conv: ConvId }) {
           }}
           onEditStart={setEditingId}
           onEditDone={() => setEditingId(null)}
-          onSeed={(t) => composerRef.current?.insert(t)}
         />
       </div>
 

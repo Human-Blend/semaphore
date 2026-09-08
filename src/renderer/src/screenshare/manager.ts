@@ -106,15 +106,26 @@ async function waitGathering(pc: RTCPeerConnection, timeoutMs = 1000): Promise<v
 // Presenter
 
 export async function startShare(conv: ConvId): Promise<void> {
+  // Never gate on getMediaAccessStatus BEFORE attempting a capture: macOS only
+  // lists an app under Privacy → Screen Recording once it has actually tried to
+  // capture. Checking-then-bailing sent people to a Settings pane where
+  // Semaphore wasn't listed at all (they'd only find it under Microphone).
+  // On macOS 15+ the native ScreenCaptureKit picker handles the grant itself.
+  const { sources, systemPicker } = await window.bridge.screen.sources()
+  if (systemPicker) {
+    await beginCapture(conv, null)
+    return
+  }
+  if (sources.length > 0) {
+    useScreenStore.setState({ pickerOpen: conv })
+    return // picker calls beginCapture(conv, sourceId)
+  }
+  // Enumeration returned nothing — the OS blocked it. Now the app is
+  // registered with TCC, so the Settings pane will actually list it.
   const perm = await window.bridge.screen.permission()
   if (perm === 'denied' || perm === 'restricted') {
     useScreenStore.setState({ permissionPanel: true })
     return
-  }
-  const { sources, systemPicker } = await window.bridge.screen.sources()
-  if (!systemPicker && sources.length > 0) {
-    useScreenStore.setState({ pickerOpen: conv })
-    return // picker calls beginCapture(conv, sourceId)
   }
   await beginCapture(conv, null)
 }
@@ -132,10 +143,13 @@ export async function beginCapture(conv: ConvId, sourceId: string | null): Promi
         height: { max: RTC.captureMaxHeight },
       },
     })
-  } catch {
-    // User canceled the picker, or permission needs the app relaunched.
+  } catch (err) {
+    // Distinguish "user hit Cancel in the picker" from a real permission
+    // block — cancelling must not throw a scary panel in their face.
+    const name = err instanceof Error ? err.name : ''
     const perm = await window.bridge.screen.permission()
-    if (perm !== 'granted') useScreenStore.setState({ permissionPanel: true })
+    const canceled = name === 'NotAllowedError' && perm === 'granted'
+    if (!canceled && perm !== 'granted') useScreenStore.setState({ permissionPanel: true })
     return
   }
   const track = stream.getVideoTracks()[0]

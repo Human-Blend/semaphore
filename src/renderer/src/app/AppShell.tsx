@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useStore, selfOf } from '@/store'
+import { useStore } from '@/store'
 import ChatPane from '@/chat/ChatPane'
 import { Lightbox } from '@/content/Lightbox'
-import { ChromeCss, DRAG, NO_DRAG, isMac, truncate } from './chrome'
+import { ChromeCss, DRAG, NO_DRAG, isMac } from './chrome'
 import Sidebar from './Sidebar'
 import ChannelHeader from './ChannelHeader'
 import RightRail from './RightRail'
@@ -15,48 +15,24 @@ import { ActiveShareBanner, ScreenShareRoot } from '@/screenshare/ShareUi'
 import { BeamSurface } from './BeamSurface'
 import { UpdateBanner } from './UpdateBanner'
 
-// The main three-pane application shell (spec §2). A 44px drag strip spans the
-// top; its left segment doubles as the sidebar's team block.
+// The main three-pane application shell (spec §2). A slim drag strip spans the
+// top (empty, so macOS traffic lights sit alone); the team block lives at the
+// top of the sidebar.
 
 const FONT_PX: Record<'S' | 'M' | 'L', string> = { S: '14px', M: '15px', L: '16px' }
 
-function ConnectionLine() {
-  const health = useStore((s) => s.health)
-  const slow = health.reachable && health.latencyMs !== null && health.latencyMs >= 500
-  const color = !health.reachable ? 'var(--danger)' : slow ? 'var(--warning)' : 'var(--success)'
-  const label = !health.reachable
-    ? 'Share unreachable'
-    : slow
-      ? `Share slow · ${health.latencyMs}ms`
-      : `Share connected${health.latencyMs !== null ? ` · ${health.latencyMs}ms` : ''}`
-  return (
-    <span
-      title={
-        !health.reachable
-          ? 'The team folder cannot be reached right now. Messages queue on this machine.'
-          : slow
-            ? 'The share is responding slowly — messages may take a few seconds to appear.'
-            : 'Connected to the team folder.'
-      }
-      style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-3)', minWidth: 0 }}
-    >
-      <span
-        aria-hidden="true"
-        style={{ width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }}
-      />
-      <span style={truncate}>{label}</span>
-    </span>
-  )
-}
 
+/**
+ * The drag strip. Deliberately empty: on macOS the traffic lights live here,
+ * and anything rendered alongside them risks colliding depending on how the
+ * OS insets them. The team block sits in the sidebar below instead.
+ */
 function TitleBar() {
-  const boot = useStore((s) => s.boot)
-  const self = selfOf(boot)
   return (
     <div
       style={{
         ...DRAG,
-        height: 44,
+        height: isMac ? 36 : 32,
         flexShrink: 0,
         display: 'flex',
         alignItems: 'stretch',
@@ -67,21 +43,10 @@ function TitleBar() {
         style={{
           width: 260,
           flexShrink: 0,
-          display: 'flex',
-          flexDirection: 'column',
-          justifyContent: 'center',
-          gap: 1,
-          padding: isMac ? '0 12px 0 76px' : '0 12px 0 16px',
           background: 'var(--bg-sidebar)',
           borderRight: '1px solid var(--border-subtle)',
-          minWidth: 0,
         }}
-      >
-        <span style={{ ...truncate, fontSize: 13, fontWeight: 600, color: 'var(--text-1)' }}>
-          {self?.teamName ?? 'Semaphore'}
-        </span>
-        <ConnectionLine />
-      </div>
+      />
       <div style={{ flex: 1, background: 'var(--bg-app)' }} />
     </div>
   )

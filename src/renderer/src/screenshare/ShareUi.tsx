@@ -233,9 +233,14 @@ function PermissionPanel() {
       <div onClick={(e) => e.stopPropagation()} style={{ width: 440, background: 'var(--bg-panel)', borderRadius: 'var(--r-xl)', border: '1px solid var(--border-strong)', boxShadow: 'var(--elev-3)', padding: 24 }}>
         <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>Screen Recording permission needed</div>
         <p style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: '19px' }}>
-          macOS requires you to allow Semaphore under{' '}
-          <strong style={{ color: 'var(--text-1)' }}>System Settings → Privacy &amp; Security → Screen Recording</strong>, then restart
-          the app. This can re-appear after app updates — that's normal for an internally-built app.
+          Allow Semaphore under{' '}
+          <strong style={{ color: 'var(--text-1)' }}>System Settings → Privacy &amp; Security → Screen Recording</strong>, then
+          restart the app.
+        </p>
+        <p style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: '17px' }}>
+          Look for <strong style={{ color: 'var(--text-2)' }}>Screen&nbsp;Recording</strong> specifically — not Microphone or
+          Camera. Semaphore never records audio. macOS may ask again after an app update; that's normal for an
+          internally-built app.
         </p>
         {status === 'granted' && (
           <p style={{ fontSize: 13, color: 'var(--success)', fontWeight: 600 }}>✓ Granted — restart Semaphore to finish.</p>
@@ -244,7 +249,11 @@ function PermissionPanel() {
           <Button variant="ghost" onClick={close}>
             Later
           </Button>
-          <Button onClick={() => void window.bridge.screen.openPermissionSettings()}>Open System Settings</Button>
+          {status === 'granted' ? (
+            <Button onClick={() => void window.bridge.app.relaunch()}>Restart Semaphore</Button>
+          ) : (
+            <Button onClick={() => void window.bridge.screen.openPermissionSettings()}>Open System Settings</Button>
+          )}
         </div>
       </div>
     </div>

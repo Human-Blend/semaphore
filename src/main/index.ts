@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { AppController } from './appController'
 import { registerIpc } from './ipc'
 import { registerBlobProtocol, registerBlobScheme } from './services/blobProtocol'
+import { registerGifProtocol, registerGifScheme } from './services/gifProtocol'
 
 // mDNS candidate obfuscation would replace host-candidate IPs with .local names
 // that corporate LANs can't resolve, killing every P2P connection. Must be set
@@ -22,6 +23,7 @@ if (profile && !app.isPackaged) {
 app.setAppUserModelId('com.semaphore.teamchat')
 
 registerBlobScheme()
+registerGifScheme()
 
 const gotLock = app.requestSingleInstanceLock({ profile: profile ?? '' })
 if (!gotLock) {
@@ -40,7 +42,7 @@ function createWindow(): void {
     show: false,
     backgroundColor: '#0E0F13',
     ...(process.platform === 'darwin'
-      ? { titleBarStyle: 'hiddenInset' as const, trafficLightPosition: { x: 16, y: 14 } }
+      ? { titleBarStyle: 'hiddenInset' as const, trafficLightPosition: { x: 16, y: 11 } }
       : { titleBarStyle: 'hidden' as const, titleBarOverlay: { color: '#14151B', symbolColor: '#A9ADBB', height: 44 } }),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -81,6 +83,7 @@ app.on('second-instance', () => {
 
 app.whenReady().then(async () => {
   registerBlobProtocol(controller)
+  registerGifProtocol()
   registerIpc(controller, () => mainWindow)
   await controller.init()
   createWindow()

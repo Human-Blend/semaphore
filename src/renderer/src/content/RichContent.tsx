@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import type { MessageView } from '@shared/merge'
 import type { Attachment, BodyEntity, ConvId } from '@shared/types'
 import { isMediaAttachment, segmentMessage } from './parse'
@@ -21,9 +21,16 @@ export function MessageBody({ view }: { view: MessageView }) {
 
   const media = view.attachments.filter(isMediaAttachment)
   const files = view.attachments.filter((a) => !isMediaAttachment(a))
+  // A pack GIF travels as its pack id, not bytes: every client has the same
+  // bundled pack, so this costs zero share I/O. Remote (searched) GIFs travel
+  // as an https URL.
   const gifUrl =
-    view.body.kind === 'gif' && /^https?:\/\//i.test(view.body.text.trim())
-      ? view.body.text.trim()
+    view.body.kind === 'gif'
+      ? view.body.packId
+        ? `sfgif://pack/${view.body.packId}.gif`
+        : /^(https?|sfgif):\/\//i.test(view.body.text.trim())
+          ? view.body.text.trim()
+          : null
       : null
 
   return (
@@ -34,7 +41,7 @@ export function MessageBody({ view }: { view: MessageView }) {
         </div>
       ) : view.body.kind === 'gif' ? (
         gifUrl ? (
-          <RemoteGif url={gifUrl} />
+          <RemoteGif url={gifUrl} compact={!!view.body.packId} />
         ) : media.length === 0 ? (
           <span style={{ fontSize: 12, color: 'var(--text-3)', fontStyle: 'italic' }}>
             GIF unavailable
@@ -137,25 +144,43 @@ function TextBody({ text, entities }: { text: string; entities?: BodyEntity[] })
 // ---------------------------------------------------------------------------
 
 /** GIF sent as a plain URL (picker result / pasted). Autoplays by nature. */
-function RemoteGif({ url }: { url: string }) {
+function RemoteGif({ url, compact }: { url: string; compact?: boolean }) {
+  const [failed, setFailed] = useState(false)
+  if (failed) {
+    // A pack id this client's bundled pack doesn't carry (older/newer build),
+    // or a remote GIF this network blocks. Say so instead of showing a void.
+    return (
+      <span style={{ fontSize: 12, color: 'var(--text-3)', fontStyle: 'italic' }}>
+        GIF unavailable on this machine
+      </span>
+    )
+  }
   return (
     <span
       style={{
         position: 'relative',
         display: 'inline-block',
         borderRadius: 'var(--r-lg)',
-        border: '1px solid var(--border-subtle)',
         overflow: 'hidden',
-        background: 'var(--bg-raised)',
-        maxWidth: 420,
+        maxWidth: compact ? 160 : 420,
+        background: compact ? 'transparent' : 'var(--bg-raised)',
+        border: compact ? 'none' : '1px solid var(--border-subtle)',
       }}
     >
       <img
         src={url}
         alt="GIF"
         draggable={false}
-        style={{ display: 'block', maxWidth: '100%', maxHeight: 320, minWidth: 120, minHeight: 80 }}
+        onError={() => setFailed(true)}
+        style={{
+          display: 'block',
+          maxWidth: '100%',
+          maxHeight: compact ? 160 : 320,
+          minWidth: compact ? 0 : 120,
+          minHeight: compact ? 0 : 80,
+        }}
       />
+      {!compact && (
       <span
         aria-hidden
         style={{
@@ -176,6 +201,7 @@ function RemoteGif({ url }: { url: string }) {
       >
         GIF
       </span>
+      )}
     </span>
   )
 }
