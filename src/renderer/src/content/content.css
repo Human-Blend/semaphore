@@ -1,0 +1,302 @@
+/* Rich-content styles: Graphite syntax palette, hover reveals, shimmer,
+   lightbox + GIF picker motion. Scoped under .sem-* classes only. */
+
+/* ------------------------------------------------------------------ */
+/* Code blocks — "Graphite" palette (one hue family, dark + light).    */
+
+.sem-code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 20px;
+  color: #d6dae4;
+}
+
+.sem-code pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  white-space: pre;
+  user-select: text;
+}
+
+.sem-code code {
+  font-family: inherit;
+  background: none;
+  padding: 0;
+}
+
+.sem-code .hljs-keyword,
+.sem-code .hljs-selector-tag,
+.sem-code .hljs-doctag,
+.sem-code .hljs-tag {
+  color: #c792ea;
+}
+.sem-code .hljs-string,
+.sem-code .hljs-regexp,
+.sem-code .hljs-addition {
+  color: #8cd49b;
+}
+.sem-code .hljs-number,
+.sem-code .hljs-literal,
+.sem-code .hljs-symbol {
+  color: #f5b70a;
+}
+.sem-code .hljs-title,
+.sem-code .hljs-title.function_,
+.sem-code .hljs-function .hljs-title,
+.sem-code .hljs-name,
+.sem-code .hljs-section {
+  color: #7bafff;
+}
+.sem-code .hljs-title.class_,
+.sem-code .hljs-type,
+.sem-code .hljs-built_in,
+.sem-code .hljs-selector-class,
+.sem-code .hljs-selector-id {
+  color: #5fd4d0;
+}
+.sem-code .hljs-comment,
+.sem-code .hljs-quote {
+  color: #5c6370;
+  font-style: italic;
+}
+.sem-code .hljs-variable,
+.sem-code .hljs-template-variable,
+.sem-code .hljs-attr,
+.sem-code .hljs-attribute,
+.sem-code .hljs-params,
+.sem-code .hljs-subst {
+  color: #d6dae4;
+}
+.sem-code .hljs-punctuation,
+.sem-code .hljs-operator,
+.sem-code .hljs-meta,
+.sem-code .hljs-deletion {
+  color: #8a8f9e;
+}
+
+[data-theme='light'] .sem-code {
+  color: #33373f;
+}
+[data-theme='light'] .sem-code .hljs-keyword,
+[data-theme='light'] .sem-code .hljs-selector-tag,
+[data-theme='light'] .sem-code .hljs-doctag,
+[data-theme='light'] .sem-code .hljs-tag {
+  color: #9333b4;
+}
+[data-theme='light'] .sem-code .hljs-string,
+[data-theme='light'] .sem-code .hljs-regexp,
+[data-theme='light'] .sem-code .hljs-addition {
+  color: #1f7a46;
+}
+[data-theme='light'] .sem-code .hljs-number,
+[data-theme='light'] .sem-code .hljs-literal,
+[data-theme='light'] .sem-code .hljs-symbol {
+  color: #a96a03;
+}
+[data-theme='light'] .sem-code .hljs-title,
+[data-theme='light'] .sem-code .hljs-title.function_,
+[data-theme='light'] .sem-code .hljs-function .hljs-title,
+[data-theme='light'] .sem-code .hljs-name,
+[data-theme='light'] .sem-code .hljs-section {
+  color: #2d63c8;
+}
+[data-theme='light'] .sem-code .hljs-title.class_,
+[data-theme='light'] .sem-code .hljs-type,
+[data-theme='light'] .sem-code .hljs-built_in,
+[data-theme='light'] .sem-code .hljs-selector-class,
+[data-theme='light'] .sem-code .hljs-selector-id {
+  color: #0e7c78;
+}
+[data-theme='light'] .sem-code .hljs-comment,
+[data-theme='light'] .sem-code .hljs-quote {
+  color: #9aa0ae;
+}
+[data-theme='light'] .sem-code .hljs-variable,
+[data-theme='light'] .sem-code .hljs-template-variable,
+[data-theme='light'] .sem-code .hljs-attr,
+[data-theme='light'] .sem-code .hljs-attribute,
+[data-theme='light'] .sem-code .hljs-params,
+[data-theme='light'] .sem-code .hljs-subst {
+  color: #33373f;
+}
+[data-theme='light'] .sem-code .hljs-punctuation,
+[data-theme='light'] .sem-code .hljs-operator,
+[data-theme='light'] .sem-code .hljs-meta,
+[data-theme='light'] .sem-code .hljs-deletion {
+  color: #6e7383;
+}
+
+/* Collapse fade — gradient must match --bg-code in both themes. */
+.sem-code-fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 48px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--bg-code));
+}
+
+/* ------------------------------------------------------------------ */
+/* Inline text pieces                                                  */
+
+.sem-link {
+  color: var(--accent-text);
+  text-decoration: none;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.sem-link:hover {
+  text-decoration: underline;
+  color: var(--accent-hover);
+}
+
+/* ------------------------------------------------------------------ */
+/* Hover reveals (link card + file tile actions)                       */
+
+.sem-reveal {
+  opacity: 0;
+  transition: opacity var(--t-instant) var(--ease-standard);
+}
+.sem-reveal-host:hover .sem-reveal,
+.sem-reveal-host:focus-within .sem-reveal {
+  opacity: 1;
+}
+
+.sem-scrim-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--r-sm);
+  background: rgba(10, 11, 15, 0.55);
+  color: #fff;
+  cursor: pointer;
+  transition: background var(--t-instant) var(--ease-standard);
+}
+.sem-scrim-btn:hover {
+  background: rgba(10, 11, 15, 0.78);
+}
+
+/* ------------------------------------------------------------------ */
+/* Shimmer skeleton (blob warming up / unknown-dimension placeholder)  */
+
+.sem-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.sem-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.05) 50%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  animation: sem-shimmer-move 1.6s linear infinite;
+}
+@keyframes sem-shimmer-move {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Lightbox + GIF picker motion                                        */
+
+@keyframes sem-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes sem-scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.sem-lightbox {
+  animation: sem-fade-in var(--t-base) var(--ease-standard);
+}
+.sem-lightbox-media {
+  animation: sem-scale-in var(--t-base) var(--ease-glide);
+}
+.sem-gifpicker {
+  animation: sem-scale-in var(--t-base) var(--ease-pop);
+  transform-origin: bottom left;
+}
+
+/* GIF picker grid items */
+.sem-gif-item {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--bg-raised);
+  cursor: pointer;
+  transition: border-color var(--t-instant) var(--ease-standard);
+}
+.sem-gif-item:hover {
+  border-color: var(--accent);
+}
+.sem-gif-item img {
+  display: block;
+  width: 100%;
+  transition: transform var(--t-fast) var(--ease-standard);
+}
+.sem-gif-item:hover img {
+  transform: scale(1.03);
+}
+
+/* Category chips */
+.sem-gif-chip {
+  height: 28px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-full);
+  background: var(--bg-raised);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--t-instant) var(--ease-standard),
+    color var(--t-instant) var(--ease-standard);
+}
+.sem-gif-chip:hover {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+/* Media cell buttons reset */
+.sem-media-btn {
+  padding: 0;
+  border: none;
+  background: none;
+  display: block;
+  cursor: zoom-in;
+}

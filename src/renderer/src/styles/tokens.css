@@ -1,0 +1,140 @@
+/* Semaphore design tokens — dark is the default theme; [data-theme="light"] flips. */
+
+:root {
+  /* Canvas & surfaces */
+  --bg-app: #0e0f13;
+  --bg-sidebar: #14151b;
+  --bg-panel: #191b22;
+  --bg-raised: #20232c;
+  --bg-overlay: rgba(10, 11, 15, 0.72);
+  --bg-input: #1c1f27;
+
+  /* Borders */
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.13);
+
+  /* Text */
+  --text-1: #edeef3;
+  --text-2: #a9adbb;
+  --text-3: #6e7383;
+  --text-inverse: #16181d;
+
+  /* Accent — "Beacon" indigo */
+  --accent: #7b80ff;
+  --accent-hover: #9296ff;
+  --accent-active: #6a6ff2;
+  --accent-soft: rgba(123, 128, 255, 0.14);
+  --accent-text: #a3a7ff;
+  --on-accent: #ffffff;
+
+  /* "Flare" — beams, transfers, celebration */
+  --flare: #ff9457;
+  --flare-soft: rgba(255, 148, 87, 0.16);
+
+  /* Semantic */
+  --success: #3dd68c;
+  --warning: #f5b70a;
+  --danger: #ff6875;
+  --danger-soft: rgba(255, 104, 117, 0.14);
+
+  /* Presence */
+  --presence-online: #34c77b;
+  --presence-away: #f5b70a;
+  --presence-offline: #565b6b;
+
+  /* Code block canvas */
+  --bg-code: #14161c;
+
+  /* Typography */
+  --font-ui:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    ui-monospace, 'SF Mono', 'Cascadia Code', 'Segoe UI Mono', Consolas, 'Liberation Mono',
+    monospace;
+
+  /* Spacing (4px base) */
+  --s1: 2px;
+  --s2: 4px;
+  --s3: 8px;
+  --s4: 12px;
+  --s5: 16px;
+  --s6: 20px;
+  --s7: 24px;
+  --s8: 32px;
+  --s9: 40px;
+  --s10: 48px;
+  --s11: 64px;
+
+  /* Radius */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --r-full: 999px;
+
+  /* Elevation (dark leads with border + brightness; shadows still help depth) */
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --elev-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --elev-3: 0 12px 32px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.35);
+
+  /* Motion */
+  --t-instant: 80ms;
+  --t-fast: 140ms;
+  --t-base: 200ms;
+  --t-slow: 300ms;
+  --t-lush: 450ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --ease-pop: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-glide: cubic-bezier(0.22, 1, 0.36, 1);
+
+  color-scheme: dark;
+}
+
+[data-theme='light'] {
+  --bg-app: #ffffff;
+  --bg-sidebar: #f4f5f8;
+  --bg-panel: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-overlay: rgba(22, 24, 29, 0.45);
+  --bg-input: #f1f2f6;
+  --border-subtle: rgba(20, 22, 32, 0.08);
+  --border-strong: rgba(20, 22, 32, 0.16);
+  --text-1: #16181d;
+  --text-2: #5a5f6e;
+  --text-3: #8a8f9e;
+  --text-inverse: #ffffff;
+  --accent: #5a5fe0;
+  --accent-hover: #4a4fd0;
+  --accent-active: #4045c4;
+  --accent-soft: rgba(90, 95, 224, 0.1);
+  --accent-text: #4a4fd0;
+  --flare: #f0722e;
+  --flare-soft: rgba(240, 114, 46, 0.12);
+  --success: #1f9d63;
+  --warning: #b77905;
+  --danger: #d93a4a;
+  --danger-soft: rgba(217, 58, 74, 0.1);
+  --presence-online: #2bab6b;
+  --presence-away: #e5a200;
+  --presence-offline: #a0a5b4;
+  --bg-code: #f6f7f9;
+  --elev-1: 0 1px 2px rgba(20, 22, 32, 0.06);
+  --elev-2: 0 4px 12px rgba(20, 22, 32, 0.1);
+  --elev-3: 0 12px 32px rgba(20, 22, 32, 0.18), 0 2px 8px rgba(20, 22, 32, 0.08);
+  color-scheme: light;
+}
+
+/* Deterministic identity hues for avatars/channels (8 per theme, AA-tuned) */
+:root {
+  --hue-0: #e5484d;
+  --hue-1: #f0722e;
+  --hue-2: #d6a21a;
+  --hue-3: #2bab6b;
+  --hue-4: #12a594;
+  --hue-5: #4a8fe0;
+  --hue-6: #7b80ff;
+  --hue-7: #c560d6;
+}

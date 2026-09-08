@@ -1,0 +1,37 @@
+# Semaphore packaging — built once on macOS, copy-and-run on macOS + Windows.
+# zip targets only: no installers, no self-extracting exes (locked-down fleets
+# punish both). See docs/build-spec notes in the plan.
+appId: com.semaphore.teamchat # NEVER change: Windows AUMID + macOS TCC identity hang off it
+productName: Semaphore
+electronVersion: 44.2.0
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**
+extraResources:
+  - from: resources/
+    to: .
+asar: true
+npmRebuild: false
+nodeGypRebuild: false
+
+win:
+  target:
+    - target: zip
+      arch: [x64]
+  icon: build/icon.ico
+  signAndEditExecutable: true # pure-JS resedit — works on macOS, no wine
+  artifactName: Semaphore-${version}-win-${arch}.zip
+
+mac:
+  target:
+    - target: zip # ditto-made zip: symlinks + ad-hoc seal survive SMB
+      arch: [arm64]
+  icon: build/icon.icns
+  identity: '-' # explicit ad-hoc signature: arm64 kernel refuses unsigned code
+  hardenedRuntime: false # hardened runtime without a real cert can prevent launch
+  gatekeeperAssess: false
+  extendInfo:
+    NSMicrophoneUsageDescription: 'Semaphore uses the microphone for screen-share audio.'
+  artifactName: Semaphore-${version}-mac-${arch}.zip

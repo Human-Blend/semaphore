@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+
+# Local/test debris
+*.log
+.DS_Store
+/tmp/
+scripts/.*.mjs
+
+# Never commit key material
+*.keystore
+*.sealed
+*.tsbuildinfo
