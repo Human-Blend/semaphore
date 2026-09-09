@@ -140,12 +140,18 @@ export class AdoClient {
   async me(): Promise<AdoResult<{ id: string; name: string }>> {
     const page = await this.get('/_apis/connectionData', { 'api-version': API_PREVIEW })
     if (!page.ok) return page
-    const user = (page.value.body as { authenticatedUser?: { id?: unknown; providerDisplayName?: unknown } } | null)
-      ?.authenticatedUser
-    // An anonymous answer (no id, or the well-known all-zero anonymous guid)
-    // is a rejected PAT wearing a 200.
+    const user = (
+      page.value.body as {
+        authenticatedUser?: { id?: unknown; providerDisplayName?: unknown; descriptor?: unknown }
+      } | null
+    )?.authenticatedUser
+    // An anonymous answer is a rejected PAT wearing a 200: no id, the all-zero
+    // guid, or — on an organization with public projects — the all-`a` guid
+    // with a `System:PublicAccess;…` descriptor (verified against
+    // dev.azure.com/dnceng-public without any credentials).
     const id = typeof user?.id === 'string' ? user.id : ''
-    if (!id || /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(id)) {
+    const descriptor = typeof user?.descriptor === 'string' ? user.descriptor : ''
+    if (!id || /^[0a]{8}-[0a]{4}-[0a]{4}-[0a]{4}-[0a]{12}$/.test(id) || descriptor.startsWith('System:PublicAccess')) {
       return this.fail('unauthorized', 'Azure DevOps answered without an authenticated user')
     }
     return { ok: true, value: { id, name: typeof user?.providerDisplayName === 'string' ? user.providerDisplayName : id } }
@@ -257,6 +263,17 @@ export class AdoClient {
         return this.fail('unauthorized', `${SENTENCE.unauthorized} (sign-in page returned)`)
       default:
         break
+    }
+    if (res.status >= 300 && res.status < 400) {
+      // A redirect the transport did not follow. Azure DevOps sends unauthenticated
+      // API calls to `…vssps.visualstudio.com/_signin` (curl sees this where a
+      // browser-shaped client sees 203) — that is a rejected token, not a
+      // mystery status.
+      const location = res.headers.get('location') ?? ''
+      if (/_signin|login\.microsoftonline\.com/i.test(location)) {
+        return this.fail('unauthorized', `${SENTENCE.unauthorized} (redirected to sign in)`)
+      }
+      return this.fail('http', `${SENTENCE.http}: HTTP ${res.status} redirect to ${location || '(no location)'}`)
     }
     if (res.status < 200 || res.status >= 300) {
       return this.fail('http', `${SENTENCE.http}: HTTP ${res.status} ${text.slice(0, MAX_DETAIL)}`)

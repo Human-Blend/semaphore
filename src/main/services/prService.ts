@@ -1,7 +1,7 @@
 import { Notification, net } from 'electron'
 import type { BrowserWindow } from 'electron'
 import type { PushMessage } from '@shared/bridge'
-import type { AdoResult, ConvId, PrsConfig, PrsProbe, PrsRepo, PrsStatus, PrView } from '@shared/types'
+import type { AdoError, AdoResult, ConvId, PrsConfig, PrsProbe, PrsRepo, PrsStatus, PrView } from '@shared/types'
 import { POLL, TEAM_CONV } from '@shared/constants'
 import { baseUrlOrigin, isTracked, materializePrsConfig, normalizeBaseUrl, toPrView } from '@shared/prs'
 import { AdoClient, type AdoRepo, type AdoResponse, type FetchLike } from './ado'
@@ -485,10 +485,16 @@ export class PrService {
     }
     const client = new AdoClient(this.fetchImpl, { baseUrl, token, userAgent: this.ua() })
     const me = await client.me()
-    if (!me.ok) return { ok: false, error: me.error }
+    if (!me.ok) return this.probeFailed('connectionData', baseUrl, me.error)
     const projects = await client.projects()
-    if (!projects.ok) return { ok: false, error: projects.error }
+    if (!projects.ok) return this.probeFailed('projects', baseUrl, projects.error)
     return { ok: true, me: me.value, projects: projects.value }
+  }
+
+  /** `detail` is already redacted by AdoClient; the token itself never gets here. */
+  private probeFailed(step: string, baseUrl: string, error: AdoError): PrsProbe {
+    console.warn(`[prs] test connection failed at ${step} for ${baseUrl}: ${error.code} — ${error.detail}`)
+    return { ok: false, error }
   }
 
   async listRepos(input: { baseUrl: string; token: string; project: string }): Promise<AdoResult<AdoRepo[]>> {

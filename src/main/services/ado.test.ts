@@ -100,6 +100,22 @@ describe('AdoClient — success parsing', () => {
     if (!r.ok) expect(r.error.code).toBe('unauthorized')
   })
 
+  it('me() treats the public-access user of an org with public projects as a rejected token', async () => {
+    // Exactly what dev.azure.com/dnceng-public answers with no credentials at all.
+    const f = fake(
+      json({
+        authenticatedUser: {
+          id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          descriptor: 'System:PublicAccess;aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          providerDisplayName: 'Anonymous',
+        },
+      }),
+    )
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
   it('repos() strips refs/heads/ from defaultBranch and drops nameless entries', async () => {
     const f = fake(
       json({
@@ -173,6 +189,30 @@ describe('AdoClient — status and body mapping', () => {
     const r = await client(f.fetchImpl).me()
     expect(r.ok).toBe(false)
     if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
+  it('an unfollowed 302 to the sign-in page → unauthorized', async () => {
+    const f = fake(
+      res({
+        status: 302,
+        body: '<html><head><title>Object moved</title></head></html>',
+        headers: { location: 'https://spsprodcus4.vssps.visualstudio.com/_signin?realm=dev.azure.com&reply_to=x' },
+      }),
+    )
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
+  it('an unfollowed redirect elsewhere → http, naming the target', async () => {
+    const f = fake(res({ status: 307, headers: { location: 'https://proxy.corp/blocked' } }))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error.code).toBe('http')
+      expect(r.error.detail).toContain('HTTP 307')
+      expect(r.error.detail).toContain('https://proxy.corp/blocked')
+    }
   })
 
   it('200 with a non-JSON body → unauthorized', async () => {
