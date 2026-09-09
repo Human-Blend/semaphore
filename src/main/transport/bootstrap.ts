@@ -80,6 +80,7 @@ export async function ensureLayout(io: ShareIo): Promise<void> {
       DIR.beacon,
       DIR.channels,
       DIR.dm,
+      DIR.team,
       DIR.blobs,
       DIR.blobsTmp,
       DIR.drops,

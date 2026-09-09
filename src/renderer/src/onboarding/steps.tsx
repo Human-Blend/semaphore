@@ -60,7 +60,7 @@ function CheckRow({ state, delay, children }: { state: 'ok' | 'fail'; delay: num
 function latencyGrade(ms: number): { color: string; text: string; state: 'ok' | 'fail' } {
   if (ms < 60) return { color: 'var(--success)', text: `Latency ${ms}ms — good`, state: 'ok' }
   if (ms < 150) return { color: 'var(--warning)', text: `Latency ${ms}ms — okay, expect slight delays`, state: 'ok' }
-  return { color: 'var(--danger)', text: `Latency ${ms}ms — Semaphore will work, but slowly`, state: 'ok' }
+  return { color: 'var(--danger)', text: `Latency ${ms}ms — Chat will work, but slowly`, state: 'ok' }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ export function StepFolder({
 
   return (
     <div>
-      <StepTitle sub="Semaphore has no server — your team lives in a shared folder everyone can reach. Teammates who pick this same folder all land in the same team: that's the whole trick.">
+      <StepTitle sub="Chat has no server — your team lives in a shared folder everyone can reach. Teammates who pick this same folder all land in the same team: that's the whole trick.">
         Choose your team folder
       </StepTitle>
 
@@ -428,7 +428,7 @@ export function StepIdentity({
             </span>
           </div>
           <div style={{ fontSize: 15, lineHeight: '22px', color: 'var(--text-1)', marginTop: 2, userSelect: 'text' }}>
-            Hey team — I just joined Semaphore 👋
+            Hey team — I just joined Chat 👋
           </div>
         </div>
       </div>

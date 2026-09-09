@@ -27,7 +27,7 @@ const run = (cmd) => execSync(cmd, { stdio: 'inherit', cwd: root })
 
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const version = pkg.version
-console.log(`\n— Semaphore release v${version} —\n`)
+console.log(`\n— Chat release v${version} —\n`)
 
 // 1-2. Gates
 run('node scripts/check-no-natives.mjs')
@@ -39,19 +39,26 @@ run('npm run build')
 run('npx electron-builder --mac --win')
 
 // 5. Collect artifacts
+// electron-builder never cleans dist/, so a substring match would also pick up
+// zips left by earlier builds (including the pre-rename Semaphore-*.zip) and
+// silently publish one of those. Match only the names this build just wrote
+// (artifactName in electron-builder.yml) and require both of them.
 const dist = join(root, 'dist')
-const zips = readdirSync(dist).filter((f) => f.endsWith('.zip') && f.includes(version))
-if (zips.length === 0) {
-  console.error('no zips found in dist/')
-  process.exit(1)
-}
+const zips = readdirSync(dist).filter((f) => f.startsWith(`Chat-${version}-`) && f.endsWith('.zip'))
 const files = {}
 for (const z of zips) {
+  const key = z.includes('-mac-') ? 'mac-arm64' : z.includes('-win-') ? 'win-x64' : null
+  if (!key) continue
   const buf = readFileSync(join(dist, z))
   const sha256 = createHash('sha256').update(buf).digest('hex')
-  const key = z.includes('mac') ? 'mac-arm64' : z.includes('win') ? 'win-x64' : z
   files[key] = { name: z, sha256, bytes: buf.length }
   console.log(`  ${z}  ${(buf.length / 1e6).toFixed(1)} MB  ${sha256.slice(0, 16)}…`)
+}
+for (const key of ['mac-arm64', 'win-x64']) {
+  if (!files[key]) {
+    console.error(`missing dist/Chat-${version}-${key === 'mac-arm64' ? 'mac' : 'win'}-*.zip — packaging did not produce the ${key} artifact`)
+    process.exit(1)
+  }
 }
 
 // 6. Release key (generated once, lives OUTSIDE the repo)
@@ -101,7 +108,29 @@ if (!sharePath) {
   console.log('  SHARE_PATH=/Volumes/TeamShare npm run release')
   process.exit(0)
 }
-const appsDir = join(sharePath, 'Semaphore', 'apps')
+// Clients look for updates under their own team root: a team set up before
+// the rename still lives in <share>/Semaphore/, and SHARE_PATH may already BE
+// the team root (that resolved path is what Settings shows, so it's the one
+// people copy). Mirrors teamRoot() in main — all three branches.
+const resolveTeamRoot = (p) => {
+  const base = p.replace(/[\\/]+$/, '')
+  const leaf = base.split(/[\\/]/).pop()
+  const hasTeam = (root) => existsSync(join(root, 'protocol.json'))
+  if (leaf === 'Chat') return base
+  if (leaf === 'Semaphore' && hasTeam(base)) return base
+  if (!hasTeam(join(base, 'Chat')) && hasTeam(join(base, 'Semaphore'))) return join(base, 'Semaphore')
+  return join(base, 'Chat')
+}
+const teamRoot = resolveTeamRoot(sharePath)
+// A release into a folder no client polls is never intended — a real team root
+// always has protocol.json.
+if (!existsSync(join(teamRoot, 'protocol.json'))) {
+  console.error(`no protocol.json under ${teamRoot} — that is not a team root, so no client would ever see this release.`)
+  console.error('Point SHARE_PATH at the share containing the team folder (or at the team folder itself).')
+  process.exit(1)
+}
+const appsDir = join(teamRoot, 'apps')
+console.log(`\nPublishing to ${appsDir}`)
 const archiveDir = join(appsDir, 'archive')
 mkdirSync(archiveDir, { recursive: true })
 
@@ -110,9 +139,19 @@ for (const f of readdirSync(appsDir)) {
   if (f.endsWith('.zip')) renameSync(join(appsDir, f), join(archiveDir, f))
 }
 const archived = readdirSync(archiveDir).filter((f) => f.endsWith('.zip'))
-const archivedVersions = [...new Set(archived.map((f) => f.match(/(\d+\.\d+\.\d+)/)?.[1]).filter(Boolean))].sort()
+// Sort numerically per component: a bare .sort() puts '1.0.9' after '1.0.10'
+// and would prune the NEWER build. Match files on a delimited version too —
+// 'Chat-1.0.10-…'.includes('1.0.1') is true.
+const cmpVersion = (a, b) => {
+  const pa = a.split('.').map(Number)
+  const pb = b.split('.').map(Number)
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i]
+  return 0
+}
+const archivedVersions = [...new Set(archived.map((f) => f.match(/-(\d+\.\d+\.\d+)-/)?.[1]).filter(Boolean))].sort(cmpVersion)
 for (const v of archivedVersions.slice(0, -1)) {
-  for (const f of archived.filter((name) => name.includes(v))) {
+  const exact = new RegExp(`-${v.replace(/\./g, '\\.')}-`)
+  for (const f of archived.filter((name) => exact.test(name))) {
     rmSync(join(archiveDir, f), { force: true })
   }
 }
@@ -138,23 +177,23 @@ renameSync(tmp, join(appsDir, 'version.json'))
 // README for teammates
 writeFileSync(
   join(appsDir, 'README-INSTALL.txt'),
-  `Semaphore ${version} — install
+  `Chat ${version} — install
 ==============================
 
 macOS
-1. Copy Semaphore-${version}-mac-arm64.zip from this folder to your Desktop.
+1. Copy Chat-${version}-mac-arm64.zip from this folder to your Desktop.
    (Copy the ZIP itself — don't unzip it here.)
-2. Double-click the zip, drag Semaphore.app into /Applications.
-3. Double-click Semaphore. It should just open.
+2. Double-click the zip, drag Chat.app into /Applications.
+3. Double-click Chat. It should just open.
    If macOS says it "could not verify" the app (only happens when the zip
    came via a browser/AirDrop instead of this folder):
    System Settings → Privacy & Security → "Open Anyway", or in Terminal:
-   xattr -dr com.apple.quarantine /Applications/Semaphore.app
+   xattr -dr com.apple.quarantine /Applications/Chat.app
 
 Windows
-1. Copy Semaphore-${version}-win-x64.zip to your machine.
-2. Right-click → Extract All into %LOCALAPPDATA%\\Semaphore (or your Desktop).
-3. Double-click Semaphore.exe.
+1. Copy Chat-${version}-win-x64.zip to your machine.
+2. Right-click → Extract All into %LOCALAPPDATA%\\Chat (or your Desktop).
+3. Double-click Chat.exe.
    If SmartScreen appears: "More info" → "Run anyway"
    (or file Properties → Unblock before extracting).
 

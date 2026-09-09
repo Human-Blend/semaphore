@@ -1,30 +1,76 @@
-import { safeStorage, app } from 'electron'
-import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, renameSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomBytes, scryptSync } from 'node:crypto'
-import { buildAad, decryptRecord, encryptRecord } from '../crypto/envelope'
-import { KID } from '@shared/constants'
+import { buildAad, decryptRecord, encryptRecord, parseRecord } from '../crypto/envelope'
+import { KDF, KID } from '@shared/constants'
+import type { OsKeystore } from './osKeystore'
+import type { SecretStore } from './secretStore'
 
 // Everything the app persists locally lives under userData, encrypted with a
-// random Local Master Key (LMK). The LMK itself is sealed by the OS keystore
-// (Keychain / DPAPI via Electron safeStorage) — binding local secrets to this
-// OS user on this machine; a copied userData folder is useless elsewhere.
-// When safeStorage is unavailable (some hardened images), the LMK derives from
-// the team passphrase with a per-install salt and must be unlocked each launch.
+// random Local Master Key (LMK). The LMK itself is sealed one of two ways:
+//
+//   OSKS — by the OS keystore (DPAPI on Windows). Silent, per-user, survives
+//          app updates. See osKeystore.ts for why macOS doesn't get this.
+//   PASS — wrapped under a KEK derived (scrypt) from the team passphrase,
+//          which the user types at each launch. The LMK stays random, so a
+//          passphrase change only re-wraps this one small file — the
+//          encrypted secrets are never touched.
+//
+// Either way the LMK is what encrypts the secrets, and it never leaves memory
+// unwrapped. A copied userData folder is useless without the seal — which on
+// macOS means: without the team passphrase. That is the accepted trade for
+// staying out of the Keychain; README spells it out.
 
-export type LmkMode = 'safeStorage' | 'passphrase' | 'locked'
+export type LmkMode = 'os' | 'passphrase' | 'locked'
+
+/** What init() found on disk, and therefore what the boot flow must do next. */
+export type LmkStatus =
+  | 'unlocked' // OS keystore opened (or just created) the LMK
+  | 'passphrase' // passphrase-wrapped LMK on disk: unlockWithPassphrase()
+  | 'fresh' // nothing on disk and no OS keystore: onboarding creates it
+  | 'unrecoverable' // no build/keystore can open what's on disk: wipe()
 
 const LMK_SEALED = 'lmk.sealed'
-const LMK_SALT = 'lmk.salt'
 const SETTINGS = 'settings.json'
+// Written by BlobService (services/blobs.ts), cleared from here so the whole
+// "forget this profile" story stays in one place.
+const DERIVED_DIRS = ['blob-cache']
+const MAGIC_PASS = Buffer.from('PASS')
+const MAGIC_OS = Buffer.from('OSKS')
+const PASS_VERSION = 1
+const PASS_SALT_LEN = 16
 
-export class LocalStore {
+// Same work factor as the team KDF (~200 ms once per launch): a copied
+// profile folder must never be a cheaper offline oracle for the team
+// passphrase than protocol.json's own check value is.
+const KEK_SCRYPT = { N: KDF.N, r: KDF.r, p: KDF.p, maxmem: KDF.maxmem }
+const LMK_AAD = buildAad('local', 'lmk', 'lmk')
+
+function deriveKek(passphrase: string, salt: Buffer): Buffer {
+  return scryptSync(passphrase.normalize('NFKD'), salt, 32, KEK_SCRYPT)
+}
+
+// A PASS seal this build could conceivably open: right version, and a salt
+// plus a well-formed SFC1 record behind it. Anything else is not "wrong
+// passphrase" — no passphrase will ever open it, so say so up front.
+function passSealIsWellFormed(raw: Buffer): boolean {
+  if (raw[4] !== PASS_VERSION) return false
+  try {
+    parseRecord(raw.subarray(5 + PASS_SALT_LEN))
+    return true
+  } catch {
+    return false
+  }
+}
+
+export class LocalStore implements SecretStore {
   private lmk: Buffer | null = null
-  private dir: string
   mode: LmkMode = 'locked'
 
-  constructor(dir?: string) {
-    this.dir = dir ?? app.getPath('userData')
+  constructor(
+    private readonly dir: string,
+    private readonly keystore: OsKeystore | null,
+  ) {
     mkdirSync(this.dir, { recursive: true })
   }
 
@@ -33,73 +79,166 @@ export class LocalStore {
     return this.lmk !== null
   }
 
-  /** Returns the unlock mode required, initializing the LMK when possible. */
-  init(): LmkMode {
-    const sealedPath = join(this.dir, LMK_SEALED)
-    if (existsSync(sealedPath)) {
-      const raw = readFileSync(sealedPath)
-      if (raw.subarray(0, 4).toString() === 'PASS') {
-        this.mode = 'locked' // passphrase mode — needs unlockWithPassphrase()
-        return 'passphrase'
-      }
-      if (safeStorage.isEncryptionAvailable()) {
-        this.lmk = Buffer.from(safeStorage.decryptString(raw), 'base64')
-        this.mode = 'safeStorage'
-        return 'safeStorage'
-      }
-      this.mode = 'locked'
-      return 'passphrase' // sealed with safeStorage but unavailable now — rare; treated as locked
-    }
-    // First run: create the LMK
-    const lmk = randomBytes(32)
-    if (safeStorage.isEncryptionAvailable()) {
-      writeFileSync(sealedPath, safeStorage.encryptString(lmk.toString('base64')))
-      this.lmk = lmk
-      this.mode = 'safeStorage'
-      return 'safeStorage'
-    }
-    // Defer: passphrase mode needs the team passphrase; caller invokes
-    // createPassphraseLmk() during onboarding/unlock.
-    this.mode = 'locked'
-    return 'passphrase'
+  private get sealedPath(): string {
+    return join(this.dir, LMK_SEALED)
   }
 
+  private keystoreReady(): boolean {
+    try {
+      return this.keystore?.available() ?? false
+    } catch {
+      return false
+    }
+  }
+
+  /** Reads (or, with an OS keystore, creates) the LMK. Never throws. */
+  init(): LmkStatus {
+    this.lmk = null
+    this.mode = 'locked'
+
+    if (existsSync(this.sealedPath)) {
+      // A seal that is there but unreadable (EACCES from a restored/copied
+      // profile, EIO, EBUSY behind a scanner, or a delete racing the
+      // existsSync) is no different to the user than a seal that doesn't fit:
+      // say 'unrecoverable' so the unlock screen can offer to start fresh.
+      // This method must never throw — a rejection here has no boot path left.
+      let raw: Buffer
+      try {
+        raw = readFileSync(this.sealedPath)
+      } catch {
+        return 'unrecoverable'
+      }
+      if (raw.subarray(0, 4).equals(MAGIC_PASS)) return passSealIsWellFormed(raw) ? 'passphrase' : 'unrecoverable'
+
+      // OS-sealed, either with our marker or the pre-1.0.2 bare blob.
+      if (!this.keystoreReady()) return 'unrecoverable'
+      const legacy = !raw.subarray(0, 4).equals(MAGIC_OS)
+      let lmk: Buffer
+      try {
+        lmk = this.keystore!.open(legacy ? raw : raw.subarray(4))
+      } catch {
+        return 'unrecoverable'
+      }
+      if (lmk.length !== 32) return 'unrecoverable'
+      this.lmk = lmk
+      this.mode = 'os'
+      if (legacy) {
+        // Best effort: the bare blob still opens next launch if the rewrite
+        // fails (file held by a scanner, read-only profile).
+        try {
+          this.writeSealed(Buffer.concat([MAGIC_OS, this.keystore!.seal(lmk)]))
+        } catch {}
+      }
+      return 'unlocked'
+    }
+
+    // First run. With an OS keystore the LMK is created right here and the
+    // user never sees a prompt; otherwise onboarding wraps it under the team
+    // passphrase once it has one.
+    if (this.keystoreReady()) {
+      try {
+        const lmk = randomBytes(32)
+        const sealed = Buffer.concat([MAGIC_OS, this.keystore!.seal(lmk)])
+        this.clearSecrets() // leftovers from a seal that's gone would never decrypt
+        this.writeSealed(sealed)
+        this.lmk = lmk
+        this.mode = 'os'
+        return 'unlocked'
+      } catch {
+        // Keystore claimed availability but failed to seal — fall through to
+        // the passphrase path rather than crash the boot.
+      }
+    }
+    return 'fresh'
+  }
+
+  /** First run without an OS keystore: fresh random LMK wrapped under the passphrase. */
   createPassphraseLmk(passphrase: string): void {
-    const salt = randomBytes(16)
-    writeFileSync(join(this.dir, LMK_SALT), salt)
-    this.lmk = scryptSync(passphrase.normalize('NFKD'), salt, 32, {
-      N: 2 ** 15,
-      r: 8,
-      p: 1,
-      maxmem: 64 * 1024 * 1024,
-    })
-    writeFileSync(join(this.dir, LMK_SEALED), Buffer.concat([Buffer.from('PASS'), randomBytes(4)]))
-    // Write a check value so a wrong passphrase is detected on unlock
-    this.writeSecret('lmk-check', Buffer.from('ok'))
+    // Any *.enc left over (an aborted setup, a wiped-by-hand seal) can't be
+    // read under a new LMK and would only ever throw. Start clean.
+    this.clearSecrets()
+    const lmk = randomBytes(32)
+    this.writeSealed(this.wrapPassphrase(lmk, passphrase))
+    this.lmk = lmk
     this.mode = 'passphrase'
   }
 
+  /** Wrong passphrase → false and the store stays locked. Never throws. */
   unlockWithPassphrase(passphrase: string): boolean {
-    const salt = readFileSync(join(this.dir, LMK_SALT))
-    const candidate = scryptSync(passphrase.normalize('NFKD'), salt, 32, {
-      N: 2 ** 15,
-      r: 8,
-      p: 1,
-      maxmem: 64 * 1024 * 1024,
-    })
-    const prev = this.lmk
-    this.lmk = candidate
+    let raw: Buffer
     try {
-      const check = this.readSecret('lmk-check')
-      if (check?.toString() === 'ok') {
-        this.mode = 'passphrase'
-        return true
-      }
+      raw = readFileSync(this.sealedPath)
     } catch {
-      // fall through
+      return false
     }
-    this.lmk = prev
-    return false
+    if (!raw.subarray(0, 4).equals(MAGIC_PASS) || raw[4] !== PASS_VERSION) return false
+    const salt = raw.subarray(5, 5 + PASS_SALT_LEN)
+    const record = raw.subarray(5 + PASS_SALT_LEN)
+    try {
+      const lmk = decryptRecord(record, deriveKek(passphrase, salt), LMK_AAD)
+      if (lmk.length !== 32) return false
+      this.lmk = lmk
+      this.mode = 'passphrase'
+      return true
+    } catch {
+      return false // GCM tag mismatch: wrong passphrase (or a corrupt seal)
+    }
+  }
+
+  /**
+   * Re-wrap the LMK under a different passphrase — joining another team
+   * folder, or a team passphrase rotation. The secrets themselves are untouched.
+   */
+  rewrapPassphrase(newPassphrase: string): void {
+    if (!this.lmk) throw new Error('LocalStore locked')
+    if (this.mode !== 'passphrase') return // OS-sealed: the passphrase isn't the seal
+    this.writeSealed(this.wrapPassphrase(this.lmk, newPassphrase))
+  }
+
+  /**
+   * Forget everything sealed on this machine (the seal and every secret);
+   * plaintext settings survive. The only way forward from 'unrecoverable'.
+   */
+  wipe(): void {
+    this.lmk = null
+    this.mode = 'locked'
+    rmSync(this.sealedPath, { force: true })
+    rmSync(`${this.sealedPath}.tmp`, { force: true })
+    rmSync(join(this.dir, 'lmk.salt'), { force: true }) // pre-release passphrase format
+    this.clearSecrets()
+    this.clearDerivedData()
+  }
+
+  /**
+   * Derived plaintext that lives under userData but is nobody's secret: the
+   * decrypted attachment cache. It is written for the team folder currently
+   * set up, so wiping the profile or leaving that folder has to take it too —
+   * otherwise gigabytes of decrypted attachments outlive the seal that was
+   * the only thing tying them to a team.
+   */
+  clearDerivedData(): void {
+    for (const d of DERIVED_DIRS) rmSync(join(this.dir, d), { recursive: true, force: true })
+  }
+
+  // -------------------------------------------------------------------------
+
+  private wrapPassphrase(lmk: Buffer, passphrase: string): Buffer {
+    const salt = randomBytes(PASS_SALT_LEN)
+    const record = encryptRecord(deriveKek(passphrase, salt), KID.local('lmk'), lmk, LMK_AAD)
+    return Buffer.concat([MAGIC_PASS, Buffer.from([PASS_VERSION]), salt, record])
+  }
+
+  /** Temp-write + rename: a crash mid-write can't leave a half-written seal. */
+  private writeSealed(data: Buffer): void {
+    const tmp = `${this.sealedPath}.tmp`
+    writeFileSync(tmp, data)
+    renameSync(tmp, this.sealedPath)
+  }
+
+  private clearSecrets(): void {
+    for (const f of readdirSync(this.dir)) {
+      if (f.endsWith('.enc')) rmSync(join(this.dir, f), { force: true })
+    }
   }
 
   // -------------------------------------------------------------------------

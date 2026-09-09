@@ -3,5 +3,5 @@ Copyright Google Inc.
 Licensed under CC BY 4.0 — https://creativecommons.org/licenses/by/4.0/
 Source: https://googlefonts.github.io/noto-emoji-animation/
 
-These animated GIFs ship with Semaphore so the GIF picker works on networks
+These animated GIFs ship with Chat so the GIF picker works on networks
 that block Giphy/Tenor. They are unmodified.

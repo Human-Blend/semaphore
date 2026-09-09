@@ -12,7 +12,8 @@ import type {
   BlobFetchState,
   UpdateView,
 } from '@shared/bridge'
-import type { ConvId, PresenceView, VerifiedEvent } from '@shared/types'
+import type { ConvId, PresenceView, PrsStatus, PrView, VerifiedEvent } from '@shared/types'
+import { TEAM_CONV } from '@shared/constants'
 
 // Central renderer state. Raw events per conversation live here; components
 // materialize views with @shared/merge (memoized). All mutations go through
@@ -40,9 +41,18 @@ interface ChatStore {
   blobs: Record<string, BlobFetchState>
   update: UpdateView | null
   lightbox: { conv: ConvId; eventId: string; blobId: string } | null
+  /** Tracked Azure DevOps pull requests (pushed by the main-side PR service). */
+  prs: PrView[]
+  prsStatus: PrsStatus | null
+  /** The PR group's settings dialog — opened from the pane header or the sidebar row. */
+  prsPrefsOpen: boolean
 
   init(): Promise<void>
+  /** Everything team-scoped: channels, people, own read marks; then every log for badges. */
+  loadTeam(): Promise<void>
   setActiveConv(conv: ConvId | null): void
+  /** Navigate to the PR group and open (or close) its settings dialog. */
+  setPrsPrefsOpen(open: boolean): void
   ensureEvents(conv: ConvId): Promise<void>
   send(conv: ConvId, draft: SendDraft): Promise<void>
   markRead(conv: ConvId, stem: string): void
@@ -76,6 +86,9 @@ export const useStore = create<ChatStore>((set, get) => ({
   blobs: {},
   update: null,
   lightbox: null,
+  prs: [],
+  prsStatus: null,
+  prsPrefsOpen: false,
 
   async init() {
     window.bridge.onPush((msg: PushMessage) => {
@@ -84,10 +97,14 @@ export const useStore = create<ChatStore>((set, get) => ({
         case 'boot':
           set({ boot: msg.boot })
           if (msg.boot.mode === 'ready') {
-            void window.bridge.chat.channels().then((channels) => set({ channels }))
-            void window.bridge.presence.list().then((presence) => set({ presence }))
+            // Unlock / onboarding land here: same default as a cold start.
+            void get().loadTeam()
           } else if (msg.boot.mode === 'onboarding') {
             // Team disconnect (folder change): drop all team-scoped state.
+            // The dock badge is cleared from here, not from PrAlert's effect:
+            // this same render unmounts AppShell (and PrAlert with it), so an
+            // effect keyed on the unseen count never gets to write the 0.
+            void window.bridge.app.setBadge(0).catch(() => {})
             set({
               channels: [],
               presence: [],
@@ -103,6 +120,9 @@ export const useStore = create<ChatStore>((set, get) => ({
               update: null,
               lightbox: null,
               outboxQueued: 0,
+              prs: [],
+              prsStatus: null,
+              prsPrefsOpen: false,
             })
           }
           break
@@ -143,6 +163,12 @@ export const useStore = create<ChatStore>((set, get) => ({
         case 'update':
           set({ update: msg.update })
           break
+        case 'prs':
+          set({ prs: msg.prs, prsStatus: msg.status })
+          break
+        case 'prs-open':
+          get().setActiveConv(TEAM_CONV.prs)
+          break
         case 'skew-warning':
           break
       }
@@ -152,19 +178,49 @@ export const useStore = create<ChatStore>((set, get) => ({
     set({ boot })
     const settings = await window.bridge.settings.get()
     set({ settings })
-    if (boot.mode === 'ready') {
-      const [channels, presence] = await Promise.all([
-        window.bridge.chat.channels(),
-        window.bridge.presence.list(),
-      ])
-      set({ channels, presence })
-      if (channels.length && !get().activeConv) get().setActiveConv(channels[0].conv)
+    if (boot.mode === 'ready') await get().loadTeam()
+  },
+
+  async loadTeam() {
+    const [channels, presence, myReads] = await Promise.all([
+      window.bridge.chat.channels(),
+      window.bridge.presence.list(),
+      window.bridge.chat.myReads(),
+    ])
+    set({ channels, presence, myReads })
+    if (channels.length && !get().activeConv) get().setActiveConv(channels[0].conv)
+    // Unread badges need every conversation's log, not just the open one; the
+    // team logs (calendar, PR config) ride the same prefetch so the sidebar can
+    // show a "something today" dot without opening the pane.
+    for (const conv of [
+      ...channels.map((c) => c.conv),
+      ...presence.map((p) => p.dmConv),
+      ...Object.values(TEAM_CONV),
+    ])
+      void get().ensureEvents(conv)
+    // The PR service starts right after the chat service; a 'not-ready' here
+    // just means we raced it and the first 'prs' push will fill the slice in.
+    // Anything else is a real failure worth seeing in the console.
+    try {
+      const [prsStatus, prs] = await Promise.all([window.bridge.prs.status(), window.bridge.prs.list()])
+      set({ prs, prsStatus })
+    } catch (err) {
+      if (!/not-ready/.test(String(err))) console.warn('prs: initial load failed', err)
     }
   },
 
   setActiveConv(conv) {
-    set({ activeConv: conv })
+    // Leaving the PR group unmounts PrsPane — and the prefs modal with it —
+    // without going through the modal's own close paths, so the flag has to be
+    // dropped here or the next visit to team:prs opens the settings dialog
+    // over the list unbidden.
+    set(conv === TEAM_CONV.prs ? { activeConv: conv } : { activeConv: conv, prsPrefsOpen: false })
     if (conv) void get().ensureEvents(conv)
+  },
+
+  setPrsPrefsOpen(open) {
+    if (open) get().setActiveConv(TEAM_CONV.prs)
+    set({ prsPrefsOpen: open })
   },
 
   async ensureEvents(conv) {

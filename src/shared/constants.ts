@@ -2,6 +2,8 @@
 // reconciled FDC/1 spec; the share-conformance harness may override the timing
 // numbers per deployment (they are read through TeamConfig at runtime).
 
+import type { ConvId } from './types'
+
 export const PROTOCOL = {
   name: 'fdc',
   version: 1,
@@ -18,6 +20,10 @@ export const DIR = {
   beacon: 'beacon',
   channels: 'channels',
   dm: 'dm',
+  // App-defined team logs (calendar, pull-request config). Deliberately its own
+  // top-level dir so the janitor's 180-day day-dir sweep (channels/, dm/ only)
+  // never touches it — a birthday entered two years ago must survive.
+  team: 'team',
   blobs: 'blobs',
   blobsTmp: 'blobs/tmp',
   drops: 'drops',
@@ -27,6 +33,17 @@ export const DIR = {
   apps: 'apps',
   janitor: 'janitor',
   janitorClaims: 'janitor/claims',
+} as const
+
+/** The fixed set of team conversations. The whole ConvId is the key id. */
+export const TEAM_CONV = {
+  calendar: 'team:calendar',
+  prs: 'team:prs',
+} as const satisfies Record<string, ConvId>
+
+/** Team calendar presentation constants. */
+export const CALENDAR = {
+  hues: 8, // colour = index into --hue-0..7
 } as const
 
 export const POLL = {
@@ -42,6 +59,10 @@ export const POLL = {
   remountMs: 5000,
   /** apps/version.json stat cadence. */
   updateMs: 5 * 60_000,
+  /** Azure DevOps pull-request poll cadence. */
+  prsMs: 60_000,
+  /** Ceiling for the PR poller's exponential backoff after errors. */
+  prsBackoffMaxMs: 10 * 60_000,
 } as const
 
 export const BEACON = {
@@ -57,6 +78,9 @@ export const PRESENCE = {
   onlineWithinMs: 50_000,
   offlineAfterMs: 120_000,
   awayIdleSec: 300,
+  // Offline this long (by its own last beacon) and a device drops out of the
+  // people list — its DM comes back the moment it does.
+  departedAfterMs: 3 * 86_400_000,
 } as const
 
 export const HLC = {
@@ -197,7 +221,8 @@ export const FILE_EXT = {
 } as const
 
 export const APP = {
-  id: 'com.semaphore.teamchat',
-  teamRootDirName: 'Semaphore',
-  downloadsSubdir: 'Semaphore',
+  id: 'com.semaphore.teamchat', // never changes: Windows AUMID + macOS TCC key on it
+  teamRootDirName: 'Chat',
+  legacyTeamRootDirName: 'Semaphore', // team folders created before the rename
+  downloadsSubdir: 'Chat',
 } as const

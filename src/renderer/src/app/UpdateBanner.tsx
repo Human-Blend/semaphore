@@ -19,7 +19,7 @@ export function UpdateBanner() {
     try {
       const res = await window.bridge.update.copyToMachine()
       if ('path' in res) {
-        toast(`Update copied — quit Semaphore, extract, and replace the app.`)
+        toast(`Update copied — quit Chat, extract, and replace the app.`)
         void window.bridge.app.showInFolder(res.path)
       } else {
         toast(res.error)
@@ -37,7 +37,7 @@ export function UpdateBanner() {
         <div style={{ width: 420, background: 'var(--bg-panel)', borderRadius: 'var(--r-xl)', border: '1px solid var(--border-strong)', boxShadow: 'var(--elev-3)', padding: 24 }}>
           <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>Update required</div>
           <p style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: '19px' }}>
-            This version of Semaphore can no longer read the team's message format. Copy version {update.version} from the
+            This version of Chat can no longer read the team's message format. Copy version {update.version} from the
             team folder, quit, extract, and replace the app.
           </p>
           <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
@@ -70,7 +70,7 @@ export function UpdateBanner() {
       }}
     >
       <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent)' }} />
-      Semaphore {update.version} is available
+      Chat {update.version} is available
       <button onClick={() => void copy()} disabled={busy} style={{ border: 'none', background: 'transparent', color: 'var(--accent-text)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>
         {busy ? 'Copying…' : 'Copy to my machine'}
       </button>

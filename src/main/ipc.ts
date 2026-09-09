@@ -1,9 +1,12 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import type { ConvId, EventPayload } from '@shared/types'
 import type { PushMessage, SendDraft, SettingsView } from '@shared/bridge'
+import { redactEventForRenderer, redactPushForRenderer } from '@shared/prs'
 import { AppController, detectDevice } from './appController'
 import { fetchLinkPreview } from './services/linkPreview'
+import { registerCalendarIpc } from './services/calendarIpc'
 import { registerFileIpc } from './services/filesIpc'
+import { registerPrsIpc } from './services/prsIpc'
 import { registerScreenIpc } from './services/screenIpc'
 
 // One place registers every bridge invoke handler. Channels not yet backed by
@@ -11,7 +14,11 @@ import { registerScreenIpc } from './services/screenIpc'
 
 export function registerIpc(controller: AppController, getWindow: () => BrowserWindow | null): void {
   const push = (msg: PushMessage) => {
-    getWindow()?.webContents.send('push', msg)
+    // The `prs` config event carries the team's shared Azure DevOps PAT in
+    // cleartext. The renderer never reads it (the pane goes by
+    // `PrsStatus.sharedTokenSet`), so it is stripped here rather than copied
+    // into sandboxed web memory — same treatment as the `chat:events` reply.
+    getWindow()?.webContents.send('push', redactPushForRenderer(msg))
   }
   controller.setPush(push)
 
@@ -24,6 +31,7 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   // App
   ipcMain.handle('app:getBoot', () => controller.getBoot())
   ipcMain.handle('app:unlock', (_e, passphrase: string) => controller.unlock(passphrase))
+  ipcMain.handle('app:resetLocalData', () => controller.resetLocalData())
   ipcMain.handle('app:changeTeamFolder', () => controller.changeTeamFolder())
   ipcMain.handle('app:relaunch', () => {
     app.relaunch()
@@ -49,7 +57,7 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('chat:channels', () => chat().channelViews())
   ipcMain.handle('chat:createChannel', (_e, name: string, topic?: string) => chat().createChannel(name, topic))
   ipcMain.handle('chat:dmFor', (_e, peer: string) => chat().dmFor(peer))
-  ipcMain.handle('chat:events', (_e, conv: ConvId) => chat().getEvents(conv))
+  ipcMain.handle('chat:events', (_e, conv: ConvId) => chat().getEvents(conv).map(redactEventForRenderer))
   ipcMain.handle('chat:send', (_e, conv: ConvId, draft: SendDraft) => chat().send(conv, draft))
   ipcMain.handle('chat:edit', (_e, conv: ConvId, target: string, text: string) =>
     chat().mutate(conv, 'edt', { t: 'edt', conv, target, body: { kind: 'text', text } } as EventPayload),
@@ -66,6 +74,7 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('chat:markRead', (_e, conv: ConvId, stem: string) => chat().markRead(conv, stem))
   ipcMain.handle('chat:setTyping', (_e, conv: ConvId | null) => chat().setTyping(conv))
   ipcMain.handle('chat:cursors', (_e, conv: ConvId) => chat().cursors(conv))
+  ipcMain.handle('chat:myReads', () => chat().myReads())
 
   // Presence
   ipcMain.handle('presence:list', () => chat().poller.presenceViews())
@@ -86,7 +95,9 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('settings:get', () => controller.getSettings())
   ipcMain.handle('settings:set', (_e, patch: Partial<SettingsView>) => controller.setSettings(patch))
 
-  // File/blob/beam and screen-share slices register their own handlers.
+  // File/blob/beam, screen-share and team-log slices register their own handlers.
   registerFileIpc(controller, getWindow)
   registerScreenIpc(controller, getWindow)
+  registerCalendarIpc(controller, getWindow)
+  registerPrsIpc(controller, getWindow)
 }

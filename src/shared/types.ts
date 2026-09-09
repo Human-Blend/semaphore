@@ -42,7 +42,7 @@ export interface DevicePin {
 // ---------------------------------------------------------------------------
 // Events (one file per event; filename stem is the event id)
 
-export type EventType = 'msg' | 'edt' | 'del' | 'rct' | 'pin' | 'sys' | 'prv'
+export type EventType = 'msg' | 'edt' | 'del' | 'rct' | 'pin' | 'sys' | 'prv' | 'cal' | 'prs'
 
 export interface EventId {
   hlcMs: number
@@ -51,7 +51,9 @@ export interface EventId {
   stem: string // "<13>-<4>-<8>"
 }
 
-export type ConvId = `chan:${string}` | `dm:${string}` // dm:<pairToken>
+// dm:<pairToken>; team:<fixed name> — team convs are app-defined logs
+// (see TEAM_CONV) that live under DIR.team and are never day-swept.
+export type ConvId = `chan:${string}` | `dm:${string}` | `team:${string}`
 
 export type BodyEntity =
   | { type: 'code'; lang: string | null; start: number; end: number }
@@ -78,6 +80,8 @@ export interface LinkPreview {
   img?: string // data: URI WebP
   domain: string
   failed?: boolean // fetch attempted and blocked — render honest degraded card
+  /** Why it failed (absent on pre-1.0.2 senders: treat as 'network'). */
+  reason?: 'network' | 'http' | 'nometa'
 }
 
 export interface MsgBody {
@@ -150,6 +154,43 @@ export interface SysPayload {
   data: Record<string, unknown>
 }
 
+// ---------------------------------------------------------------------------
+// Team calendar (conv 'team:calendar', event type 'cal')
+
+export interface CalendarEntry {
+  id: string // 16 hex, random, chosen by the creator; stable across edits
+  title: string // <= 120 chars
+  tag: string // <= 24 chars, free text ('Release', 'Freeze', 'Birthday', …)
+  color: number // 0..7 -> var(--hue-N)
+  start: string // 'YYYY-MM-DD' (calendar date, no timezone)
+  end: string // 'YYYY-MM-DD' inclusive; === start for single-day
+  annual: boolean // repeats every year on the same month/day (birthdays)
+  notes: string // '' when empty — never undefined (canonical JSON)
+}
+
+export type CalPayload =
+  | { t: 'cal'; conv: ConvId; op: 'put'; entry: CalendarEntry }
+  | { t: 'cal'; conv: ConvId; op: 'del'; id: string }
+
+// ---------------------------------------------------------------------------
+// Pull-request group (conv 'team:prs', event type 'prs')
+
+export interface PrsRepo {
+  id: string
+  name: string
+}
+
+export interface PrsConfig {
+  /** 'https://dev.azure.com/org' | 'https://tfs.corp/tfs/DefaultCollection' — no trailing slash. */
+  baseUrl: string
+  project: string // project name (or id)
+  repos: PrsRepo[] // watched repositories; empty = nothing tracked
+  sharedToken: string // '' when the configurer chose not to share
+}
+
+/** Full snapshot of the group config; LWW by event stem. */
+export type PrsPayload = { t: 'prs'; conv: ConvId; config: PrsConfig }
+
 export type EventPayload =
   | MsgPayload
   | EdtPayload
@@ -158,6 +199,8 @@ export type EventPayload =
   | PinPayload
   | PrvPayload
   | SysPayload
+  | CalPayload
+  | PrsPayload
 
 /** What actually gets encrypted into an .e1 file. */
 export interface SignedRecord<T = unknown> {
@@ -181,7 +224,7 @@ export interface BeaconContent {
   /** Last N event filenames this device wrote, per conversation (channels only). */
   heads: Record<string, string[]>
   /** Read/ingest watermarks per conversation (channels only). */
-  cursors: Record<string, { read: string; ingested: string }>
+  cursors: Record<string, Cursor>
   /** DM section: pairToken -> SFC1-under-pair-key, base64. Hides DM activity from the team. */
   dmSealed?: Record<string, string>
   /** Live upload progress: blobId -> chunks done/total. */
@@ -196,8 +239,15 @@ export interface BeaconContent {
 /** The pair-key-encrypted part of a beacon for one DM. */
 export interface DmBeaconSection {
   heads: string[]
-  cursor: { read: string; ingested: string }
+  cursor: Cursor
   typingUntil?: number
+}
+
+/** A device's watermarks in one conversation: event stems, plus when it last read. */
+export interface Cursor {
+  read: string
+  ingested: string
+  readAt?: number // share-calibrated ms; absent from pre-1.0.2 beacons
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +364,67 @@ export interface VerifiedEvent {
   receivedAt: number
 }
 
+// ---------------------------------------------------------------------------
+// Azure DevOps (pull-request group). Lives here — not in services/ado.ts — so
+// bridge.ts can name these types without importing main-process code.
+
+export type AdoErrorCode =
+  | 'unauthorized'
+  | 'forbidden'
+  | 'not-found'
+  | 'proxy-auth'
+  | 'tls'
+  | 'dns'
+  | 'network'
+  | 'timeout'
+  | 'http'
+  | 'bad-url'
+
+/** `detail` never contains the token. */
+export interface AdoError {
+  code: AdoErrorCode
+  detail: string
+}
+
+export type AdoResult<T> = { ok: true; value: T } | { ok: false; error: AdoError }
+
+export interface PrView {
+  key: string // `${repoId}:${pullRequestId}`
+  id: number
+  title: string
+  repoId: string
+  repoName: string
+  author: { id: string; name: string }
+  sourceBranch: string // 'refs/heads/' stripped
+  targetBranch: string // 'refs/heads/' stripped
+  createdAt: number // ms epoch
+  isDraft: boolean
+  reviewers: { id: string; name: string; vote: number; required: boolean }[]
+  assignedToMe: boolean // I appear in reviewers
+  myVote: number // 0 when not a reviewer
+  webUrl: string
+  seen: boolean
+}
+
+export interface PrsStatus {
+  configured: boolean
+  baseUrl: string
+  project: string
+  repos: PrsRepo[]
+  tokenSource: 'personal' | 'shared' | 'none'
+  /** True when the team config currently carries a shared token (independent of tokenSource, which is per viewer). */
+  sharedTokenSet: boolean
+  me: { id: string; name: string } | null
+  lastPollAt: number | null
+  polling: boolean
+  error: AdoError | null
+  unseen: number
+}
+
+export type PrsProbe =
+  | { ok: true; me: { id: string; name: string }; projects: { id: string; name: string }[] }
+  | { ok: false; error: AdoError }
+
 export interface PresenceView {
   deviceId: string
   name: string
@@ -323,4 +434,11 @@ export interface PresenceView {
   status: string
   lastSeenMs: number | null
   trust: TrustState
+  dmConv: ConvId
+  /**
+   * Nobody is behind this registration any more (swept beacon, quiet for
+   * days, or superseded by a re-setup). Kept in the list so names still
+   * resolve and pending DM traffic stays reachable; roster surfaces hide it.
+   */
+  departed: boolean
 }

@@ -131,7 +131,9 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
       ...(self
         ? [{ deviceId: self.deviceId, name: self.displayName, hostname: self.hostname, fingerprint: self.fingerprint }]
         : []),
-      ...presence.map((p) => ({ deviceId: p.deviceId, name: p.name, hostname: p.hostname, fingerprint: p.fingerprint })),
+      ...presence
+        .filter((p) => !p.departed)
+        .map((p) => ({ deviceId: p.deviceId, name: p.name, hostname: p.hostname, fingerprint: p.fingerprint })),
     ]
     for (const p of people) {
       if (seen.has(p.deviceId) || !p.name) continue

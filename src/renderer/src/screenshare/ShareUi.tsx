@@ -233,24 +233,24 @@ function PermissionPanel() {
       <div onClick={(e) => e.stopPropagation()} style={{ width: 440, background: 'var(--bg-panel)', borderRadius: 'var(--r-xl)', border: '1px solid var(--border-strong)', boxShadow: 'var(--elev-3)', padding: 24 }}>
         <div style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>Screen Recording permission needed</div>
         <p style={{ fontSize: 13, color: 'var(--text-2)', lineHeight: '19px' }}>
-          Allow Semaphore under{' '}
+          Allow Chat under{' '}
           <strong style={{ color: 'var(--text-1)' }}>System Settings → Privacy &amp; Security → Screen Recording</strong>, then
           restart the app.
         </p>
         <p style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: '17px' }}>
           Look for <strong style={{ color: 'var(--text-2)' }}>Screen&nbsp;Recording</strong> specifically — not Microphone or
-          Camera. Semaphore never records audio. macOS may ask again after an app update; that's normal for an
+          Camera. Chat never records audio. macOS may ask again after an app update; that's normal for an
           internally-built app.
         </p>
         {status === 'granted' && (
-          <p style={{ fontSize: 13, color: 'var(--success)', fontWeight: 600 }}>✓ Granted — restart Semaphore to finish.</p>
+          <p style={{ fontSize: 13, color: 'var(--success)', fontWeight: 600 }}>✓ Granted — restart Chat to finish.</p>
         )}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
           <Button variant="ghost" onClick={close}>
             Later
           </Button>
           {status === 'granted' ? (
-            <Button onClick={() => void window.bridge.app.relaunch()}>Restart Semaphore</Button>
+            <Button onClick={() => void window.bridge.app.relaunch()}>Restart Chat</Button>
           ) : (
             <Button onClick={() => void window.bridge.screen.openPermissionSettings()}>Open System Settings</Button>
           )}

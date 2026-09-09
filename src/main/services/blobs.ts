@@ -38,6 +38,9 @@ import type { ChatService } from './chatService'
 
 const GCM_TAG_LEN = 16
 const CACHE_CAP_BYTES = 2 * 1024 * 1024 * 1024
+// Plaintext copies for drag-and-drop, under the OS temp dir. AppController
+// clears it on a reset / team change, so the name lives here for both.
+export const DRAG_TEMP_DIR = 'semaphore-drag'
 // 1×1 PNG — Electron requires a real (non-empty) drag icon on some platforms.
 const DRAG_ICON_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
@@ -479,7 +482,7 @@ export class BlobService {
     const cachePath = await this.ensureCached(blobId)
     // Cache files are named by blobId — copy under the real name so the drag
     // drops a sensibly-named file.
-    const dragDir = join(app.getPath('temp'), 'semaphore-drag')
+    const dragDir = join(app.getPath('temp'), DRAG_TEMP_DIR)
     await mkdir(dragDir, { recursive: true })
     const dragPath = join(dragDir, sanitizeFileName(name))
     await copyFile(cachePath, dragPath)

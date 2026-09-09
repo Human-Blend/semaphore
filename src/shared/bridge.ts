@@ -1,13 +1,23 @@
 // The complete typed contract between renderer and main. The preload script
 // implements exactly this shape; renderer code accesses it as window.bridge.
 // FROZEN: UI and main-side services are built against these types in parallel.
+// "Frozen" means no existing member changes shape. Whole new namespaces are
+// additive and safe (1.1 added `calendar` and `prs`); editing one that already
+// exists is not.
 
 import type {
+  AdoResult,
   ConvId,
+  Cursor,
   PresenceView,
   VerifiedEvent,
   BodyEntity,
+  CalendarEntry,
   LinkPreview,
+  PrView,
+  PrsProbe,
+  PrsRepo,
+  PrsStatus,
   RtcSignal,
   TrustState,
 } from './types'
@@ -17,7 +27,11 @@ import type {
 
 export type BootMode =
   | { mode: 'onboarding'; sharePathSuggestion: string | null; savedName?: string | null }
-  | { mode: 'locked' } // passphrase-LMK machines: unlock each launch
+  // 'passphrase': the local data is wrapped under the team passphrase — unlock
+  // each launch (macOS always; Windows only without DPAPI).
+  // 'unrecoverable': sealed by an OS keystore that can't open it any more —
+  // the only way forward is app.resetLocalData().
+  | { mode: 'locked'; reason: 'passphrase' | 'unrecoverable' }
   | { mode: 'ready'; self: SelfView }
 
 export interface SelfView {
@@ -76,10 +90,7 @@ export interface SendDraft {
   linkPreview?: LinkPreview
 }
 
-export interface CursorView {
-  read: string
-  ingested: string
-}
+export type CursorView = Cursor
 
 export interface BeamOfferView {
   dropId: string
@@ -155,7 +166,7 @@ export type PushMessage =
   | { kind: 'typing'; conv: ConvId; deviceId: string; until: number }
   | { kind: 'cursors'; conv: ConvId; deviceId: string; cursor: CursorView }
   | { kind: 'health'; health: HealthView }
-  | { kind: 'outbox'; queued: number } // messages waiting for remount
+  | { kind: 'outbox'; queued: number } // messages and team writes waiting for remount
   | { kind: 'beam-offer'; offer: BeamOfferView }
   | { kind: 'beam-progress'; progress: BeamProgressView }
   | { kind: 'blob'; state: BlobFetchState }
@@ -165,6 +176,9 @@ export type PushMessage =
   | { kind: 'rtc-signal'; signal: RtcSignal }
   | { kind: 'frame'; sessionId: string; seq: number; bytes: Uint8Array }
   | { kind: 'frame-viewers'; sessionId: string; count: number }
+  | { kind: 'prs'; prs: PrView[]; status: PrsStatus }
+  // OS-notification click → renderer opens team:prs.
+  | { kind: 'prs-open' }
 
 // ---------------------------------------------------------------------------
 // The bridge surface
@@ -179,6 +193,8 @@ export interface BridgeApi {
   app: {
     getBoot(): Promise<BootMode>
     unlock(passphrase: string): Promise<boolean>
+    /** Forget this machine's sealed local data and start setup over (new device identity). */
+    resetLocalData(): Promise<void>
     /** Disconnect from the current team folder and re-enter setup (name kept). */
     changeTeamFolder(): Promise<void>
     /** Quit and relaunch (macOS requires it after granting Screen Recording). */
@@ -216,6 +232,8 @@ export interface BridgeApi {
     setTyping(conv: ConvId | null): Promise<void>
     /** Remote cursors known so far: conv -> deviceId -> cursor. */
     cursors(conv: ConvId): Promise<Record<string, CursorView>>
+    /** This device's own read watermarks, persisted across launches. */
+    myReads(): Promise<Record<ConvId, string>>
   }
 
   presence: {
@@ -282,6 +300,44 @@ export interface BridgeApi {
     publish(sessionId: string, seq: number, bytes: Uint8Array): Promise<void>
     /** Presenter: subscribe to viewer-heartbeat counts for the session. */
     watchViewers(sessionId: string, on: boolean): Promise<void>
+  }
+
+  /**
+   * Team calendar. Reading is the ordinary event path —
+   * chat.events(TEAM_CONV.calendar) + 'event' pushes → materializeCalendar.
+   */
+  calendar: {
+    /**
+     * Publish or overwrite an entry (LWW by id). Throws on validation failure.
+     * An unreachable share is not a failure: the write goes to the outbox and
+     * resolves with `{ queued: true }`, so the caller closes rather than
+     * inviting a retry (a retried new entry would carry a second id).
+     */
+    put(entry: CalendarEntry): Promise<{ queued: boolean }>
+    remove(id: string): Promise<{ queued: boolean }>
+  }
+
+  prs: {
+    status(): Promise<PrsStatus>
+    list(): Promise<PrView[]>
+    refresh(): Promise<void>
+    markSeen(keys: string[]): Promise<void>
+    testConnection(input: { baseUrl: string; token: string }): Promise<PrsProbe>
+    listRepos(input: {
+      baseUrl: string
+      token: string
+      project: string
+    }): Promise<AdoResult<{ id: string; name: string; defaultBranch: string }[]>>
+    saveConfig(input: {
+      baseUrl: string
+      project: string
+      repos: PrsRepo[]
+      token: string
+      shareToken: boolean
+    }): Promise<void>
+    setPersonalToken(token: string | null): Promise<void>
+    /** Publish an empty config and clear 'prs-seen'; keeps the personal token. */
+    disconnect(): Promise<void>
   }
 
   settings: {

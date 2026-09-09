@@ -1,15 +1,20 @@
 import { app, BrowserWindow, dialog } from 'electron'
 import { homedir } from 'node:os'
+import { basename, join } from 'node:path'
+import { rmSync } from 'node:fs'
 import type { BootMode, OnboardHealth, PushMessage, SelfView, SettingsView } from '@shared/bridge'
-import { APP } from '@shared/constants'
+import { APP, DIR } from '@shared/constants'
 import { LocalStore } from './store/localStore'
+import { platformKeystore } from './store/osKeystore'
 import { ShareIo } from './transport/shareIo'
 import { createOrJoinTeam, readProtocolFile } from './transport/bootstrap'
 import { Roster } from './transport/roster'
 import { Session } from './transport/session'
 import { ChatService } from './services/chatService'
+import { DRAG_TEMP_DIR } from './services/blobs'
 import { Janitor } from './services/janitor'
 import { UpdateService } from './services/updates'
+import { PrService } from './services/prService'
 import {
   currentHostname,
   gatherMachineIdHash,
@@ -46,11 +51,12 @@ const DEFAULT_SETTINGS: SettingsView = {
 }
 
 export class AppController {
-  readonly store = new LocalStore()
+  readonly store = new LocalStore(app.getPath('userData'), platformKeystore())
   chat: ChatService | null = null
   session: Session | null = null
   janitor: Janitor | null = null
   updates: UpdateService | null = null
+  prs: PrService | null = null
   private identity: DeviceIdentity | null = null
   private settings: SettingsView = DEFAULT_SETTINGS
   private boot: BootMode = { mode: 'onboarding', sharePathSuggestion: null }
@@ -80,18 +86,54 @@ export class AppController {
   // -------------------------------------------------------------------------
 
   async init(): Promise<void> {
-    const mode = this.store.init()
+    const status = this.store.init()
     this.settings = { ...DEFAULT_SETTINGS, ...(this.store.readSettings<Partial<SettingsView>>() ?? {}) }
 
-    if (mode === 'passphrase' && !this.store.unlocked) {
-      this.boot = { mode: 'locked' }
-      return
+    switch (status) {
+      case 'unlocked':
+        await this.tryStartFromSavedConfig()
+        return
+      case 'passphrase':
+        this.boot = { mode: 'locked', reason: 'passphrase' }
+        return
+      case 'unrecoverable':
+        this.boot = { mode: 'locked', reason: 'unrecoverable' }
+        return
+      case 'fresh':
+        // No LMK yet and no OS keystore: onboarding wraps one under the team
+        // passphrase once it has it (onboardSubmit).
+        this.boot = { mode: 'onboarding', sharePathSuggestion: null, savedName: null }
+        return
     }
-    await this.tryStartFromSavedConfig()
+  }
+
+  /**
+   * The local data can't be opened — the seal doesn't fit (an OS keystore
+   * entry from a build that still used the macOS Keychain, a profile copied
+   * between user accounts) or the passphrase is gone. Forget it all and set
+   * up again; the team folder itself is untouched.
+   */
+  async resetLocalData(): Promise<void> {
+    // Only from the unlock screen: with a session running this would pull the
+    // identity out from under it.
+    if (this.boot.mode !== 'locked') return
+    this.store.wipe() // takes the decrypted attachment cache with it
+    this.clearDragTemp()
+    this.store.init() // an OS keystore may create a fresh LMK right away; otherwise onboarding will
+    this.boot = { mode: 'onboarding', sharePathSuggestion: null, savedName: null }
+    this.push({ kind: 'boot', boot: this.boot })
   }
 
   private async tryStartFromSavedConfig(): Promise<void> {
-    const config = this.store.readSecretJson<AppConfig>('app-config')
+    let config: AppConfig | null
+    try {
+      config = this.store.readSecretJson<AppConfig>('app-config')
+    } catch {
+      // The LMK opened but doesn't fit the secrets on disk (a seal replaced
+      // over leftover *.enc): nothing here will ever decrypt.
+      this.boot = { mode: 'locked', reason: 'unrecoverable' }
+      return
+    }
     if (!config) {
       this.boot = { mode: 'onboarding', sharePathSuggestion: null, savedName: null }
       return
@@ -115,20 +157,45 @@ export class AppController {
     const config = this.store.readSecretJson<AppConfig>('app-config')
     this.janitor?.stop()
     this.updates?.stop()
+    this.prs?.stop()
     await this.chat?.stop().catch(() => {})
     this.chat = null
     this.session = null
     this.janitor = null
     this.updates = null
-    for (const secret of ['app-config', 'team-cache', 'sender-seqs', 'beacon-seq', 'outbox']) {
+    this.prs = null
+    // Team-scoped only. 'prs-seen' is about this team's pull requests and goes;
+    // 'prs-token' is the user's own Azure DevOps credential and stays.
+    for (const secret of [
+      'app-config',
+      'team-cache',
+      'sender-seqs',
+      'beacon-seq',
+      'outbox',
+      'read-cursors',
+      'prs-seen',
+    ]) {
       this.store.deleteSecret(secret)
     }
+    // The decrypted attachment cache is this team's plaintext too: it must not
+    // sit on disk after the folder it came from is gone.
+    this.store.clearDerivedData()
+    this.clearDragTemp()
     this.boot = {
       mode: 'onboarding',
       sharePathSuggestion: config?.sharePath ?? null,
       savedName: config?.displayName ?? null,
     }
     this.push({ kind: 'boot', boot: this.boot })
+  }
+
+  /** Plaintext copies BlobService leaves in temp so drags land under a real name. */
+  private clearDragTemp(): void {
+    try {
+      rmSync(join(app.getPath('temp'), DRAG_TEMP_DIR), { recursive: true, force: true })
+    } catch {
+      // best effort: a file held open by a drag in flight is not worth failing on
+    }
   }
 
   async unlock(passphrase: string): Promise<boolean> {
@@ -155,16 +222,27 @@ export class AppController {
   }
 
   async healthCheck(path: string): Promise<OnboardHealth> {
-    const io = new ShareIo(this.teamRoot(path))
+    const io = new ShareIo(await this.teamRoot(path))
     const health = await io.healthCheck()
     const proto = await readProtocolFile(io)
     return { ...health, existingTeamName: proto?.teamName ?? null }
   }
 
-  private teamRoot(sharePath: string): string {
+  private async teamRoot(sharePath: string): Promise<string> {
     // The app owns a subfolder inside whatever share the user picked, unless
-    // they picked a folder that already IS a team root.
-    return sharePath.endsWith(APP.teamRootDirName) ? sharePath : `${sharePath}/${APP.teamRootDirName}`
+    // they picked a folder that already IS a team root. Teams set up before
+    // the rename live in `<share>/Semaphore/`; keep joining those rather than
+    // splitting the team across two roots.
+    const base = sharePath.replace(/[\\/]+$/, '')
+    const leaf = basename(base)
+    const hasTeam = (root: string): Promise<boolean> =>
+      new ShareIo(root).statMaybe(DIR.protocolFile).then((s) => s !== null, () => false)
+    if (leaf === APP.teamRootDirName) return base
+    if (leaf === APP.legacyTeamRootDirName && (await hasTeam(base))) return base
+    const root = `${base}/${APP.teamRootDirName}`
+    const legacy = `${base}/${APP.legacyTeamRootDirName}`
+    if (!(await hasTeam(root)) && (await hasTeam(legacy))) return legacy
+    return root
   }
 
   async onboardSubmit(cfg: {
@@ -174,19 +252,21 @@ export class AppController {
     teamName: string
   }): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
-      if (!this.store.unlocked) {
-        // No safeStorage on this machine: derive the local key from the team
-        // passphrase (typed each launch).
-        this.store.createPassphraseLmk(cfg.passphrase)
-      }
-      const root = this.teamRoot(cfg.sharePath)
+      const root = await this.teamRoot(cfg.sharePath)
       const io = new ShareIo(root)
       await io.ensureDir('')
       const result = await createOrJoinTeam(io, cfg.passphrase, cfg.teamName || 'Team')
       if ('error' in result) {
-        return { ok: false, error: result.error === 'wrong-passphrase' ? 'That passphrase does not match this team folder.' : 'This team folder needs a newer version of Semaphore.' }
+        return { ok: false, error: result.error === 'wrong-passphrase' ? 'That passphrase does not match this team folder.' : 'This team folder needs a newer version of Chat.' }
       }
       const { proto, tmk } = result.join
+
+      // Only now that the passphrase is known-good: on machines without an OS
+      // keystore it is also what seals the local data, and it's the one the
+      // unlock screen will ask for at the next launch — so a changed team
+      // folder (or a rotated passphrase) must re-wrap the existing LMK.
+      if (!this.store.unlocked) this.store.createPassphraseLmk(cfg.passphrase)
+      else this.store.rewrapPassphrase(cfg.passphrase)
       const config: AppConfig = { sharePath: root, displayName: cfg.displayName, teamName: proto.teamName }
       this.store.writeSecretJson('app-config', config)
       this.store.writeSecretJson('team-cache', {
@@ -256,6 +336,10 @@ export class AppController {
     this.janitor.start()
     this.updates = new UpdateService(session, (msg) => this.push(msg))
     this.updates.start()
+    // After chat.start(): the PR service materializes its config from the
+    // 'team:prs' log the startup catch-up has just filled in.
+    this.prs = new PrService(this.chat, this.store, this.getWindow, (msg) => this.push(msg), () => app.getVersion())
+    this.prs.start()
 
     this.boot = { mode: 'ready', self: this.selfView(config, proto.teamName) }
   }
@@ -276,6 +360,7 @@ export class AppController {
   async shutdown(): Promise<void> {
     this.janitor?.stop()
     this.updates?.stop()
+    this.prs?.stop()
     await this.chat?.stop().catch(() => {})
   }
 }

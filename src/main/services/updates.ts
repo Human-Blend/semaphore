@@ -17,7 +17,12 @@ import type { Session } from '../transport/session'
 // The release public key (raw Ed25519, base64url). scripts/release.mjs prints
 // the matching value on first run; paste it here before the first team release.
 // Empty string disables signature enforcement (dev builds only, warns).
-export const RELEASE_PUBKEY_B64URL = ''
+//
+// Baked in for 1.1.0. The private half lives ONLY at ~/.semaphore-release-key.json
+// on the build Mac (never in this repo) — back it up: without it, no future
+// release can be signed for these clients and the team needs a hand-delivered
+// build carrying a new key.
+export const RELEASE_PUBKEY_B64URL = '3FqH-RQxnKLVt-1FL1G1dDWt-GYO9T56bAtdeQvG4VY'
 
 export class UpdateService {
   private timer: NodeJS.Timeout | null = null

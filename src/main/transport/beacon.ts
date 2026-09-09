@@ -1,6 +1,6 @@
 import { BEACON, DIR, DST, KID } from '@shared/constants'
-import { beaconFileName, parseBeaconFileName, seqToBase36 } from '@shared/ids'
-import type { BeaconContent, ConvId, DmBeaconSection, SignedRecord } from '@shared/types'
+import { beaconFileName, isDmConv, parseBeaconFileName, seqToBase36 } from '@shared/ids'
+import type { BeaconContent, ConvId, Cursor, DmBeaconSection, SignedRecord } from '@shared/types'
 import { buildAad, decryptRecord, encryptRecord } from '../crypto/envelope'
 import { signRecord, verifyRecord } from '../crypto/identity'
 import type { Session } from './session'
@@ -19,11 +19,13 @@ export class BeaconWriter {
   private pendingTimer: NodeJS.Timeout | null = null
   private heartbeat: NodeJS.Timeout | null = null
   private lastBumpAt = 0
+  /** Tail of the publish queue — see publishNow(). */
+  private publishing: Promise<void> = Promise.resolve()
 
   // State assembled into each beacon
   presence: BeaconContent['presence'] = { state: 'online', status: '', idleSec: 0 }
   typing: BeaconContent['typing'] | undefined
-  private heads = new Map<ConvId, string[]>() // channels only
+  private heads = new Map<ConvId, string[]>() // channels + team convs (DMs live in dmSections)
   private cursors = new Map<ConvId, { read: string; ingested: string }>()
   private dmSections = new Map<string, DmBeaconSection>() // pairToken -> section
   xfers: BeaconContent['xfers'] = {}
@@ -53,39 +55,51 @@ export class BeaconWriter {
   }
 
   noteOwnEvent(conv: ConvId, fileName: string): void {
-    if (conv.startsWith('chan:')) {
-      const ring = this.heads.get(conv) ?? []
-      ring.push(fileName)
-      while (ring.length > BEACON.headsRingSize) ring.shift()
-      this.heads.set(conv, ring)
-    } else {
+    // Only DMs need the per-pair sealed section (who-talks-to-whom is private);
+    // channels and team convs advertise heads in the plain section.
+    if (isDmConv(conv)) {
       const token = conv.slice(3)
       const section = this.dmSections.get(token) ?? { heads: [], cursor: { read: '', ingested: '' } }
       section.heads.push(fileName)
       while (section.heads.length > BEACON.headsRingSize) section.heads.shift()
       this.dmSections.set(token, section)
+    } else {
+      const ring = this.heads.get(conv) ?? []
+      ring.push(fileName)
+      while (ring.length > BEACON.headsRingSize) ring.shift()
+      this.heads.set(conv, ring)
     }
     void this.bump('event')
   }
 
-  setCursor(conv: ConvId, cursor: { read: string; ingested: string }): void {
-    if (conv.startsWith('chan:')) {
-      const prev = this.cursors.get(conv)
-      if (prev && prev.read === cursor.read && prev.ingested === cursor.ingested) return
-      this.cursors.set(conv, cursor)
-    } else {
+  setCursor(conv: ConvId, cursor: Cursor): void {
+    if (this.primeCursor(conv, cursor)) void this.bump('cursor')
+  }
+
+  /**
+   * Record a cursor without publishing — restoring last launch's watermarks
+   * before the startup beacon, so peers' receipts don't blink back to nothing.
+   * Returns whether anything changed.
+   */
+  primeCursor(conv: ConvId, cursor: Cursor): boolean {
+    const same = (a: Cursor | undefined): boolean =>
+      !!a && a.read === cursor.read && a.ingested === cursor.ingested && a.readAt === cursor.readAt
+    if (isDmConv(conv)) {
       const token = conv.slice(3)
       const section = this.dmSections.get(token) ?? { heads: [], cursor: { read: '', ingested: '' } }
-      if (section.cursor.read === cursor.read && section.cursor.ingested === cursor.ingested) return
+      if (same(section.cursor)) return false
       section.cursor = cursor
       this.dmSections.set(token, section)
+    } else {
+      if (same(this.cursors.get(conv))) return false
+      this.cursors.set(conv, cursor)
     }
-    void this.bump('cursor')
+    return true
   }
 
   setTyping(conv: ConvId | null): void {
     const until = this.session.io.calibratedNow() + BEACON.typingTtlMs
-    if (conv && conv.startsWith('dm:')) {
+    if (conv && isDmConv(conv)) {
       const token = conv.slice(3)
       const section = this.dmSections.get(token) ?? { heads: [], cursor: { read: '', ingested: '' } }
       section.typingUntil = until
@@ -131,7 +145,21 @@ export class BeaconWriter {
     }
   }
 
-  private async publishNow(): Promise<void> {
+  /**
+   * One publish at a time. Overlapping publishes can complete out of order on a
+   * slow share, and then the older one's epilogue deletes the *newer* beacon and
+   * leaves its own stale file as this device's latest — peers that already read
+   * the newer seq skip the survivor, so heads and presence go stale until the
+   * next bump. Queueing keeps seq order and the previous-name bookkeeping honest
+   * (it also guarantees stop()'s goodbye lands last) for the price of one await.
+   */
+  private publishNow(): Promise<void> {
+    const done = this.publishing.then(() => this.writeBeacon())
+    this.publishing = done.catch(() => {})
+    return done
+  }
+
+  private async writeBeacon(): Promise<void> {
     if (!this.dirty && this.lastPublishedName) {
       // Heartbeats still rewrite (freshness is the signal), so fall through.
     }

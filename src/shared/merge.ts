@@ -16,6 +16,10 @@ import type {
 // Reader-side merge of the append-only event log into renderable messages.
 // Deterministic: same event set → same output, regardless of arrival order.
 // Used by the renderer (and tests); pure code, no I/O.
+//
+// The 'cal' and 'prs' team-log event types are deliberately absent from the
+// switch below: they never appear in a chan:/dm: log, and they materialize
+// through calendar.ts / prs.ts instead. Falling through the switch drops them.
 
 export interface ReactionView {
   emoji: string

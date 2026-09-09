@@ -7,7 +7,12 @@ import { LINKPREVIEW } from '@shared/constants'
 // and any teammate whose network CAN fetch may attach a preview later via a
 // `prv` event.
 
+// Only network-level failures (can't connect, timeout) go in here: an HTTP
+// error proves the host is reachable, and one dead link must not silence a
+// whole domain for an hour.
 const domainFailures = new Map<string, number>() // hostname -> failedAt
+
+type TextResult = { ok: true; html: string } | { ok: false; reason: 'network' | 'http' }
 
 export async function fetchLinkPreview(url: string): Promise<LinkPreview> {
   let parsed: URL
@@ -18,46 +23,67 @@ export async function fetchLinkPreview(url: string): Promise<LinkPreview> {
   }
   const domain = parsed.hostname
   const base: LinkPreview = { url, domain }
+  // net.request only speaks http(s); anything else is not a link we preview.
+  if (!isHttpUrl(parsed)) return { ...base, failed: true }
 
   const lastFail = domainFailures.get(domain)
   if (lastFail && Date.now() - lastFail < LINKPREVIEW.domainFailureCacheMs) {
-    return { ...base, failed: true }
+    return { ...base, failed: true, reason: 'network' }
   }
 
   try {
-    const html = await fetchText(url, LINKPREVIEW.fetchTimeoutMs)
-    if (html === null) throw new Error('fetch failed')
-    const meta = parseOg(html)
+    const res = await fetchText(url, LINKPREVIEW.fetchTimeoutMs)
+    if (!res.ok) {
+      if (res.reason === 'network') domainFailures.set(domain, Date.now())
+      return { ...base, failed: true, reason: res.reason }
+    }
+    const meta = parseOg(res.html)
     const preview: LinkPreview = {
       ...base,
       title: meta.title,
       desc: meta.desc,
     }
     if (meta.image) {
-      const img = await fetchImageAsDataUri(new URL(meta.image, url).toString())
-      if (img) preview.img = img
+      // The page already answered: a junk og:image (a data: URI, a malformed
+      // value) must cost this card its picture and nothing else — never the
+      // whole domain's previews for an hour.
+      try {
+        const img = await fetchImageAsDataUri(new URL(meta.image, url).toString())
+        if (img) preview.img = img
+      } catch {
+        // no image; the title/desc card still stands
+      }
     }
-    if (!preview.title && !preview.img) return { ...base, failed: true }
+    if (!preview.title && !preview.img) return { ...base, failed: true, reason: 'nometa' }
     return preview
   } catch {
     domainFailures.set(domain, Date.now())
-    return { ...base, failed: true }
+    return { ...base, failed: true, reason: 'network' }
   }
 }
 
-function fetchText(url: string, timeoutMs: number, redirects = 0): Promise<string | null> {
+function isHttpUrl(url: string | URL): boolean {
+  try {
+    const p = (typeof url === 'string' ? new URL(url) : url).protocol
+    return p === 'http:' || p === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function fetchText(url: string, timeoutMs: number): Promise<TextResult> {
   return new Promise((resolve) => {
     const req = net.request({ url, redirect: 'follow' })
     const timer = setTimeout(() => {
       req.abort()
-      resolve(null)
+      resolve({ ok: false, reason: 'network' })
     }, timeoutMs)
     const chunks: Buffer[] = []
     let total = 0
     req.on('response', (res) => {
       if ((res.statusCode ?? 500) >= 400) {
         clearTimeout(timer)
-        resolve(null)
+        resolve({ ok: false, reason: 'http' })
         return
       }
       res.on('data', (c: Buffer) => {
@@ -65,30 +91,32 @@ function fetchText(url: string, timeoutMs: number, redirects = 0): Promise<strin
         if (total > 512 * 1024) {
           clearTimeout(timer)
           req.abort()
-          resolve(Buffer.concat(chunks).toString('utf8')) // head is enough for og tags
+          resolve({ ok: true, html: Buffer.concat(chunks).toString('utf8') }) // head is enough for og tags
           return
         }
         chunks.push(c)
       })
       res.on('end', () => {
         clearTimeout(timer)
-        resolve(Buffer.concat(chunks).toString('utf8'))
+        resolve({ ok: true, html: Buffer.concat(chunks).toString('utf8') })
       })
       res.on('error', () => {
         clearTimeout(timer)
-        resolve(null)
+        resolve({ ok: false, reason: 'network' })
       })
     })
     req.on('error', () => {
       clearTimeout(timer)
-      resolve(null)
+      resolve({ ok: false, reason: 'network' })
     })
     req.end()
-    void redirects
   })
 }
 
 function fetchBinary(url: string, timeoutMs: number, maxBytes: number): Promise<Buffer | null> {
+  // net.request throws synchronously on a non-http(s) scheme — inside the
+  // executor below that would come back as a rejection, not a null.
+  if (!isHttpUrl(url)) return Promise.resolve(null)
   return new Promise((resolve) => {
     const req = net.request({ url, redirect: 'follow' })
     const timer = setTimeout(() => {

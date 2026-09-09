@@ -231,7 +231,7 @@ export function GifPicker({
       {/* Grid or empty state */}
       <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '0 12px 12px' }}>
         {items.length > 0 ? (
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 4 }}>
             {items.map((item, i) => (
               <button
                 key={`${item.url}-${i}`}
@@ -277,7 +277,7 @@ export function GifPicker({
               {q ? 'Nothing in the vault for that' : 'No GIFs here yet'}
             </div>
             <div style={{ fontSize: 12, lineHeight: '17px', color: 'var(--text-3)' }}>
-              The GIF vault ships in the next update — drag any GIF into the chat meanwhile.
+              Try another word, or drag any GIF into the chat.
             </div>
           </div>
         )}

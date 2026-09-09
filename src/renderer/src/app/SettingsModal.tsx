@@ -423,7 +423,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
               {section === 'about' && (
                 <>
                   <div>
-                    <div style={{ fontSize: 22, fontWeight: 600, color: 'var(--text-1)' }}>Semaphore</div>
+                    <div style={{ fontSize: 22, fontWeight: 600, color: 'var(--text-1)' }}>Chat</div>
                     <div style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 4 }}>
                       Serverless team chat over an encrypted shared folder.
                     </div>

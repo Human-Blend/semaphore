@@ -114,7 +114,9 @@ export default function RightRail({
 
   const sortedMembers = useMemo(() => {
     const rank = { online: 0, away: 1, offline: 2 } as const
-    return [...presence].sort((a, b) => rank[a.state] - rank[b.state] || a.name.localeCompare(b.name))
+    return presence
+      .filter((p) => !p.departed)
+      .sort((a, b) => rank[a.state] - rank[b.state] || a.name.localeCompare(b.name))
   }, [presence])
 
   return (

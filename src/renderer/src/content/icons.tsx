@@ -28,6 +28,15 @@ export function GlobeIcon({ size = 16 }: IconProps) {
   )
 }
 
+export function LinkIcon({ size = 16 }: IconProps) {
+  return (
+    <svg {...svgProps(size)}>
+      <path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1.5 1.5" />
+      <path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1.5-1.5" />
+    </svg>
+  )
+}
+
 export function CopyIcon({ size = 16 }: IconProps) {
   return (
     <svg {...svgProps(size)}>

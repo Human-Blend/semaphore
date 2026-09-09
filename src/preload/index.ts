@@ -22,6 +22,7 @@ const bridge: BridgeApi = {
   app: {
     getBoot: () => invoke('app:getBoot'),
     unlock: (passphrase) => invoke('app:unlock', passphrase),
+    resetLocalData: () => invoke('app:resetLocalData'),
     changeTeamFolder: () => invoke('app:changeTeamFolder'),
     relaunch: () => invoke('app:relaunch'),
     openExternal: (url) => invoke('app:openExternal', url),
@@ -50,6 +51,7 @@ const bridge: BridgeApi = {
     markRead: (conv, stem) => invoke('chat:markRead', conv, stem),
     setTyping: (conv) => invoke('chat:setTyping', conv),
     cursors: (conv) => invoke('chat:cursors', conv),
+    myReads: () => invoke('chat:myReads'),
   },
 
   presence: {
@@ -104,6 +106,23 @@ const bridge: BridgeApi = {
   frames: {
     publish: (sessionId, seq, bytes) => invoke('frames:publish', sessionId, seq, bytes),
     watchViewers: (sessionId, on) => invoke('frames:watchViewers', sessionId, on),
+  },
+
+  calendar: {
+    put: (entry) => invoke('calendar:put', entry),
+    remove: (id) => invoke('calendar:remove', id),
+  },
+
+  prs: {
+    status: () => invoke('prs:status'),
+    list: () => invoke('prs:list'),
+    refresh: () => invoke('prs:refresh'),
+    markSeen: (keys) => invoke('prs:markSeen', keys),
+    testConnection: (input) => invoke('prs:testConnection', input),
+    listRepos: (input) => invoke('prs:listRepos', input),
+    saveConfig: (input) => invoke('prs:saveConfig', input),
+    setPersonalToken: (token) => invoke('prs:setPersonalToken', token),
+    disconnect: () => invoke('prs:disconnect'),
   },
 
   settings: {

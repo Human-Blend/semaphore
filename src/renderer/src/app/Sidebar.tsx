@@ -1,13 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import type { PresenceView } from '@shared/types'
-import { useStore, selfOf } from '@/store'
-import { Avatar, DeviceChip, identityHue } from '@/ui/atoms'
-import { SectionLabel, Toggle, truncate } from './chrome'
-import { IconGear, IconPlus } from './icons'
-import { useBeamTarget, BeamLabel } from './beam'
-import { openDm, useDmMap } from './dm'
-import { toast } from './toasts'
-import QuickSwitcher from './QuickSwitcher'
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import type { ConvId, PresenceView } from "@shared/types";
+import { TEAM_CONV } from "@shared/constants";
+import { materializeCalendar, occurrencesInRange, ymd } from "@shared/calendar";
+import { useStore, selfOf } from "@/store";
+import { Avatar, DeviceChip, identityHue } from "@/ui/atoms";
+import { SectionLabel, Toggle, truncate } from "./chrome";
+import { IconCalendar, IconGear, IconGitPull, IconPlus } from "./icons";
+import { useBeamTarget, BeamLabel } from "./beam";
+import { openDm, useDmMap } from "./dm";
+import { toast } from "./toasts";
+import QuickSwitcher from "./QuickSwitcher";
 
 // Spec §2.2 — the sidebar: quick switcher, channels, DMs (beam drop targets),
 // self footer with status popover. The team block lives in the titlebar row.
@@ -19,41 +22,41 @@ function ChannelRow({
   unread,
   onClick,
 }: {
-  conv: string
-  name: string
-  active: boolean
-  unread: number
-  onClick: () => void
+  conv: string;
+  name: string;
+  active: boolean;
+  unread: number;
+  onClick: () => void;
 }) {
-  void conv
-  const hasUnread = unread > 0
+  void conv;
+  const hasUnread = unread > 0;
   return (
     <button
       className="sem-row"
       onClick={onClick}
       title={`#${name}`}
-      aria-label={`Channel ${name}${hasUnread ? `, ${unread} unread` : ''}`}
+      aria-label={`Channel ${name}${hasUnread ? `, ${unread} unread` : ""}`}
       style={{
-        position: 'relative',
-        width: '100%',
+        position: "relative",
+        width: "100%",
         height: 30,
         gap: 8,
-        padding: '0 8px 0 10px',
-        borderRadius: 'var(--r-sm)',
-        background: active ? 'var(--accent-soft)' : undefined,
+        padding: "0 8px 0 10px",
+        borderRadius: "var(--r-sm)",
+        background: active ? "var(--accent-soft)" : undefined,
       }}
     >
       {active && (
         <span
           aria-hidden="true"
           style={{
-            position: 'absolute',
+            position: "absolute",
             left: 0,
             top: 7,
             bottom: 7,
             width: 2,
             borderRadius: 2,
-            background: 'var(--accent)',
+            background: "var(--accent)",
           }}
         />
       )}
@@ -61,13 +64,13 @@ function ChannelRow({
         aria-hidden="true"
         style={{
           width: 14,
-          textAlign: 'center',
+          textAlign: "center",
           fontWeight: 600,
           fontSize: 13,
           color: identityHue(name),
-          filter: 'saturate(0.6)',
+          filter: "saturate(0.6)",
           flexShrink: 0,
-          userSelect: 'none',
+          userSelect: "none",
         }}
       >
         #
@@ -79,57 +82,332 @@ function ChannelRow({
           minWidth: 0,
           fontSize: 13,
           fontWeight: hasUnread ? 600 : 400,
-          color: active || hasUnread ? 'var(--text-1)' : 'var(--text-2)',
-          transition: 'color var(--t-fast) var(--ease-standard)',
+          color: active || hasUnread ? "var(--text-1)" : "var(--text-2)",
+          transition: "color var(--t-fast) var(--ease-standard)",
         }}
       >
         {name}
       </span>
-      {hasUnread && (
+      {hasUnread && <UnreadBadge count={unread} />}
+    </button>
+  );
+}
+
+export function UnreadBadge({
+  count,
+  tone = "accent",
+}: {
+  count: number;
+  tone?: "accent" | "danger";
+}) {
+  return (
+    <span
+      style={{
+        minWidth: 18,
+        height: 16,
+        padding: "0 5px",
+        borderRadius: "var(--r-full)",
+        background: tone === "danger" ? "var(--danger)" : "var(--accent)",
+        color: "var(--on-accent)",
+        fontSize: 11,
+        fontWeight: 600,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+      }}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
+/**
+ * A fixed "team" conversation row (calendar, pull requests) — same metrics as
+ * ChannelRow, but with a glyph instead of the `#` and an optional trailing
+ * badge/chip supplied by the caller.
+ */
+function SpecialRow({
+  name,
+  icon,
+  active,
+  ariaLabel,
+  title,
+  trailing,
+  onClick,
+  action,
+}: {
+  name: string;
+  icon: ReactNode;
+  active: boolean;
+  ariaLabel: string;
+  title: string;
+  trailing?: ReactNode;
+  onClick: () => void;
+  /** Optional secondary affordance: a small button revealed on hover, also reachable by right-click. */
+  action?: { label: string; icon: ReactNode; onClick: () => void };
+}) {
+  const [hover, setHover] = useState(false);
+  const showAction = action !== undefined && hover;
+  return (
+    <div
+      style={{ position: "relative" }}
+      onMouseEnter={action ? () => setHover(true) : undefined}
+      onMouseLeave={action ? () => setHover(false) : undefined}
+    >
+      <button
+        className="sem-row"
+        onClick={onClick}
+        onContextMenu={
+          action
+            ? (e) => {
+                e.preventDefault();
+                action.onClick();
+              }
+            : undefined
+        }
+        title={title}
+        aria-label={ariaLabel}
+        style={{
+          position: "relative",
+          width: "100%",
+          height: 30,
+          gap: 8,
+          padding: "0 8px 0 10px",
+          borderRadius: "var(--r-sm)",
+          background: active ? "var(--accent-soft)" : undefined,
+        }}
+      >
+        {active && (
+          <span
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 7,
+              bottom: 7,
+              width: 2,
+              borderRadius: 2,
+              background: "var(--accent)",
+            }}
+          />
+        )}
         <span
+          aria-hidden="true"
           style={{
-            minWidth: 18,
-            height: 16,
-            padding: '0 5px',
-            borderRadius: 'var(--r-full)',
-            background: 'var(--accent)',
-            color: 'var(--on-accent)',
-            fontSize: 11,
-            fontWeight: 600,
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
+            width: 14,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: active ? "var(--text-1)" : "var(--text-3)",
             flexShrink: 0,
           }}
         >
-          {unread > 99 ? '99+' : unread}
+          {icon}
         </span>
+        <span
+          style={{
+            ...truncate,
+            flex: 1,
+            minWidth: 0,
+            fontSize: 13,
+            color: active ? "var(--text-1)" : "var(--text-2)",
+            transition: "color var(--t-fast) var(--ease-standard)",
+          }}
+        >
+          {name}
+        </span>
+        {!showAction && trailing}
+      </button>
+      {showAction && (
+        <button
+          className="sem-row sem-focus"
+          onClick={(e) => {
+            e.stopPropagation();
+            action.onClick();
+          }}
+          title={action.label}
+          aria-label={action.label}
+          style={{
+            position: "absolute",
+            right: 8,
+            top: 6,
+            width: 18,
+            height: 18,
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: "var(--r-xs)",
+            color: "var(--text-3)",
+          }}
+        >
+          {action.icon}
+        </button>
       )}
-    </button>
-  )
+    </div>
+  );
 }
 
-function DmRow({ p, active }: { p: PresenceView; active: boolean }) {
-  const beam = useBeamTarget(p.deviceId, p.name)
-  const offline = p.state === 'offline'
+/** The "Set up" affordance shown on the PR row before anyone has connected. */
+function SetupChip({ label = "Set up" }: { label?: string }) {
+  return (
+    <span
+      style={{
+        height: 16,
+        padding: "0 6px",
+        borderRadius: "var(--r-full)",
+        background: "var(--bg-raised)",
+        border: "1px solid var(--border-subtle)",
+        color: "var(--text-3)",
+        fontSize: 10,
+        fontWeight: 600,
+        display: "inline-flex",
+        alignItems: "center",
+        flexShrink: 0,
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+/** Team section: the calendar and the pull-request group (spec §3). */
+function TeamSection({
+  activeConv,
+  onOpen,
+}: {
+  activeConv: ConvId | null;
+  onOpen: (conv: ConvId) => void;
+}) {
+  const calEvents = useStore((s) => s.events[TEAM_CONV.calendar]);
+  const prsStatus = useStore((s) => s.prsStatus);
+  const setPrsPrefsOpen = useStore((s) => s.setPrsPrefsOpen);
+
+  // A hue dot on the calendar row when anything (including an annual entry)
+  // falls on today — the calendar has no unread notion. Recomputed per render
+  // (a string, so the memo below still only re-runs on an actual day change).
+  const today = ymd(new Date());
+  const somethingToday = useMemo(() => {
+    if (!calEvents || calEvents.length === 0) return false;
+    return (
+      occurrencesInRange(materializeCalendar(calEvents), today, today).length >
+      0
+    );
+  }, [calEvents, today]);
+
+  const unseen = prsStatus?.unseen ?? 0;
+
+  // Someone set the group up without sharing their token: this machine polls
+  // nothing, so `unseen` stays 0 forever and the row would otherwise be
+  // indistinguishable from a quiet, working group. The chip is the only cue
+  // that the pane is waiting for a personal token.
+  const needsToken =
+    prsStatus?.configured === true && prsStatus.tokenSource === "none";
+
+  return (
+    <>
+      <div style={{ padding: "10px 8px 4px" }}>
+        <SectionLabel>Team</SectionLabel>
+      </div>
+      <SpecialRow
+        name="Calendar"
+        icon={<IconCalendar size={13} />}
+        active={activeConv === TEAM_CONV.calendar}
+        title={
+          somethingToday
+            ? "Team calendar — something is on today"
+            : "Team calendar"
+        }
+        ariaLabel={`Team calendar${somethingToday ? ", something is on today" : ""}`}
+        onClick={() => onOpen(TEAM_CONV.calendar)}
+        trailing={
+          somethingToday ? (
+            <span
+              aria-hidden="true"
+              style={{
+                width: 6,
+                height: 6,
+                borderRadius: "50%",
+                background: "var(--accent)",
+                flexShrink: 0,
+              }}
+            />
+          ) : undefined
+        }
+      />
+      <SpecialRow
+        name="Pull requests"
+        icon={<IconGitPull size={13} />}
+        active={activeConv === TEAM_CONV.prs}
+        title={
+          prsStatus && !prsStatus.configured
+            ? "Pull requests — not connected to Azure DevOps yet"
+            : needsToken
+              ? "Pull requests — enter your Azure DevOps token to start watching"
+              : unseen > 0
+                ? `Pull requests — ${unseen} waiting`
+                : "Pull requests"
+        }
+        ariaLabel={
+          prsStatus && !prsStatus.configured
+            ? "Pull requests, set up needed"
+            : needsToken
+              ? "Pull requests, your Azure DevOps token is needed"
+              : `Pull requests${unseen > 0 ? `, ${unseen} unseen` : ""}`
+        }
+        onClick={() => onOpen(TEAM_CONV.prs)}
+        action={{
+          label: "Pull request settings",
+          icon: <IconGear size={12} />,
+          onClick: () => setPrsPrefsOpen(true),
+        }}
+        trailing={
+          prsStatus && !prsStatus.configured ? (
+            <SetupChip />
+          ) : needsToken ? (
+            <SetupChip label="Add token" />
+          ) : unseen > 0 ? (
+            <UnreadBadge count={unseen} tone="danger" />
+          ) : undefined
+        }
+      />
+    </>
+  );
+}
+
+function DmRow({
+  p,
+  active,
+  unread,
+}: {
+  p: PresenceView;
+  active: boolean;
+  unread: number;
+}) {
+  const beam = useBeamTarget(p.deviceId, p.name);
+  const offline = p.state === "offline";
+  const hasUnread = unread > 0;
   return (
     <button
       className="sem-row"
       onClick={() => void openDm(p.deviceId)}
       title={`Message ${p.name} (${p.hostname})`}
-      aria-label={`Direct message ${p.name}, ${p.state}`}
+      aria-label={`Direct message ${p.name}, ${p.state}${hasUnread ? `, ${unread} unread` : ""}`}
       {...beam.props}
       style={{
-        position: 'relative',
-        width: '100%',
+        position: "relative",
+        width: "100%",
         height: beam.over ? 44 : 36,
         gap: 8,
-        padding: '0 8px',
-        borderRadius: 'var(--r-sm)',
-        background: beam.over ? 'var(--flare-soft)' : active ? 'var(--accent-soft)' : undefined,
-        boxShadow: beam.over ? 'inset 0 0 0 1px var(--flare)' : undefined,
+        padding: "0 8px",
+        borderRadius: "var(--r-sm)",
+        background: beam.over
+          ? "var(--flare-soft)"
+          : active
+            ? "var(--accent-soft)"
+            : undefined,
+        boxShadow: beam.over ? "inset 0 0 0 1px var(--flare)" : undefined,
         transition:
-          'height var(--t-fast) var(--ease-standard), background var(--t-fast) var(--ease-standard), box-shadow var(--t-fast) var(--ease-standard)',
+          "height var(--t-fast) var(--ease-standard), background var(--t-fast) var(--ease-standard), box-shadow var(--t-fast) var(--ease-standard)",
       }}
     >
       {beam.over ? (
@@ -140,34 +418,45 @@ function DmRow({ p, active }: { p: PresenceView; active: boolean }) {
             <span
               aria-hidden="true"
               style={{
-                position: 'absolute',
+                position: "absolute",
                 left: 0,
                 top: 9,
                 bottom: 9,
                 width: 2,
                 borderRadius: 2,
-                background: 'var(--accent)',
+                background: "var(--accent)",
               }}
             />
           )}
-          <Avatar name={p.name} size={24} presence={p.state} desaturate={p.state === 'away'} />
+          <Avatar
+            name={p.name}
+            size={24}
+            presence={p.state}
+            desaturate={p.state === "away"}
+          />
           <span
             style={{
               ...truncate,
               flex: 1,
               minWidth: 0,
               fontSize: 13,
-              color: offline ? 'var(--text-3)' : 'var(--text-1)',
-              transition: 'color var(--t-slow) var(--ease-standard)',
+              fontWeight: hasUnread ? 600 : 400,
+              color: offline && !hasUnread ? "var(--text-3)" : "var(--text-1)",
+              transition: "color var(--t-slow) var(--ease-standard)",
             }}
           >
             {p.name}
           </span>
-          <DeviceChip hostname={p.hostname} fingerprint={p.fingerprint} warn={p.trust === 'flagged'} />
+          <DeviceChip
+            hostname={p.hostname}
+            fingerprint={p.fingerprint}
+            warn={p.trust === "flagged"}
+          />
+          {hasUnread && <UnreadBadge count={unread} />}
         </>
       )}
     </button>
-  )
+  );
 }
 
 function StatusPopover({
@@ -175,41 +464,41 @@ function StatusPopover({
   appearOffline,
   onClose,
 }: {
-  currentStatus: string
-  appearOffline: boolean
-  onClose: () => void
+  currentStatus: string;
+  appearOffline: boolean;
+  onClose: () => void;
 }) {
-  const [text, setText] = useState(currentStatus)
-  const [offline, setOffline] = useState(appearOffline)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const [text, setText] = useState(currentStatus);
+  const [offline, setOffline] = useState(appearOffline);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    inputRef.current?.focus()
-  }, [])
+    inputRef.current?.focus();
+  }, []);
 
   async function save() {
     try {
-      await window.bridge.presence.setStatus(text.trim())
-      toast(text.trim() ? 'Status set' : 'Status cleared', 'success')
-      onClose()
+      await window.bridge.presence.setStatus(text.trim());
+      toast(text.trim() ? "Status set" : "Status cleared", "success");
+      onClose();
     } catch {
-      toast('Could not set status', 'danger')
+      toast("Could not set status", "danger");
     }
   }
 
   async function setAppear(v: boolean) {
-    setOffline(v)
+    setOffline(v);
     try {
-      await window.bridge.presence.setAppearState(v ? 'offline' : 'online')
+      await window.bridge.presence.setAppearState(v ? "offline" : "online");
     } catch {
-      toast('Could not change presence', 'danger')
+      toast("Could not change presence", "danger");
     }
   }
 
   return (
     <>
       <div
-        style={{ position: 'fixed', inset: 0, zIndex: 70 }}
+        style={{ position: "fixed", inset: 0, zIndex: 70 }}
         onClick={onClose}
         aria-hidden="true"
       />
@@ -218,19 +507,27 @@ function StatusPopover({
         aria-label="Status"
         className="sem-frost"
         style={{
-          position: 'absolute',
+          position: "absolute",
           left: 8,
           right: 8,
           bottom: 58,
           zIndex: 71,
-          borderRadius: 'var(--r-lg)',
-          border: '1px solid var(--border-subtle)',
-          boxShadow: 'var(--elev-2)',
+          borderRadius: "var(--r-lg)",
+          border: "1px solid var(--border-subtle)",
+          boxShadow: "var(--elev-2)",
           padding: 12,
-          animation: 'sem-rise var(--t-base) var(--ease-pop)',
+          animation: "sem-rise var(--t-base) var(--ease-pop)",
         }}
       >
-        <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', color: 'var(--text-3)', marginBottom: 6 }}>
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            letterSpacing: "0.06em",
+            color: "var(--text-3)",
+            marginBottom: 6,
+          }}
+        >
           STATUS
         </div>
         <input
@@ -241,12 +538,14 @@ function StatusPopover({
           maxLength={80}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') void save()
-            if (e.key === 'Escape') onClose()
+            if (e.key === "Enter") void save();
+            if (e.key === "Escape") onClose();
           }}
           aria-label="Status text"
         />
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+        <div
+          style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}
+        >
           <button
             className="sem-chip-btn"
             onClick={() => void save()}
@@ -258,20 +557,26 @@ function StatusPopover({
         </div>
         <div
           style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
             marginTop: 10,
             paddingTop: 10,
-            borderTop: '1px solid var(--border-subtle)',
+            borderTop: "1px solid var(--border-subtle)",
           }}
         >
-          <span style={{ fontSize: 13, color: 'var(--text-2)' }}>Appear offline</span>
-          <Toggle on={offline} onChange={(v) => void setAppear(v)} label="Appear offline" />
+          <span style={{ fontSize: 13, color: "var(--text-2)" }}>
+            Appear offline
+          </span>
+          <Toggle
+            on={offline}
+            onChange={(v) => void setAppear(v)}
+            label="Appear offline"
+          />
         </div>
       </div>
     </>
-  )
+  );
 }
 
 /**
@@ -280,95 +585,143 @@ function StatusPopover({
  * lights regardless of how the OS insets them.
  */
 function TeamBlock() {
-  const boot = useStore((s) => s.boot)
-  const health = useStore((s) => s.health)
-  const self = selfOf(boot)
-  const slow = health.reachable && health.latencyMs !== null && health.latencyMs >= 500
-  const color = !health.reachable ? 'var(--danger)' : slow ? 'var(--warning)' : 'var(--success)'
+  const boot = useStore((s) => s.boot);
+  const health = useStore((s) => s.health);
+  const self = selfOf(boot);
+  const slow =
+    health.reachable && health.latencyMs !== null && health.latencyMs >= 500;
+  const color = !health.reachable
+    ? "var(--danger)"
+    : slow
+      ? "var(--warning)"
+      : "var(--success)";
   const label = !health.reachable
-    ? 'Share unreachable'
+    ? "Share unreachable"
     : slow
       ? `Share slow · ${health.latencyMs}ms`
-      : `Share connected${health.latencyMs !== null ? ` · ${health.latencyMs}ms` : ''}`
+      : `Share connected${health.latencyMs !== null ? ` · ${health.latencyMs}ms` : ""}`;
 
   return (
     <div
       style={{
         height: 52,
         flexShrink: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        justifyContent: 'center',
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "center",
         gap: 2,
-        padding: '0 12px 0 16px',
+        padding: "0 12px 0 16px",
         minWidth: 0,
-        userSelect: 'none',
+        userSelect: "none",
       }}
     >
-      <span style={{ ...truncate, fontSize: 15, fontWeight: 600, color: 'var(--text-1)' }}>
-        {self?.teamName ?? 'Semaphore'}
+      <span
+        style={{
+          ...truncate,
+          fontSize: 15,
+          fontWeight: 600,
+          color: "var(--text-1)",
+        }}
+      >
+        {self?.teamName ?? "Chat"}
       </span>
       <span
         title={
           !health.reachable
-            ? 'The team folder cannot be reached right now. Messages queue on this machine.'
+            ? "The team folder cannot be reached right now. Messages queue on this machine."
             : slow
-              ? 'The share is responding slowly — messages may take a few seconds to appear.'
-              : 'Connected to the team folder.'
+              ? "The share is responding slowly — messages may take a few seconds to appear."
+              : "Connected to the team folder."
         }
-        style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-3)', minWidth: 0 }}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 5,
+          fontSize: 11,
+          color: "var(--text-3)",
+          minWidth: 0,
+        }}
       >
-        <span aria-hidden="true" style={{ width: 6, height: 6, borderRadius: '50%', background: color, flexShrink: 0 }} />
+        <span
+          aria-hidden="true"
+          style={{
+            width: 6,
+            height: 6,
+            borderRadius: "50%",
+            background: color,
+            flexShrink: 0,
+          }}
+        />
         <span style={truncate}>{label}</span>
       </span>
     </div>
-  )
+  );
 }
 
-export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const channels = useStore((s) => s.channels)
-  const presence = useStore((s) => s.presence)
-  const boot = useStore((s) => s.boot)
-  const activeConv = useStore((s) => s.activeConv)
-  const setActiveConv = useStore((s) => s.setActiveConv)
+export default function Sidebar({
+  onOpenSettings,
+}: {
+  onOpenSettings: () => void;
+}) {
+  const channels = useStore((s) => s.channels);
+  const presence = useStore((s) => s.presence);
+  const boot = useStore((s) => s.boot);
+  const activeConv = useStore((s) => s.activeConv);
+  const setActiveConv = useStore((s) => s.setActiveConv);
   // Subscribed so unread counts refresh as events/read-cursors change.
-  useStore((s) => s.events)
-  useStore((s) => s.myReads)
-  const unreadCount = useStore((s) => s.unreadCount)
-  const dmPeers = useDmMap((s) => s.peers)
-  const self = selfOf(boot)
+  const events = useStore((s) => s.events);
+  const myReads = useStore((s) => s.myReads);
+  const unreadCount = useStore((s) => s.unreadCount);
+  const dmPeers = useDmMap((s) => s.peers);
+  const self = selfOf(boot);
 
-  const [adding, setAdding] = useState(false)
-  const [newName, setNewName] = useState('')
-  const [statusOpen, setStatusOpen] = useState(false)
-  const addRef = useRef<HTMLInputElement>(null)
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [statusOpen, setStatusOpen] = useState(false);
+  const addRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (adding) addRef.current?.focus()
-  }, [adding])
+    if (adding) addRef.current?.focus();
+  }, [adding]);
 
+  // Departed devices drop off the list — unless they left us something
+  // unread, in which case the row stays until it has been opened.
   const others = useMemo(() => {
-    const list = presence.filter((p) => p.deviceId !== self?.deviceId)
-    const rank = { online: 0, away: 1, offline: 2 } as const
-    list.sort((a, b) => rank[a.state] - rank[b.state] || a.name.localeCompare(b.name))
-    return list
-  }, [presence, self?.deviceId])
+    const list = presence.filter(
+      (p) =>
+        p.deviceId !== self?.deviceId &&
+        (!p.departed || unreadCount(p.dmConv) > 0),
+    );
+    const rank = { online: 0, away: 1, offline: 2 } as const;
+    list.sort(
+      (a, b) => rank[a.state] - rank[b.state] || a.name.localeCompare(b.name),
+    );
+    return list;
+    // events/myReads are what unreadCount reads; listing them keeps the memo honest.
+  }, [presence, self?.deviceId, unreadCount, events, myReads]);
 
-  const selfPresence = presence.find((p) => p.deviceId === self?.deviceId)
+  const selfPresence = presence.find((p) => p.deviceId === self?.deviceId);
 
   async function createChannel() {
-    const name = newName.trim().toLowerCase().replace(/\s+/g, '-').replace(/^#/, '')
+    const name = newName
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/^#/, "");
     if (!name) {
-      setAdding(false)
-      return
+      setAdding(false);
+      return;
     }
     try {
-      const ch = await window.bridge.chat.createChannel(name)
-      setActiveConv(ch.conv)
-      setAdding(false)
-      setNewName('')
+      const ch = await window.bridge.chat.createChannel(name);
+      setActiveConv(ch.conv);
+      setAdding(false);
+      setNewName("");
     } catch (err) {
-      toast(`Could not create #${name} — ${err instanceof Error ? err.message : String(err)}`, 'danger')
+      toast(
+        `Could not create #${name} — ${err instanceof Error ? err.message : String(err)}`,
+        "danger",
+      );
     }
   }
 
@@ -377,24 +730,29 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
       style={{
         width: 260,
         flexShrink: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        background: 'var(--bg-sidebar)',
-        borderRight: '1px solid var(--border-subtle)',
-        position: 'relative',
+        display: "flex",
+        flexDirection: "column",
+        background: "var(--bg-sidebar)",
+        borderRight: "1px solid var(--border-subtle)",
+        position: "relative",
         minHeight: 0,
       }}
     >
       <TeamBlock />
       <QuickSwitcher />
 
-      <div className="sem-scroll" style={{ flex: 1, minHeight: 0, padding: '4px 8px 8px' }}>
+      <div
+        className="sem-scroll"
+        style={{ flex: 1, minHeight: 0, padding: "4px 8px 8px" }}
+      >
+        <TeamSection activeConv={activeConv} onOpen={setActiveConv} />
+
         <div
           style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '10px 8px 4px',
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "16px 8px 4px",
           }}
         >
           <SectionLabel>Channels</SectionLabel>
@@ -406,10 +764,10 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
             style={{
               width: 18,
               height: 18,
-              alignItems: 'center',
-              justifyContent: 'center',
-              borderRadius: 'var(--r-xs)',
-              color: 'var(--text-3)',
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: "var(--r-xs)",
+              color: "var(--text-3)",
             }}
           >
             <IconPlus size={12} />
@@ -417,7 +775,7 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
         </div>
 
         {adding && (
-          <div style={{ padding: '2px 0 4px' }}>
+          <div style={{ padding: "2px 0 4px" }}>
             <input
               ref={addRef}
               className="sem-input"
@@ -427,15 +785,15 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') void createChannel()
-                if (e.key === 'Escape') {
-                  setAdding(false)
-                  setNewName('')
+                if (e.key === "Enter") void createChannel();
+                if (e.key === "Escape") {
+                  setAdding(false);
+                  setNewName("");
                 }
               }}
               onBlur={() => {
-                setAdding(false)
-                setNewName('')
+                setAdding(false);
+                setNewName("");
               }}
               spellCheck={false}
             />
@@ -453,17 +811,28 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
           />
         ))}
         {!channels.length && (
-          <div style={{ padding: '4px 8px', fontSize: 12, color: 'var(--text-3)' }}>No channels yet — create one.</div>
+          <div
+            style={{ padding: "4px 8px", fontSize: 12, color: "var(--text-3)" }}
+          >
+            No channels yet — create one.
+          </div>
         )}
 
-        <div style={{ padding: '16px 8px 4px' }}>
+        <div style={{ padding: "16px 8px 4px" }}>
           <SectionLabel>Direct messages</SectionLabel>
         </div>
         {others.map((p) => (
-          <DmRow key={p.deviceId} p={p} active={activeConv !== null && dmPeers[activeConv] === p.deviceId} />
+          <DmRow
+            key={p.deviceId}
+            p={p}
+            active={activeConv !== null && dmPeers[activeConv] === p.deviceId}
+            unread={activeConv === p.dmConv ? 0 : unreadCount(p.dmConv)}
+          />
         ))}
         {!others.length && (
-          <div style={{ padding: '4px 8px', fontSize: 12, color: 'var(--text-3)' }}>
+          <div
+            style={{ padding: "4px 8px", fontSize: 12, color: "var(--text-3)" }}
+          >
             Nobody else yet. Teammates appear here when they join the folder.
           </div>
         )}
@@ -472,14 +841,14 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
       {self && (
         <div
           style={{
-            height: 52,
+            height: 56,
             flexShrink: 0,
-            display: 'flex',
-            alignItems: 'center',
+            display: "flex",
+            alignItems: "center",
             gap: 8,
-            padding: '0 8px',
-            borderTop: '1px solid var(--border-subtle)',
-            position: 'relative',
+            padding: "0 8px",
+            borderTop: "1px solid var(--border-subtle)",
+            position: "relative",
           }}
         >
           <button
@@ -488,19 +857,59 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
             title="Set your status"
             aria-label="Set your status"
             aria-expanded={statusOpen}
-            style={{ flex: 1, minWidth: 0, height: 40, gap: 8, padding: '0 6px', borderRadius: 'var(--r-sm)' }}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              height: 44,
+              gap: 8,
+              padding: "0 6px",
+              borderRadius: "var(--r-sm)",
+            }}
           >
-            <Avatar name={self.displayName} size={28} presence={selfPresence?.state ?? 'online'} />
+            <Avatar
+              name={self.displayName}
+              size={28}
+              presence={selfPresence?.state ?? "online"}
+            />
             <span style={{ minWidth: 0, flex: 1 }}>
-              <span style={{ ...truncate, display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--text-1)' }}>
+              <span
+                style={{
+                  ...truncate,
+                  display: "block",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: "var(--text-1)",
+                }}
+              >
                 {self.displayName}
               </span>
-              <span style={{ ...truncate, display: 'block', fontSize: 11, color: 'var(--text-3)' }}>
-                {selfPresence?.status || 'Set a status'}
+              {/* The device chip gets its own line so a long name never has to give way to it. */}
+              <span
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  minWidth: 0,
+                  marginTop: 2,
+                }}
+              >
+                <DeviceChip
+                  hostname={self.hostname}
+                  fingerprint={self.fingerprint}
+                />
+                <span
+                  style={{
+                    ...truncate,
+                    fontSize: 11,
+                    color: "var(--text-3)",
+                    minWidth: 0,
+                  }}
+                >
+                  {selfPresence?.status || "Set a status"}
+                </span>
               </span>
             </span>
           </button>
-          <DeviceChip hostname={self.hostname} fingerprint={self.fingerprint} />
           <button
             className="sem-row sem-focus"
             onClick={onOpenSettings}
@@ -509,10 +918,10 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
             style={{
               width: 28,
               height: 28,
-              alignItems: 'center',
-              justifyContent: 'center',
-              borderRadius: 'var(--r-sm)',
-              color: 'var(--text-2)',
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: "var(--r-sm)",
+              color: "var(--text-2)",
             }}
           >
             <IconGear size={16} />
@@ -520,13 +929,13 @@ export default function Sidebar({ onOpenSettings }: { onOpenSettings: () => void
 
           {statusOpen && (
             <StatusPopover
-              currentStatus={selfPresence?.status ?? ''}
-              appearOffline={selfPresence?.state === 'offline'}
+              currentStatus={selfPresence?.status ?? ""}
+              appearOffline={selfPresence?.state === "offline"}
               onClose={() => setStatusOpen(false)}
             />
           )}
         </div>
       )}
     </div>
-  )
+  );
 }

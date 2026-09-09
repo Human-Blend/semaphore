@@ -1,0 +1,311 @@
+import { describe, expect, it } from 'vitest'
+import { AdoClient, type AdoResponse, type FetchLike } from './ado'
+
+// The whole point of the injectable FetchLike: the mapping table in §2.3 is
+// testable without a network, an Electron runtime, or an Azure DevOps server.
+// The token used everywhere below is long enough to be redactable and is
+// asserted absent from every error detail.
+
+const TOKEN = 'pat-abcdefghijklmnopqrstuvwxyz0123456789-SECRET'
+const BASE = 'https://dev.azure.com/acme'
+
+interface Call {
+  url: string
+  headers: Record<string, string>
+}
+
+function res(init: {
+  status?: number
+  body?: string
+  headers?: Record<string, string>
+}): AdoResponse {
+  const h = init.headers ?? {}
+  return {
+    status: init.status ?? 200,
+    headers: { get: (n: string) => h[n.toLowerCase()] ?? null },
+    text: async () => init.body ?? '',
+  }
+}
+
+function json(value: unknown, extra?: { status?: number; headers?: Record<string, string> }): AdoResponse {
+  return res({ status: extra?.status ?? 200, body: JSON.stringify(value), headers: extra?.headers })
+}
+
+/** A fake fetch that replays a queue of responses (or one repeated response). */
+function fake(
+  reply: AdoResponse | ((call: Call, n: number) => AdoResponse | Promise<AdoResponse>),
+): { fetchImpl: FetchLike; calls: Call[] } {
+  const calls: Call[] = []
+  const fetchImpl: FetchLike = async (url, init) => {
+    const call = { url, headers: init.headers }
+    calls.push(call)
+    return typeof reply === 'function' ? reply(call, calls.length - 1) : reply
+  }
+  return { fetchImpl, calls }
+}
+
+function client(fetchImpl: FetchLike, baseUrl = BASE): AdoClient {
+  return new AdoClient(fetchImpl, { baseUrl, token: TOKEN, userAgent: 'Chat/1.0.1' })
+}
+
+const ME = { authenticatedUser: { id: 'u-1', providerDisplayName: 'Ada Lovelace' } }
+
+describe('AdoClient — request shape', () => {
+  it('sends Basic auth built from ":" + token, Accept and User-Agent', async () => {
+    const f = fake(json(ME))
+    await client(f.fetchImpl).me()
+    const h = f.calls[0].headers
+    expect(h.Authorization).toBe(`Basic ${Buffer.from(`:${TOKEN}`, 'utf8').toString('base64')}`)
+    expect(h.Accept).toBe('application/json')
+    expect(h['User-Agent']).toBe('Chat/1.0.1')
+  })
+
+  it('uses api-version 6.0-preview for connectionData and 6.0 elsewhere', async () => {
+    const f = fake(json(ME))
+    await client(f.fetchImpl).me()
+    expect(f.calls[0].url).toBe(`${BASE}/_apis/connectionData?api-version=${encodeURIComponent('6.0-preview')}`)
+
+    const g = fake(json({ value: [] }))
+    await client(g.fetchImpl).repos('My Project')
+    expect(g.calls[0].url).toBe(`${BASE}/My%20Project/_apis/git/repositories?api-version=6.0`)
+  })
+
+  it('builds the active-pull-requests URL with the search criteria and $top', async () => {
+    const f = fake(json({ value: [] }))
+    await client(f.fetchImpl).activePullRequests('Proj', 'repo-id-1')
+    expect(f.calls[0].url).toBe(
+      `${BASE}/Proj/_apis/git/repositories/repo-id-1/pullrequests` +
+        '?searchCriteria.status=active&$top=200&api-version=6.0',
+    )
+  })
+
+  it('strips a trailing slash from the base URL', async () => {
+    const f = fake(json(ME))
+    await client(f.fetchImpl, `${BASE}///`).me()
+    expect(f.calls[0].url.startsWith(`${BASE}/_apis/`)).toBe(true)
+  })
+})
+
+describe('AdoClient — success parsing', () => {
+  it('me() reads authenticatedUser.{id,providerDisplayName}', async () => {
+    const f = fake(json(ME))
+    const r = await client(f.fetchImpl).me()
+    expect(r).toEqual({ ok: true, value: { id: 'u-1', name: 'Ada Lovelace' } })
+  })
+
+  it('me() treats the anonymous guid as a rejected token', async () => {
+    const f = fake(json({ authenticatedUser: { id: '00000000-0000-0000-0000-000000000000' } }))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
+  it('repos() strips refs/heads/ from defaultBranch and drops nameless entries', async () => {
+    const f = fake(
+      json({
+        value: [
+          { id: 'r1', name: 'api', defaultBranch: 'refs/heads/main' },
+          { id: 'r2', name: 'web' },
+          { id: 'r3' },
+        ],
+      }),
+    )
+    const r = await client(f.fetchImpl).repos('Proj')
+    expect(r).toEqual({
+      ok: true,
+      value: [
+        { id: 'r1', name: 'api', defaultBranch: 'main' },
+        { id: 'r2', name: 'web', defaultBranch: '' },
+      ],
+    })
+  })
+
+  it('activePullRequests() keeps only entries with a numeric pullRequestId', async () => {
+    const f = fake(json({ value: [{ pullRequestId: 7, title: 'Fix' }, { title: 'junk' }] }))
+    const r = await client(f.fetchImpl).activePullRequests('Proj', 'r1')
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.value.map((p) => p.pullRequestId)).toEqual([7])
+  })
+})
+
+describe('AdoClient — continuation-token paging', () => {
+  it('follows x-ms-continuationtoken until it stops coming', async () => {
+    const f = fake((_call, n) => {
+      if (n === 0) return json({ value: [{ id: 'p1', name: 'One' }] }, { headers: { 'x-ms-continuationtoken': 'ct-2' } })
+      if (n === 1) return json({ value: [{ id: 'p2', name: 'Two' }] }, { headers: { 'x-ms-continuationtoken': 'ct-3' } })
+      return json({ value: [{ id: 'p3', name: 'Three' }] })
+    })
+    const r = await client(f.fetchImpl).projects()
+    expect(r).toEqual({
+      ok: true,
+      value: [
+        { id: 'p1', name: 'One' },
+        { id: 'p2', name: 'Two' },
+        { id: 'p3', name: 'Three' },
+      ],
+    })
+    expect(f.calls).toHaveLength(3)
+    expect(f.calls[0].url).not.toContain('continuationToken')
+    expect(f.calls[1].url).toContain('continuationToken=ct-2')
+    expect(f.calls[2].url).toContain('continuationToken=ct-3')
+  })
+
+  it('stops at the page cap instead of looping forever on a stuck token', async () => {
+    const f = fake(json({ value: [{ id: 'p', name: 'P' }] }, { headers: { 'x-ms-continuationtoken': 'same' } }))
+    const r = await client(f.fetchImpl).projects()
+    expect(r.ok).toBe(true)
+    expect(f.calls).toHaveLength(20)
+  })
+
+  it('propagates a mid-paging failure', async () => {
+    const f = fake((_c, n) =>
+      n === 0 ? json({ value: [{ id: 'p1', name: 'One' }] }, { headers: { 'x-ms-continuationtoken': 'ct' } }) : res({ status: 401 }),
+    )
+    const r = await client(f.fetchImpl).projects()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+})
+
+describe('AdoClient — status and body mapping', () => {
+  it('203 with an HTML sign-in page → unauthorized', async () => {
+    const f = fake(res({ status: 203, body: '<!DOCTYPE html><html><body>Sign In</body></html>' }))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
+  it('200 with a non-JSON body → unauthorized', async () => {
+    const f = fake(res({ status: 200, body: '<html>Azure DevOps Services | Sign In</html>' }))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
+  it('200 with valid JSON that is not an object → unauthorized', async () => {
+    const f = fake(res({ status: 200, body: '"nope"' }))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
+  it.each([
+    [401, 'unauthorized'],
+    [403, 'forbidden'],
+    [404, 'not-found'],
+    [407, 'proxy-auth'],
+  ] as const)('%i → %s', async (status, code) => {
+    const f = fake(res({ status }))
+    const r = await client(f.fetchImpl).repos('Proj')
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe(code)
+  })
+
+  it.each([[400], [409], [500], [502]] as const)('%i → http', async (status) => {
+    const f = fake(res({ status, body: 'boom' }))
+    const r = await client(f.fetchImpl).repos('Proj')
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error.code).toBe('http')
+      expect(r.error.detail).toContain(`HTTP ${status}`)
+    }
+  })
+})
+
+describe('AdoClient — thrown-error mapping', () => {
+  async function codeFor(err: unknown): Promise<string> {
+    const f = fake(() => Promise.reject(err))
+    const r = await client(f.fetchImpl).me()
+    return r.ok ? 'ok' : r.error.code
+  }
+
+  it('an abort → timeout', async () => {
+    const abort = new Error('The user aborted a request.')
+    abort.name = 'AbortError'
+    expect(await codeFor(abort)).toBe('timeout')
+  })
+
+  it('AbortSignal.timeout style TimeoutError → timeout', async () => {
+    const to = new Error('signal timed out')
+    to.name = 'TimeoutError'
+    expect(await codeFor(to)).toBe('timeout')
+  })
+
+  it('ERR_CERT_AUTHORITY_INVALID → tls', async () => {
+    expect(await codeFor(new Error('net::ERR_CERT_AUTHORITY_INVALID'))).toBe('tls')
+  })
+
+  it('ERR_NAME_NOT_RESOLVED → dns', async () => {
+    expect(await codeFor(new Error('net::ERR_NAME_NOT_RESOLVED'))).toBe('dns')
+  })
+
+  it('ERR_PROXY_AUTH_REQUESTED → proxy-auth', async () => {
+    expect(await codeFor(new Error('net::ERR_PROXY_AUTH_REQUESTED'))).toBe('proxy-auth')
+  })
+
+  it('any other ERR_* or TypeError → network', async () => {
+    expect(await codeFor(new Error('net::ERR_CONNECTION_REFUSED'))).toBe('network')
+    expect(await codeFor(new TypeError('Failed to fetch'))).toBe('network')
+  })
+
+  it('a throwing body reader is mapped too', async () => {
+    const f = fake({
+      status: 200,
+      headers: { get: () => null },
+      text: () => Promise.reject(new Error('net::ERR_NAME_NOT_RESOLVED')),
+    })
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('dns')
+  })
+})
+
+describe('AdoClient — bad URLs', () => {
+  it.each(['', '   ', 'dev.azure.com/acme', 'ftp://dev.azure.com/acme'])('%j → bad-url without a request', async (base) => {
+    const f = fake(json(ME))
+    const r = await client(f.fetchImpl, base).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('bad-url')
+    expect(f.calls).toHaveLength(0)
+  })
+})
+
+describe('AdoClient — the token never leaks', () => {
+  const leaky = [
+    res({ status: 500, body: `sign-in failed for token ${TOKEN} at /_apis` }),
+    res({ status: 203, body: `<html>${TOKEN}</html>` }),
+    res({ status: 200, body: `<html>${Buffer.from(`:${TOKEN}`, 'utf8').toString('base64')}</html>` }),
+  ]
+
+  it('is absent from every error detail, even when the server echoes it', async () => {
+    for (const reply of leaky) {
+      const f = fake(reply)
+      const r = await client(f.fetchImpl).me()
+      expect(r.ok).toBe(false)
+      if (!r.ok) {
+        expect(r.error.detail).not.toContain(TOKEN)
+        expect(r.error.detail).not.toContain(Buffer.from(`:${TOKEN}`, 'utf8').toString('base64'))
+      }
+    }
+  })
+
+  it('is absent when a thrown error message carries it (a URL-embedded PAT)', async () => {
+    const f = fake(() => Promise.reject(new Error(`net::ERR_CONNECTION_REFUSED https://:${TOKEN}@host/`)))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error.detail).not.toContain(TOKEN)
+      expect(r.error.detail).toContain('***')
+    }
+  })
+
+  it('keeps every detail short and single-line', async () => {
+    const f = fake(res({ status: 500, body: `${'x'.repeat(4000)}\n\nmore` }))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error.detail.length).toBeLessThanOrEqual(200)
+      expect(r.error.detail).not.toContain('\n')
+    }
+  })
+})

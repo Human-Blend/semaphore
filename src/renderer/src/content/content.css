@@ -151,6 +151,38 @@
   text-decoration: underline;
   color: var(--accent-hover);
 }
+/* The URL that has a preview card: shown as its domain, full URL on hover. */
+.sem-link-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  vertical-align: baseline;
+  padding: 0 6px;
+  margin: 0 1px;
+  border-radius: var(--r-full);
+  background: var(--accent-soft);
+  font-size: 0.85em;
+  line-height: 1.5;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.sem-link-chip:hover {
+  text-decoration: none;
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--accent));
+}
+
+/* Link card footer: domain at rest, the full URL while hovered. */
+.sem-linkcard-url {
+  display: none;
+}
+.sem-reveal-host:hover .sem-linkcard-domain,
+.sem-reveal-host:focus-within .sem-linkcard-domain {
+  display: none;
+}
+.sem-reveal-host:hover .sem-linkcard-url,
+.sem-reveal-host:focus-within .sem-linkcard-url {
+  display: inline;
+}
 
 /* ------------------------------------------------------------------ */
 /* Hover reveals (link card + file tile actions)                       */
@@ -261,6 +293,8 @@
 .sem-gif-item img {
   display: block;
   width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
   transition: transform var(--t-fast) var(--ease-standard);
 }
 .sem-gif-item:hover img {

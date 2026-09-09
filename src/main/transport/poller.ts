@@ -1,9 +1,10 @@
-import { POLL, PRESENCE } from '@shared/constants'
+import { POLL, PRESENCE, TEAM_CONV } from '@shared/constants'
 import type { BeaconContent, ConvId, PresenceStateKind, PresenceView } from '@shared/types'
 import { fingerprintFromEdPub } from '../crypto/identity'
-import { sanitizeHostname } from '@shared/ids'
+import { isChanConv, isTeamConv, sanitizeHostname } from '@shared/ids'
 import { BeaconReader, type BeaconObservation } from './beacon'
 import type { EventStore } from './events'
+import type { RosterEntry } from './roster'
 import type { Session } from './session'
 
 // Drives the whole read side: beacon polling, event ingestion via heads,
@@ -30,6 +31,7 @@ export class Poller {
   private observations = new Map<string, DeviceObservation>() // full deviceId
   private timer: NodeJS.Timeout | null = null
   private ticks = 0
+  private polled = false // first beacon listing done: absence now means something
   private running = false
   private degraded = false
   listeners: PollerEvents = {}
@@ -85,10 +87,15 @@ export class Poller {
       }
       return
     }
+    const firstPoll = !this.polled
 
     for (const obs of observations) {
       await this.processObservation(obs)
     }
+    // Only now: processObservation pushes presence for every device it meets,
+    // and until the whole listing is in, everyone not reached yet still looks
+    // like they have no beacon at all — i.e. departed. Flip the guard after.
+    this.polled = true
 
     // Channel discovery + a full catch-up sweep on a slower cadence (new
     // channels, day rollover, events from devices whose beacons we missed).
@@ -102,9 +109,16 @@ export class Poller {
       for (const dm of s.dms.values()) {
         await this.events.catchUp(`dm:${dm.pairToken}`)
       }
+      // Team logs (calendar, PR config) have no discovery step — their ids are
+      // fixed, so the sweep just catches each one up.
+      for (const conv of Object.values(TEAM_CONV)) {
+        await this.events.catchUp(conv)
+      }
     }
 
-    if (observations.length > 0) this.emitPresence()
+    // Silence is a state change too (online → away → offline with nobody
+    // else's beacon to prompt a refresh), so re-derive on a slow cadence.
+    if (observations.length > 0 || firstPoll || this.ticks % 10 === 0) this.emitPresence()
   }
 
   private async processObservation(obs: BeaconObservation): Promise<void> {
@@ -119,10 +133,11 @@ export class Poller {
     if (!known) this.listeners.onNewDevice?.()
     if (!obs.verified) return // unverified beacons never drive ingestion
 
-    // Channel heads → ingest the exact new event files
+    // Channel + team heads → ingest the exact new event files. Only channels
+    // need a discovery refresh; team conv ids are fixed and always derivable.
     for (const [conv, heads] of Object.entries(obs.content.heads ?? {})) {
-      if (!conv.startsWith('chan:')) continue
-      if (!s.channels.get(conv.slice(5))) await s.loadChannels()
+      if (!isChanConv(conv) && !isTeamConv(conv)) continue
+      if (isChanConv(conv) && !s.channels.get(conv.slice(5))) await s.loadChannels()
       await this.events.ingestHeads(conv as ConvId, heads)
     }
     // Channel cursors → delivery/read receipts
@@ -155,17 +170,20 @@ export class Poller {
   presenceViews(): PresenceView[] {
     const s = this.session
     const now = Date.now()
+    const shareNow = s.io.calibratedNow()
+    const entries = s.roster.all().filter((e) => e.record.deviceId !== s.deviceId)
     const views: PresenceView[] = []
 
-    for (const entry of s.roster.all()) {
+    for (const entry of entries) {
       const deviceId = entry.record.deviceId
-      if (deviceId === s.deviceId) continue
       const obs = this.observations.get(deviceId)
       let state: PresenceStateKind = 'offline'
       let lastSeenMs: number | null = null
       let status = ''
       if (obs) {
-        lastSeenMs = obs.lastSeqChangeMono
+        // The beacon's own stamp, not when we noticed it: a device that quit
+        // last week reads as "last week" even on a fresh launch.
+        lastSeenMs = Math.min(obs.content.hlc, shareNow)
         status = obs.content.presence.status
         const age = now - obs.lastSeqChangeMono
         if (obs.content.presence.state === 'offline') state = 'offline'
@@ -174,6 +192,9 @@ export class Poller {
         } else if (age < PRESENCE.offlineAfterMs) state = 'away'
         else state = 'offline'
       }
+      // Departed devices stay in the list (flagged) so their old messages
+      // keep a name and an unread DM from them still has a row to open.
+      const departed = state === 'offline' && this.departed(entry, lastSeenMs, shareNow, entries)
       views.push({
         deviceId,
         name: obs?.content.name ?? entry.pin.displayName,
@@ -183,9 +204,34 @@ export class Poller {
         status,
         lastSeenMs,
         trust: entry.pin.trust,
+        dmConv: `dm:${s.dmFor(deviceId)?.pairToken ?? ''}`,
+        departed,
       })
     }
     return views
+  }
+
+  /**
+   * A registration nobody is behind any more: no beacon at all (the janitor
+   * swept it, or the device never came back after a reset), quiet for longer
+   * than a long weekend, or plainly superseded — the same person on the same
+   * machine set up again, so this identity will never sign anything again.
+   * Only a hide: the roster entry stays, so its old messages still verify and
+   * the row is back the moment the device is.
+   */
+  private departed(entry: RosterEntry, lastSeenMs: number | null, shareNow: number, all: RosterEntry[]): boolean {
+    if (!this.polled) return false // before the first listing, absence means nothing yet
+    if (lastSeenMs === null) return true
+    if (shareNow - lastSeenMs > PRESENCE.departedAfterMs) return true
+    const r = entry.record
+    return all.some(
+      (o) =>
+        o !== entry &&
+        o.record.firstSeen > r.firstSeen &&
+        o.record.displayName === r.displayName &&
+        sanitizeHostname(o.record.hostname) === sanitizeHostname(r.hostname) &&
+        (!o.record.machineIdHash || !r.machineIdHash || o.record.machineIdHash === r.machineIdHash),
+    )
   }
 
   private emitPresence(): void {

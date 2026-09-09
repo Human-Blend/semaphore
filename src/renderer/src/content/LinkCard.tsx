@@ -66,7 +66,12 @@ function FullCard({ preview }: { preview: LinkPreview }) {
       }}
       style={{
         position: 'relative',
-        maxWidth: 360,
+        // Fixed width: the footer swaps domain ↔ full URL on hover, and a
+        // shrink-to-fit card would jump; also keeps the hover actions clear
+        // of a short title.
+        width: 360,
+        maxWidth: '100%',
+        boxSizing: 'border-box',
         borderRadius: 'var(--r-lg)',
         border: '1px solid var(--border-subtle)',
         background: 'var(--bg-panel)',
@@ -98,6 +103,7 @@ function FullCard({ preview }: { preview: LinkPreview }) {
               fontWeight: 600,
               lineHeight: '18px',
               color: 'var(--text-1)',
+              paddingRight: preview.img ? 0 : 68, // hover actions sit here when no image
               display: '-webkit-box',
               WebkitLineClamp: 2,
               WebkitBoxOrient: 'vertical',
@@ -132,8 +138,24 @@ function FullCard({ preview }: { preview: LinkPreview }) {
           }}
         >
           <GlobeIcon size={12} />
-          <span style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+          <span
+            className="sem-linkcard-domain"
+            style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em' }}
+          >
             {preview.domain}
+          </span>
+          <span
+            className="sem-linkcard-url"
+            style={{
+              fontSize: 11,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontFamily: 'var(--font-mono)',
+            }}
+          >
+            {preview.url}
           </span>
         </div>
       </div>
@@ -142,7 +164,28 @@ function FullCard({ preview }: { preview: LinkPreview }) {
   )
 }
 
+// Say what actually happened: a blocked network is the common case on the
+// target LAN, but a dead link or a page without metadata is not the network's
+// fault.
+const DEGRADED: Record<NonNullable<LinkPreview['reason']>, { line: string; why: string }> = {
+  network: {
+    line: 'Preview unavailable — network restricted',
+    why: 'This network blocks external requests. The link still opens in your browser.',
+  },
+  http: {
+    line: 'Preview unavailable — the page returned an error',
+    why: 'The site answered with an error status (e.g. 404). The link may be dead or private.',
+  },
+  nometa: {
+    line: 'No preview for this page',
+    why: 'The page has no title or preview image to show.',
+  },
+}
+
 function DegradedCard({ preview }: { preview: LinkPreview }) {
+  // A newer sender may ship a reason this build doesn't know; fall back to
+  // the generic line instead of crashing the row.
+  const degraded = DEGRADED[preview.reason ?? 'network'] ?? DEGRADED.network
   return (
     <div
       className="sem-reveal-host"
@@ -200,9 +243,9 @@ function DegradedCard({ preview }: { preview: LinkPreview }) {
             whiteSpace: 'nowrap',
           }}
         >
-          Preview unavailable — network restricted
+          {degraded.line}
           <span
-            title="This network blocks external requests. The link still opens in your browser."
+            title={degraded.why}
             aria-label="Why is there no preview?"
             style={{ display: 'inline-flex', cursor: 'help' }}
           >

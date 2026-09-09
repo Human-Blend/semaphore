@@ -1,8 +1,8 @@
-# Semaphore packaging — built once on macOS, copy-and-run on macOS + Windows.
+# Chat packaging — built once on macOS, copy-and-run on macOS + Windows.
 # zip targets only: no installers, no self-extracting exes (locked-down fleets
 # punish both). See docs/build-spec notes in the plan.
 appId: com.semaphore.teamchat # NEVER change: Windows AUMID + macOS TCC identity hang off it
-productName: Semaphore
+productName: Chat
 electronVersion: 44.2.0
 directories:
   output: dist
@@ -23,7 +23,7 @@ win:
       arch: [x64]
   icon: build/icon.ico
   signAndEditExecutable: true # pure-JS resedit — works on macOS, no wine
-  artifactName: Semaphore-${version}-win-${arch}.zip
+  artifactName: Chat-${version}-win-${arch}.zip
 
 mac:
   target:
@@ -33,4 +33,4 @@ mac:
   identity: '-' # explicit ad-hoc signature: arm64 kernel refuses unsigned code
   hardenedRuntime: false # hardened runtime without a real cert can prevent launch
   gatekeeperAssess: false
-  artifactName: Semaphore-${version}-mac-${arch}.zip
+  artifactName: Chat-${version}-mac-${arch}.zip

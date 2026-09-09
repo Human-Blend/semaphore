@@ -24,7 +24,7 @@ export default function App() {
       </div>
     )
   }
-  if (boot.mode === 'locked') return <UnlockScreen />
+  if (boot.mode === 'locked') return <UnlockScreen reason={boot.reason} />
   if (boot.mode === 'onboarding')
     return <Onboarding suggestion={boot.sharePathSuggestion} savedName={boot.savedName ?? null} />
   return <AppShell />

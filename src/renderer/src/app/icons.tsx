@@ -158,3 +158,81 @@ export function IconFile({ size }: IconProps) {
   )
 }
 
+export function IconCalendar({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <rect x="3.5" y="5" width="17" height="15.5" rx="2.5" />
+      <path d="M3.5 9.5h17" />
+      <path d="M8 3.2v3.6M16 3.2v3.6" />
+    </Svg>
+  )
+}
+
+export function IconGitPull({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <circle cx="6.5" cy="6" r="2.5" />
+      <circle cx="6.5" cy="18" r="2.5" />
+      <circle cx="17.5" cy="18" r="2.5" />
+      <path d="M6.5 8.5v7" />
+      <path d="M17.5 15.5V9.5a2.5 2.5 0 0 0-2.5-2.5h-3.4" />
+      <path d="M13.4 4.6 11 7l2.4 2.4" />
+    </Svg>
+  )
+}
+
+export function IconGitBranch({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <circle cx="6.5" cy="5.5" r="2.5" />
+      <circle cx="6.5" cy="18.5" r="2.5" />
+      <circle cx="17.5" cy="8" r="2.5" />
+      <path d="M6.5 8v8" />
+      <path d="M17.5 10.5c0 3.4-2.8 5.2-6.2 5.6-1.9.2-3.3.7-4.4 1.6" />
+    </Svg>
+  )
+}
+
+export function IconRefresh({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M20 11a8 8 0 1 0-.7 4.5" />
+      <path d="M20 4.5V11h-6.2" />
+    </Svg>
+  )
+}
+
+export function IconFilter({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M3.5 5.5h17l-6.6 7.6v5.6l-3.8 2v-7.6L3.5 5.5z" />
+    </Svg>
+  )
+}
+
+export function IconChevronLeft({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M14.5 5.5 8 12l6.5 6.5" />
+    </Svg>
+  )
+}
+
+export function IconChevronRight({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M9.5 5.5 16 12l-6.5 6.5" />
+    </Svg>
+  )
+}
+
+export function IconExternal({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <path d="M13.5 4.5H19.5V10.5" />
+      <path d="M19.5 4.5 11 13" />
+      <path d="M18 14v4.5a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2H10" />
+    </Svg>
+  )
+}
+

@@ -1,10 +1,10 @@
 {
   "name": "semaphore",
-  "productName": "Semaphore",
-  "version": "1.0.1",
+  "productName": "Chat",
+  "version": "1.1.0",
   "description": "Encrypted team chat over a shared folder — no servers required",
   "main": "out/main/index.js",
-  "author": "Semaphore Team",
+  "author": "Human Blend",
   "license": "UNLICENSED",
   "private": true,
   "scripts": {

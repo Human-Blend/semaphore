@@ -32,7 +32,7 @@ export function base36ToSeq(s: string): number {
 // ---------------------------------------------------------------------------
 // Event file naming: "<hlcMs 13>-<ctr 4>-<deviceId8>.<type>.e1"
 
-const EVENT_RE = /^(\d{13})-(\d{4})-([0-9a-f]{8})\.(msg|edt|del|rct|pin|sys|prv)\.e1$/
+const EVENT_RE = /^(\d{13})-(\d{4})-([0-9a-f]{8})\.(msg|edt|del|rct|pin|sys|prv|cal|prs)\.e1$/
 
 export function eventFileName(hlcMs: number, ctr: number, deviceId: string, type: EventType): string {
   return `${String(hlcMs).padStart(13, '0')}-${String(ctr).padStart(4, '0')}-${deviceId.slice(0, 8)}.${type}${FILE_EXT.record}`
@@ -57,6 +57,22 @@ export function parseEventFileName(name: string): (EventId & { type: EventType }
 /** UTC day-shard directory name for an HLC timestamp. */
 export function dayShard(hlcMs: number): string {
   return new Date(hlcMs).toISOString().slice(0, 10)
+}
+
+// ---------------------------------------------------------------------------
+// Conversation-kind guards. Use these instead of hand-rolled startsWith() so a
+// third conversation kind can never fall into the wrong branch by accident.
+
+export function isTeamConv(conv: string): conv is `team:${string}` {
+  return conv.startsWith('team:')
+}
+
+export function isChanConv(conv: string): conv is `chan:${string}` {
+  return conv.startsWith('chan:')
+}
+
+export function isDmConv(conv: string): conv is `dm:${string}` {
+  return conv.startsWith('dm:')
 }
 
 // ---------------------------------------------------------------------------

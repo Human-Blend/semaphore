@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
+import { TEAM_CONV } from '@shared/constants'
+import { isDmConv, isTeamConv } from '@shared/ids'
 import { useStore } from '@/store'
 import ChatPane from '@/chat/ChatPane'
+import { CalendarPane } from '@/team/CalendarPane'
+import { PrsPane } from '@/team/PrsPane'
+import { PrAlert } from '@/team/PrAlert'
 import { Lightbox } from '@/content/Lightbox'
 import { ChromeCss, DRAG, NO_DRAG, isMac } from './chrome'
 import Sidebar from './Sidebar'
@@ -72,9 +77,17 @@ export default function AppShell() {
     document.documentElement.style.setProperty('--text-msg', FONT_PX[fontSize])
   }, [fontSize])
 
-  // Rail defaults: open in channels, closed in DMs (spec §2.4).
+  // Rail defaults: open in channels, closed in DMs (spec §2.4) and in the team
+  // panes, which own the whole centre column (spec §3).
   const convKind = useMemo(
-    () => (activeConv === null ? 'none' : activeConv.startsWith('dm:') ? 'dm' : 'chan'),
+    () =>
+      activeConv === null
+        ? 'none'
+        : isTeamConv(activeConv)
+          ? 'team'
+          : isDmConv(activeConv)
+            ? 'dm'
+            : 'chan',
     [activeConv],
   )
   useEffect(() => {
@@ -100,7 +113,12 @@ export default function AppShell() {
         <Sidebar onOpenSettings={() => setSettingsOpen(true)} />
 
         <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
-          {activeConv ? (
+          {convKind === 'team' ? (
+            <>
+              <HealthBanner />
+              {activeConv === TEAM_CONV.calendar ? <CalendarPane /> : <PrsPane />}
+            </>
+          ) : activeConv ? (
             <>
               <ChannelHeader
                 conv={activeConv}
@@ -130,7 +148,10 @@ export default function AppShell() {
           )}
         </div>
 
-        {railOpen && activeConv && (
+        {/* convKind is checked as well as railOpen: the rail-default effect only
+            clears railOpen *after* the first render, and the rail knows nothing
+            about team conversations. */}
+        {railOpen && activeConv && convKind !== 'team' && (
           <RightRail conv={activeConv} tab={railTab} onTab={setRailTab} onClose={() => setRailOpen(false)} />
         )}
       </div>
@@ -139,6 +160,7 @@ export default function AppShell() {
       <Lightbox />
       <ScreenShareRoot />
       <BeamSurface />
+      <PrAlert />
       <UpdateBanner />
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
     </div>

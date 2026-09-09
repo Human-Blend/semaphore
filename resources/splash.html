@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"
+    />
+    <title>Chat</title>
+    <!--
+      Splash window (420x300, frameless). Shown by src/main/index.ts before
+      controller.init() and destroyed once the main window is ready. Deliberately
+      self-contained: no script, no preload, no network — the CSP above allows
+      only the sibling icon.png. Colors mirror src/renderer/src/styles/tokens.css
+      (dark theme only; the splash never sees the user's theme preference).
+    -->
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+
+      body {
+        background: #0e0f13;
+        color: #edeef3;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI',
+          system-ui, Roboto, 'Helvetica Neue', Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        /* lifts the centered column clear of the version line at the bottom */
+        padding-bottom: 20px;
+        user-select: none;
+        cursor: default;
+      }
+
+      /* A very soft indigo wash behind the mark so the dark icon has a ground
+         to sit on rather than dissolving into the #0E0F13 canvas. */
+      .glow {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 340px;
+        height: 340px;
+        margin: -222px 0 0 -170px;
+        border-radius: 50%;
+        background: radial-gradient(
+          circle,
+          rgba(123, 128, 255, 0.18) 0%,
+          rgba(123, 128, 255, 0.07) 42%,
+          rgba(123, 128, 255, 0) 70%
+        );
+        pointer-events: none;
+      }
+
+      .mark {
+        position: relative;
+        width: 128px;
+        height: 128px;
+        border-radius: 28px;
+        display: block;
+        box-shadow:
+          0 18px 44px rgba(0, 0, 0, 0.55),
+          0 0 34px rgba(123, 128, 255, 0.22),
+          inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+      }
+
+      .wordmark {
+        position: relative;
+        margin-top: 20px;
+        font-size: 28px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        line-height: 1.1;
+      }
+
+      .tagline {
+        position: relative;
+        margin-top: 6px;
+        font-size: 12px;
+        font-weight: 400;
+        letter-spacing: 0.03em;
+        color: #6e7383;
+      }
+
+      .dots {
+        position: relative;
+        margin-top: 22px;
+        display: flex;
+        gap: 7px;
+      }
+
+      .dots i {
+        display: block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #7b80ff;
+        opacity: 0.3;
+        animation: pulse 1200ms ease-in-out infinite;
+      }
+
+      .dots i:nth-child(2) {
+        animation-delay: 160ms;
+      }
+
+      .dots i:nth-child(3) {
+        animation-delay: 320ms;
+      }
+
+      @keyframes pulse {
+        0%,
+        70%,
+        100% {
+          opacity: 0.26;
+          transform: scale(0.82);
+        }
+        35% {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+      /* Version, written by the main process after did-finish-load. Stays an
+         empty, invisible row until then so nothing shifts when it fills in. */
+      #v {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 14px;
+        text-align: center;
+        font-size: 10px;
+        letter-spacing: 0.06em;
+        color: #565b6b;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .dots i {
+          animation: none;
+          opacity: 0.55;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="glow"></div>
+    <img class="mark" src="icon.png" alt="" width="128" height="128" />
+    <div class="wordmark">Chat</div>
+    <div class="tagline">Encrypted team chat</div>
+    <div class="dots" role="presentation"><i></i><i></i><i></i></div>
+    <div id="v"></div>
+  </body>
+</html>

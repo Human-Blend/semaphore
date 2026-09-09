@@ -28,6 +28,7 @@ export default function ChannelHeader({
 
   const channel = channels.find((c) => c.conv === conv)
   const peer = presence.find((p) => p.deviceId === dmPeers[conv])
+  const members = presence.filter((p) => !p.departed).length + 1
 
   return (
     <div
@@ -60,7 +61,7 @@ export default function ChannelHeader({
             {channel.name}
           </span>
           <span style={{ fontSize: 13, color: 'var(--text-3)', whiteSpace: 'nowrap' }}>
-            {presence.length + 1} member{presence.length + 1 === 1 ? '' : 's'}
+            {members} member{members === 1 ? '' : 's'}
           </span>
           {channel.topic ? (
             <span

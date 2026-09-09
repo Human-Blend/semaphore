@@ -6,6 +6,7 @@ import type { BodyEntity } from '@shared/types'
 import type { MessageView, SysView } from '@shared/merge'
 import { EVENT } from '@shared/constants'
 import { formatBytes } from '@/ui/atoms'
+import { firstLinkOf } from '@/content/parse'
 
 export const EMPTY: never[] = []
 
@@ -55,9 +56,9 @@ export function snippetOf(m: MessageView): string {
 
 const URL_RE = /https?:\/\/[^\s<>"')\]]+/g
 
+/** The URL the preview is fetched for: the same one the body will linkify. */
 export function firstUrlOf(text: string): string | null {
-  const m = text.match(/https?:\/\/[^\s<>"')\]]+/)
-  return m ? m[0] : null
+  return firstLinkOf(text)
 }
 
 export function detectEntities(text: string, roster: { name: string; device: string }[]): BodyEntity[] {
@@ -246,7 +247,12 @@ export const CHAT_CSS = `
 @keyframes sem-pop-in { from { transform: scale(0.97) translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
 @keyframes sem-tdot { 0%, 60%, 100% { transform: none; } 30% { transform: translateY(-4px); } }
 @keyframes sem-bob { 0%, 100% { transform: translateY(-3px); } 50% { transform: translateY(3px); } }
-@keyframes sem-rise { from { transform: translate(-50%, 8px); opacity: 0; } to { transform: translate(-50%, 0); opacity: 1; } }
+/* Centred variant of chrome.tsx's sem-rise, for absolutely-positioned pills that
+   sit at left:50%. It must NOT be called sem-rise: this stylesheet is injected
+   inside ChatPane, later in document order than ChromeCss, so a duplicate name
+   would replace the chrome keyframes document-wide and translate every other
+   riser (PrAlert, the sidebar popover, BeamSurface) 50% of its own width left. */
+@keyframes sem-rise-center { from { transform: translate(-50%, 8px); opacity: 0; } to { transform: translate(-50%, 0); opacity: 1; } }
 @keyframes sem-shimmer { from { background-position: -200px 0; } to { background-position: 200px 0; } }
 @keyframes sem-scale-in { from { transform: scale(0.96); opacity: 0; } to { transform: none; opacity: 1; } }
 .sem-row { position: relative; }
@@ -262,7 +268,7 @@ export const CHAT_CSS = `
 .sem-selectable, .sem-selectable * { user-select: text; }
 .sem-composer { border: 1px solid var(--border-subtle); transition: border-color var(--t-fast) var(--ease-standard); }
 .sem-composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong)); }
-.sem-jump { animation: sem-rise 200ms var(--ease-glide); }
+.sem-jump { animation: sem-rise-center 200ms var(--ease-glide); }
 .sem-popover { animation: sem-scale-in 200ms var(--ease-pop); transform-origin: bottom right; }
 .sem-skel {
   background: linear-gradient(90deg, var(--bg-raised) 25%, var(--bg-panel) 37%, var(--bg-raised) 63%);

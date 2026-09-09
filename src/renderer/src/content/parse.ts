@@ -34,6 +34,21 @@ function trimUrlTail(raw: string): string {
   return url
 }
 
+/**
+ * The same link, allowing for the prose punctuation and trailing slash the
+ * two ends of the pipeline may or may not have trimmed.
+ */
+export function sameUrl(a: string, b: string): boolean {
+  const norm = (u: string): string => trimUrlTail(u.trim()).replace(/\/+$/, '')
+  return norm(a) === norm(b)
+}
+
+/** The first URL a message links (skipping code spans) — the one that gets a preview. */
+export function firstLinkOf(text: string, entities?: BodyEntity[]): string | null {
+  const link = segmentMessage(text, entities).find((p): p is LinkPart => p.kind === 'link')
+  return link?.url ?? null
+}
+
 function count(s: string, ch: string): number {
   let n = 0
   for (let i = 0; i < s.length; i++) if (s[i] === ch) n++

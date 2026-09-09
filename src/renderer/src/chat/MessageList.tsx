@@ -2,11 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso } from 'react-virtuoso'
 import type { VirtuosoHandle } from 'react-virtuoso'
 import type { ConvId } from '@shared/types'
+import { isDmConv } from '@shared/ids'
 import type { MaterializedLog, MessageView, SysView } from '@shared/merge'
 import { useStore } from '@/store'
 import { formatDayDivider, formatTime } from '@/ui/atoms'
 import { MessageRow } from './MessageRow'
-import { dayKeyOf, hlcMsOf, sysLine, type ChipData } from './util'
+import { dayKeyOf, sysLine, type ChipData } from './util'
 
 // Virtualized message area: day dividers, unread divider, system rows,
 // grouped flat rows, jump-to-latest pill, DM read receipts, markRead.
@@ -110,13 +111,11 @@ export function MessageList({
 
   const newestId = log.messages.length > 0 ? log.messages[log.messages.length - 1].id : null
 
-  // DM read receipt for my newest message.
+  // DM receipt under my newest message: Sent (on the share) → Delivered (the
+  // peer's client picked it up) → Read (they had it on screen).
   const cursors = useStore((s) => s.cursors[conv])
   const receiptFor = useMemo(() => {
-    if (!conv.startsWith('dm:') || !cursors) return null
-    const peer = Object.keys(cursors).find((d) => d !== selfId)
-    if (!peer) return null
-    const cur = cursors[peer]
+    if (!isDmConv(conv)) return null
     let mineNewest: MessageView | null = null
     for (let i = log.messages.length - 1; i >= 0; i--) {
       const m = log.messages[i]
@@ -126,10 +125,13 @@ export function MessageList({
       }
     }
     if (!mineNewest || mineNewest.deleted) return null
-    if (cur.read && cur.read >= mineNewest.id)
-      return { id: mineNewest.id, text: `Read ${formatTime(hlcMsOf(cur.read))}` }
-    if (cur.ingested && cur.ingested >= mineNewest.id) return { id: mineNewest.id, text: 'Delivered' }
-    return null
+    const peer = cursors ? Object.keys(cursors).find((d) => d !== selfId) : undefined
+    const cur = peer ? cursors![peer] : undefined
+    if (cur?.read && cur.read >= mineNewest.id) {
+      return { id: mineNewest.id, text: cur.readAt ? `Read ${formatTime(cur.readAt)}` : 'Read' }
+    }
+    if (cur?.ingested && cur.ingested >= mineNewest.id) return { id: mineNewest.id, text: 'Delivered' }
+    return { id: mineNewest.id, text: 'Sent' }
   }, [conv, cursors, log, selfId])
 
   // Mark read while parked at the bottom with app focus.

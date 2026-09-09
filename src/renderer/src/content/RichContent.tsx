@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react'
 import type { MessageView } from '@shared/merge'
 import type { Attachment, BodyEntity, ConvId } from '@shared/types'
-import { isMediaAttachment, segmentMessage } from './parse'
+import { isMediaAttachment, sameUrl, segmentMessage } from './parse'
+import { LinkIcon } from './icons'
 import { CodeBlock } from './CodeBlock'
 import { LinkCard } from './LinkCard'
 import { MediaAttachment } from './MediaAttachment'
@@ -21,6 +22,12 @@ export function MessageBody({ view }: { view: MessageView }) {
 
   const media = view.attachments.filter(isMediaAttachment)
   const files = view.attachments.filter((a) => !isMediaAttachment(a))
+  // The card carries the link, so the raw URL leaves the prose: a message
+  // that is only the URL shows just the card; inside a sentence it becomes a
+  // domain chip (full URL on hover).
+  const previewUrl = view.linkPreview?.url ?? null
+  const textIsOnlyLink =
+    previewUrl !== null && view.body.kind === 'text' && bodyIsJustLink(view.body.text, view.body.entities, previewUrl)
   // A pack GIF travels as its pack id, not bytes: every client has the same
   // bundled pack, so this costs zero share I/O. Remote (searched) GIFs travel
   // as an https URL.
@@ -47,8 +54,8 @@ export function MessageBody({ view }: { view: MessageView }) {
             GIF unavailable
           </span>
         ) : null
-      ) : view.body.text ? (
-        <TextBody text={view.body.text} entities={view.body.entities} />
+      ) : view.body.text && !textIsOnlyLink ? (
+        <TextBody text={view.body.text} entities={view.body.entities} previewUrl={previewUrl} />
       ) : null}
 
       {media.length > 0 && <MediaGroup media={media} conv={view.conv} eventId={view.id} />}
@@ -62,7 +69,20 @@ export function MessageBody({ view }: { view: MessageView }) {
 
 // ---------------------------------------------------------------------------
 
-function TextBody({ text, entities }: { text: string; entities?: BodyEntity[] }) {
+function bodyIsJustLink(text: string, entities: BodyEntity[] | undefined, url: string): boolean {
+  const parts = segmentMessage(text, entities)
+  return parts.every((p) => (p.kind === 'link' ? sameUrl(p.url, url) : p.kind === 'text' && p.text.trim() === ''))
+}
+
+function TextBody({
+  text,
+  entities,
+  previewUrl,
+}: {
+  text: string
+  entities?: BodyEntity[]
+  previewUrl: string | null
+}) {
   const parts = useMemo(() => segmentMessage(text, entities), [text, entities])
   return (
     <div
@@ -79,21 +99,30 @@ function TextBody({ text, entities }: { text: string; entities?: BodyEntity[] })
     >
       {parts.map((p, i) => {
         switch (p.kind) {
-          case 'link':
+          case 'link': {
+            const chip = previewUrl !== null && sameUrl(p.url, previewUrl)
             return (
               <a
                 key={i}
-                className="sem-link"
+                className={chip ? 'sem-link sem-link-chip' : 'sem-link'}
                 href={p.url}
-                title={`Open ${p.url}`}
+                title={chip ? p.url : `Open ${p.url}`}
                 onClick={(e) => {
                   e.preventDefault()
                   void window.bridge.app.openExternal(p.url).catch(() => {})
                 }}
               >
-                {p.text}
+                {chip ? (
+                  <>
+                    <LinkIcon size={11} />
+                    {domainOf(p.url)}
+                  </>
+                ) : (
+                  p.text
+                )}
               </a>
             )
+          }
           case 'code':
             return (
               <code
@@ -139,6 +168,14 @@ function TextBody({ text, entities }: { text: string; entities?: BodyEntity[] })
       })}
     </div>
   )
+}
+
+function domainOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '')
+  } catch {
+    return url
+  }
 }
 
 // ---------------------------------------------------------------------------

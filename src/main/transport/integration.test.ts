@@ -1,8 +1,10 @@
 import { beforeAll, describe, expect, it } from 'vitest'
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { ConvId, MsgPayload } from '@shared/types'
+import type { CalPayload, CalendarEntry, ConvId, MsgPayload } from '@shared/types'
+import { DIR, TEAM_CONV } from '@shared/constants'
+import { materializeCalendar } from '@shared/calendar'
 import { materialize } from '@shared/merge'
 import { generateIdentity, type DeviceIdentity } from '../crypto/identity'
 import type { SecretStore } from '../store/secretStore'
@@ -224,6 +226,59 @@ describe('two-client integration over a shared folder', () => {
     await bob.events.ingestHeads(conv, heads)
     expect(bob.events.has(conv, sent.id)).toBe(true)
   })
+
+  it('calendar entry round-trips A → B and lives under team/, not channels/', async () => {
+    const conv = TEAM_CONV.calendar
+    const channelTokensBefore = readdirSync(join(root, DIR.channels)).sort()
+
+    const entry: CalendarEntry = {
+      id: 'a1b2c3d4e5f60718',
+      title: 'Release 1.1',
+      tag: 'Release',
+      color: 3,
+      start: '2026-03-14',
+      end: '2026-03-16',
+      annual: false,
+      notes: 'ship it',
+    }
+    const put = await alice.events.publish(conv, 'cal', {
+      t: 'cal',
+      conv,
+      op: 'put',
+      entry,
+    } satisfies CalPayload)
+    alice.writer.noteOwnEvent(conv, `${put.id}.cal.e1`)
+
+    // On disk: one new opaque token under team/, and channels/ untouched.
+    const teamDir = join(root, DIR.team)
+    expect(existsSync(teamDir)).toBe(true)
+    const teamTokens = readdirSync(teamDir)
+    expect(teamTokens).toHaveLength(1)
+    expect(teamTokens[0]).not.toContain('calendar') // opaque, not the conv id
+    expect(existsSync(join(teamDir, teamTokens[0], 'events'))).toBe(true)
+    expect(readdirSync(join(root, DIR.channels)).sort()).toEqual(channelTokensBefore)
+
+    // Both sides derive the same token with no metadata file to discover.
+    expect(bob.session.teamFor(conv).token).toBe(teamTokens[0])
+
+    // Team heads ride the plain beacon section, exactly like a channel.
+    await alice.writer.bump('event')
+    const obs = (await bob.reader.poll()).find((o) => o.content.device === alice.identity.deviceId)
+    expect(obs?.content.heads[conv]).toContain(`${put.id}.cal.e1`)
+
+    await bob.events.catchUp(conv)
+    const items = materializeCalendar(bob.events.getEvents(conv))
+    expect(items).toHaveLength(1)
+    expect(items[0].title).toBe('Release 1.1')
+    expect(items[0].end).toBe('2026-03-16')
+    expect(items[0].author).toBe(alice.identity.deviceId)
+    expect(bob.events.getEvents(conv).every((e) => e.verified)).toBe(true)
+
+    // A delete from Bob hides it on Alice after catch-up.
+    await bob.events.publish(conv, 'cal', { t: 'cal', conv, op: 'del', id: entry.id } satisfies CalPayload)
+    await alice.events.catchUp(conv)
+    expect(materializeCalendar(alice.events.getEvents(conv))).toHaveLength(0)
+  }, 60_000)
 
   it('flags a new device claiming an existing display name', async () => {
     const mallory = await makeClient(root, 'correct horse battery staple', 'Alice') // same name!

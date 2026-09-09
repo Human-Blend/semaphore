@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { DIR, DST, FILE_EXT, KID } from '@shared/constants'
 import type { ChannelMeta, ConvId, ProtocolFile, SignedRecord, TeamConfig } from '@shared/types'
+import { isChanConv, isTeamConv } from '@shared/ids'
 import { newHlcState, type HlcState } from '@shared/hlc'
 import { buildAad, decryptRecord, encryptRecord } from '../crypto/envelope'
 import {
@@ -33,12 +34,25 @@ export interface DmState {
   key: Buffer
 }
 
+/**
+ * A team conversation ('team:calendar', 'team:prs'): an app-defined event log
+ * under `team/<token>/events`. There is no `channel.json.e1` metadata file —
+ * the whole ConvId is the key id and the existence of the log is implied.
+ */
+export interface TeamState {
+  conv: `team:${string}`
+  token: string
+  key: Buffer
+}
+
 export class Session {
   readonly hlc: HlcState = newHlcState()
   readonly channels = new Map<string, ChannelState>() // channelId -> state
   readonly channelsByToken = new Map<string, ChannelState>()
   readonly dms = new Map<string, DmState>() // peerDeviceId -> state
   readonly dmsByToken = new Map<string, DmState>()
+  /** Derived lazily per team conv id; HKDF is cheap but convInfo() is hot. */
+  private teams = new Map<string, TeamState>()
   readonly keys: TeamKeys
   /** Per-conversation monotonic sequence for our own messages (gap detection). */
   private senderSeqs: Record<string, number>
@@ -163,8 +177,25 @@ export class Session {
   // -------------------------------------------------------------------------
   // Conversation helpers shared by events/beacon
 
+  /**
+   * Key material and directory for a team conv. No metadata file and no
+   * discovery step: the ConvId itself ('team:calendar') is the key id, so both
+   * sides derive the same token and key from the team keys alone.
+   */
+  teamFor(conv: `team:${string}`): TeamState {
+    const existing = this.teams.get(conv)
+    if (existing) return existing
+    const state: TeamState = {
+      conv,
+      token: convToken(this.keys.kMeta, conv),
+      key: deriveConvKey(this.tmk, this.teamSalt, this.proto.epoch, conv),
+    }
+    this.teams.set(conv, state)
+    return state
+  }
+
   convInfo(conv: ConvId): { key: Buffer; eventsDir: string; kid: string; scope: string } | null {
-    if (conv.startsWith('chan:')) {
+    if (isChanConv(conv)) {
       const ch = this.channels.get(conv.slice(5))
       if (!ch) return null
       return {
@@ -172,6 +203,15 @@ export class Session {
         eventsDir: `${DIR.channels}/${ch.token}/events`,
         kid: KID.conv(this.proto.epoch, ch.token),
         scope: 'conv',
+      }
+    }
+    if (isTeamConv(conv)) {
+      const t = this.teamFor(conv)
+      return {
+        key: t.key,
+        eventsDir: `${DIR.team}/${t.token}/events`,
+        kid: KID.conv(this.proto.epoch, t.token),
+        scope: 'team',
       }
     }
     const dm = this.dmsByToken.get(conv.slice(3))

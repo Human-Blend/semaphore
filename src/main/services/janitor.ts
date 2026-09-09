@@ -13,6 +13,18 @@ interface LastRun {
   deleted: Record<string, number>
 }
 
+/**
+ * The only scopes whose event day-dirs are swept past retention.
+ *
+ * `DIR.team` is deliberately absent and must stay absent: the team logs are
+ * app state, not conversation history. A birthday entered two years ago, or a
+ * PR-group config published once and never touched again, lives in exactly one
+ * old day-dir — sweeping it would silently erase the calendar and disconnect
+ * the whole team from Azure DevOps. Retention applies to chatter only.
+ * Asserted by janitor.test.ts.
+ */
+export const SWEEP_EVENT_ROOTS: readonly string[] = [DIR.channels, DIR.dm]
+
 export class Janitor {
   private timer: NodeJS.Timeout | null = null
   private running = false
@@ -83,9 +95,10 @@ export class Janitor {
       return !!st && now - st.mtimeMs > ms
     }
 
-    // Event day-dirs beyond retention — delete whole day directories
+    // Event day-dirs beyond retention — delete whole day directories.
+    // Channels and DMs only (see SWEEP_EVENT_ROOTS): team/ is never swept.
     const eventCutoffDay = dayString(now - config.eventDays * 86_400_000)
-    for (const scope of [DIR.channels, DIR.dm]) {
+    for (const scope of SWEEP_EVENT_ROOTS) {
       for (const convDir of await s.io.listDirs(scope)) {
         const eventsRel = `${scope}/${convDir}/events`
         for (const day of await s.io.listDirs(eventsRel)) {
@@ -180,7 +193,7 @@ export class Janitor {
       }
     }
 
-    // NOTE: apps/** deliberately untouched. Day-bundle compaction is a v2
+    // NOTE: apps/** and team/** deliberately untouched. Day-bundle compaction is a v2
     // optimization for multi-month cold starts.
     return counts
   }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DragEvent } from 'react'
 import type { ConvId } from '@shared/types'
 import type { AttachDraft } from '@shared/bridge'
+import { isChanConv } from '@shared/ids'
 import { materialize } from '@shared/merge'
 import type { MessageView } from '@shared/merge'
 import { useStore, selfOf } from '@/store'
@@ -80,7 +81,7 @@ export default function ChatPane({ conv }: { conv: ConvId }) {
   )
 
   const label = useMemo(() => {
-    if (conv.startsWith('chan:')) {
+    if (isChanConv(conv)) {
       const c = channels.find((ch) => ch.conv === conv)
       return c ? `#${c.name}` : 'this channel'
     }

@@ -42,7 +42,7 @@ export function NoConvState() {
       <SemaphoreGlyph />
       <div style={{ textAlign: 'center' }}>
         <div style={{ fontSize: 22, fontWeight: 600, lineHeight: '28px', color: 'var(--text-1)' }}>
-          {self ? self.teamName : 'Semaphore'}
+          {self ? self.teamName : 'Chat'}
         </div>
         <div style={{ fontSize: 13, marginTop: 6 }}>
           Pick a channel on the left, or press{' '}
