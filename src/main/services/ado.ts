@@ -7,9 +7,12 @@ import type { AdoPullRequest } from '@shared/prs'
 // class itself knows nothing about Electron, so ado.test.ts runs in plain node.
 //
 // Two rules matter more than the rest:
-//   1. `api-version=6.0` (connectionData: `6.0-preview`) is the newest version
-//      that on-prem Azure DevOps Server 2019 answers, and dev.azure.com still
-//      accepts it. Do not bump it without checking both.
+//   1. `api-version` is NEGOTIATED, not fixed. 6.0 is the opening bid (Azure
+//      DevOps Server 2020+ and dev.azure.com both take it), but an older
+//      on-prem server answers 400 `VssVersionOutOfRangeException` naming the
+//      newest version it does support — TFS 2018 is 4.1, TFS 2017 is 3.2 — and
+//      the client retries at that version and remembers it. Every endpoint
+//      used here (projects, repositories, pullrequests) exists back to 1.0.
 //   2. A rejected PAT does NOT come back as 401. Azure DevOps answers a browser
 //      with an HTML sign-in page and status 203 (or a 200 carrying HTML), so a
 //      non-JSON body is treated as `unauthorized` rather than a parse bug.
@@ -35,6 +38,8 @@ export interface AdoClientOpts {
   token: string
   userAgent: string
   timeoutMs?: number
+  /** Start from a version already negotiated with this server (skips a round trip). */
+  apiVersion?: string
 }
 
 export interface AdoRepo {
@@ -47,8 +52,16 @@ const DEFAULT_TIMEOUT_MS = 15_000
 /** Paging guard: 500 projects a page is already far past any real collection. */
 const MAX_PAGES = 20
 const MAX_DETAIL = 200
-const API = '6.0'
-const API_PREVIEW = '6.0-preview'
+
+/**
+ * Opening bid, then the fallbacks, newest first. A server that rejects one
+ * names the version it wants, so the ladder is only the safety net for a
+ * server whose refusal we can't parse. `connectionData` is a preview resource
+ * at every version — hence the `-preview` suffix, which Azure DevOps reads as
+ * "latest preview of that version".
+ */
+const API_LADDER = ['6.0', '5.0', '4.1', '3.2', '3.0', '2.0', '1.0'] as const
+const API_DEFAULT = API_LADDER[0]
 
 // ---------------------------------------------------------------------------
 // Token hygiene
@@ -97,6 +110,45 @@ function classifyThrown(err: unknown): AdoErrorCode {
   return 'network'
 }
 
+/**
+ * Azure DevOps reports failures as `{ message, typeKey, … }`. The message is
+ * the sentence a human needs ("…the latest REST API version this server
+ * supports is 4.1"); the raw body around it is noise that crowds out the
+ * 200-character detail budget.
+ */
+function adoFault(text: string): { message: string; typeKey: string } | null {
+  try {
+    const body = JSON.parse(text) as { message?: unknown; typeKey?: unknown }
+    if (!body || typeof body !== 'object' || typeof body.message !== 'string') return null
+    return { message: body.message, typeKey: typeof body.typeKey === 'string' ? body.typeKey : '' }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * `null` when the failure is not about the API version; otherwise the version
+ * the server asked for, or `''` when it refused without naming one.
+ */
+function versionRefusal(status: number, text: string): string | null {
+  if (status !== 400) return null
+  const fault = adoFault(text)
+  if (!fault) return null
+  const isRange = fault.typeKey === 'VssVersionOutOfRangeException' || /out of range for this server/i.test(fault.message)
+  if (!isRange) return null
+  return /version this server supports is\s+([0-9]+(?:\.[0-9]+)?)/i.exec(fault.message)?.[1] ?? ''
+}
+
+/** The next rung strictly below `current` that hasn't been tried yet. */
+function lowerVersion(current: string, tried: ReadonlySet<string>): string | null {
+  const at = API_LADDER.indexOf(current as (typeof API_LADDER)[number])
+  const from = at === -1 ? 0 : at + 1
+  for (let i = from; i < API_LADDER.length; i++) {
+    if (!tried.has(API_LADDER[i])) return API_LADDER[i]
+  }
+  return null
+}
+
 const SENTENCE: Record<AdoErrorCode, string> = {
   unauthorized: 'Azure DevOps rejected the token',
   forbidden: 'The token does not have access to this resource',
@@ -108,6 +160,7 @@ const SENTENCE: Record<AdoErrorCode, string> = {
   timeout: 'The request timed out',
   http: 'Azure DevOps returned an unexpected status',
   'bad-url': 'That is not a usable Azure DevOps collection URL',
+  'api-version': 'This Azure DevOps server is older than any API version Chat can speak',
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +174,7 @@ export class AdoClient {
   private readonly base: string
   private readonly timeoutMs: number
   private readonly redact: (s: string) => string
+  private version: string
 
   constructor(
     private fetchImpl: FetchLike,
@@ -131,6 +185,12 @@ export class AdoClient {
       .replace(/\/+$/, '')
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
     this.redact = makeRedactor(opts.token)
+    this.version = opts.apiVersion || API_DEFAULT
+  }
+
+  /** The version this server accepted — worth carrying into the next client. */
+  get apiVersion(): string {
+    return this.version
   }
 
   // -------------------------------------------------------------------------
@@ -138,7 +198,7 @@ export class AdoClient {
 
   /** `authenticatedUser` from connectionData — the cheapest "is this PAT good" probe. */
   async me(): Promise<AdoResult<{ id: string; name: string }>> {
-    const page = await this.get('/_apis/connectionData', { 'api-version': API_PREVIEW })
+    const page = await this.get('/_apis/connectionData', {}, { preview: true })
     if (!page.ok) return page
     const user = (
       page.value.body as {
@@ -161,7 +221,7 @@ export class AdoClient {
     const out: { id: string; name: string }[] = []
     let continuation: string | null = null
     for (let page = 0; page < MAX_PAGES; page++) {
-      const params: Record<string, string> = { 'api-version': API, $top: '500' }
+      const params: Record<string, string> = { $top: '500' }
       if (continuation) params.continuationToken = continuation
       const res: AdoResult<Page> = await this.get('/_apis/projects', params)
       if (!res.ok) return res
@@ -177,7 +237,7 @@ export class AdoClient {
   }
 
   async repos(project: string): Promise<AdoResult<AdoRepo[]>> {
-    const res = await this.get(`/${encodeURIComponent(project)}/_apis/git/repositories`, { 'api-version': API })
+    const res = await this.get(`/${encodeURIComponent(project)}/_apis/git/repositories`, {})
     if (!res.ok) return res
     const out: AdoRepo[] = []
     for (const r of listOf(res.value.body)) {
@@ -192,7 +252,7 @@ export class AdoClient {
   async activePullRequests(project: string, repoId: string): Promise<AdoResult<AdoPullRequest[]>> {
     const res = await this.get(
       `/${encodeURIComponent(project)}/_apis/git/repositories/${encodeURIComponent(repoId)}/pullrequests`,
-      { 'searchCriteria.status': 'active', $top: '200', 'api-version': API },
+      { 'searchCriteria.status': 'active', $top: '200' },
     )
     if (!res.ok) return res
     const out: AdoPullRequest[] = []
@@ -225,11 +285,41 @@ export class AdoClient {
     return `${this.base}${path}${qs ? `?${qs}` : ''}`
   }
 
-  private async get(path: string, params: Record<string, string>): Promise<AdoResult<Page>> {
+  /**
+   * One request, retried down the version ladder while the server keeps
+   * saying "that API version is too new for me". The negotiated version
+   * sticks, so a poll costs one extra round trip per process at worst.
+   */
+  private async get(
+    path: string,
+    params: Record<string, string>,
+    opts?: { preview?: boolean },
+  ): Promise<AdoResult<Page>> {
     if (!/^https?:\/\/[^/]+/i.test(this.base)) {
       return this.fail('bad-url', `${SENTENCE['bad-url']}: ${this.base || '(empty)'}`)
     }
 
+    const tried = new Set<string>()
+    for (;;) {
+      tried.add(this.version)
+      this.refusal = null
+      const version = opts?.preview ? `${this.version}-preview` : this.version
+      const result = await this.once(path, { ...params, 'api-version': version })
+      const refusal = this.refusal
+      if (refusal === null) return result
+
+      // The server named a version, or we step down a rung. Either way, never
+      // re-try one we've already burned — that is how this loop terminates.
+      const next = refusal && !tried.has(refusal) ? refusal : lowerVersion(this.version, tried)
+      if (!next) return this.fail('api-version', `${SENTENCE['api-version']} (tried ${[...tried].join(', ')})`)
+      this.version = next
+    }
+  }
+
+  /** Set by `once` when the server rejected the api-version; `''` = unnamed. */
+  private refusal: string | null = null
+
+  private async once(path: string, params: Record<string, string>): Promise<AdoResult<Page>> {
     let res: AdoResponse
     try {
       res = await this.fetchImpl(this.url(path, params), {
@@ -276,7 +366,15 @@ export class AdoClient {
       return this.fail('http', `${SENTENCE.http}: HTTP ${res.status} redirect to ${location || '(no location)'}`)
     }
     if (res.status < 200 || res.status >= 300) {
-      return this.fail('http', `${SENTENCE.http}: HTTP ${res.status} ${text.slice(0, MAX_DETAIL)}`)
+      const refused = versionRefusal(res.status, text)
+      if (refused !== null) {
+        // Not a failure yet — `get` retries at a version this server admits to.
+        this.refusal = refused
+        return this.fail('api-version', adoFault(text)?.message ?? SENTENCE['api-version'])
+      }
+      // Prefer Azure DevOps's own sentence; a raw body is mostly boilerplate.
+      const said = adoFault(text)?.message ?? text
+      return this.fail('http', `${SENTENCE.http}: HTTP ${res.status} ${said.slice(0, MAX_DETAIL)}`)
     }
 
     let body: unknown

@@ -379,6 +379,7 @@ export type AdoErrorCode =
   | 'timeout'
   | 'http'
   | 'bad-url'
+  | 'api-version'
 
 /** `detail` never contains the token. */
 export interface AdoError {
@@ -422,7 +423,7 @@ export interface PrsStatus {
 }
 
 export type PrsProbe =
-  | { ok: true; me: { id: string; name: string }; projects: { id: string; name: string }[] }
+  | { ok: true; me: { id: string; name: string }; projects: { id: string; name: string }[]; apiVersion: string }
   | { ok: false; error: AdoError }
 
 export interface PresenceView {

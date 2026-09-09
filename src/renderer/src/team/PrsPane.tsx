@@ -52,6 +52,7 @@ const ERROR_SENTENCE: Record<AdoErrorCode, string> = {
   timeout: 'Azure DevOps took too long to answer.',
   http: 'Azure DevOps answered with an error.',
   'bad-url': "That doesn't look like an Azure DevOps collection URL.",
+  'api-version': 'This Azure DevOps server is too old for Chat — it speaks none of the API versions Chat can.',
 }
 
 export function errorSentence(e: AdoError): string {

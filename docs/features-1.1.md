@@ -261,13 +261,23 @@ export class AdoClient {
 }
 ```
 Rules: `Authorization: Basic base64(':' + token)`, `Accept: application/json`,
-`User-Agent: Chat/<version>`; `api-version=6.0` (works on dev.azure.com and
-on-prem Server 2019+). **A 203 status or a non-JSON body means the PAT was
-rejected (ADO answers with an HTML sign-in page)** → `unauthorized`. Map
+`User-Agent: Chat/<version>`. **`api-version` is negotiated** (1.1.2): 6.0 is
+the opening bid; an older on-prem server answers 400
+`VssVersionOutOfRangeException` naming the newest version it supports (TFS
+2018 → 4.1, 2017 → 3.2) and the client retries there, then reuses that
+version for the life of the process, keyed by origin. A refusal that names
+nothing walks the ladder `6.0 → 5.0 → 4.1 → 3.2 → 3.0 → 2.0 → 1.0`; a version
+already refused is never re-offered, and exhausting the ladder is its own
+error code `api-version`. **A 203 status, a non-JSON body, or an unfollowed
+redirect to `_signin` means the PAT was rejected (ADO answers with an HTML
+sign-in page)** → `unauthorized`; so does a 200 `connectionData` whose
+`authenticatedUser` is the anonymous guid or a `System:PublicAccess`
+descriptor (an org with public projects answers a bad PAT this way). Map
 401→unauthorized, 403→forbidden, 404→not-found, 407→proxy-auth; Chromium
 error strings `ERR_CERT_*`→tls, `ERR_NAME_NOT_RESOLVED`→dns, abort→timeout,
-other `ERR_*`/TypeError→network, other statuses→http. Never log or echo the
-token; redact it from any error detail. Unit tests use a fake `FetchLike`.
+other `ERR_*`/TypeError→network, other statuses→http, quoting ADO's own
+`message` field rather than the raw body. Never log or echo the token; redact
+it from any error detail. Unit tests use a fake `FetchLike`.
 
 Main binds `net.fetch` (Electron, proxy-aware — never `node:https`/global
 fetch) with `{ credentials: 'omit', bypassCustomProtocolHandlers: true, signal: AbortSignal.timeout(15_000) }`.

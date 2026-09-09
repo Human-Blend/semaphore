@@ -73,8 +73,10 @@ The pull-request feature needs a **Personal Access Token** with scope
 **Code → Read** — SSH keys only authenticate `git` operations, not the REST
 API Chat polls. Create one at `{org url}/_usersSettings/tokens` (e.g.
 `https://dev.azure.com/yourorg/_usersSettings/tokens`); on-prem **Azure
-DevOps Server 2019+** works the same way against its collection URL (e.g.
-`https://tfs.internal/DefaultCollection`).
+DevOps Server and TFS** work the same way against a collection URL (e.g.
+`https://tfs.internal/DefaultCollection`) — Chat negotiates the REST API
+version down to whatever the server speaks, back to TFS 2015, and shows the
+one it settled on next to "Signed in as…".
 
 A token can be kept personal or shared with the team. A shared token is
 readable by anyone holding the team passphrase — prefer per-person tokens

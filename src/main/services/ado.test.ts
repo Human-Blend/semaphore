@@ -183,6 +183,77 @@ describe('AdoClient — continuation-token paging', () => {
   })
 })
 
+/** Exactly what an on-prem server sends when it is older than the asked-for API. */
+function outOfRange(latest: string | null): AdoResponse {
+  return json(
+    {
+      $id: '1',
+      innerException: null,
+      message: latest
+        ? `The requested REST API version of 6.0 is out of range for this server. The latest REST API version this server supports is ${latest}.`
+        : 'The requested REST API version of 6.0 is out of range for this server.',
+      typeKey: 'VssVersionOutOfRangeException',
+      errorCode: 0,
+    },
+    { status: 400 },
+  )
+}
+
+const versionOf = (url: string): string => new URL(url).searchParams.get('api-version') ?? ''
+
+describe('AdoClient — api-version negotiation', () => {
+  it('retries at the version the server names, and remembers it', async () => {
+    // TFS 2018: tops out at 4.1. The retry must land, and the next call must
+    // not repeat the discovery.
+    const f = fake((call, n) => (versionOf(call.url).startsWith('6.0') ? outOfRange('4.1') : json(n === 1 ? ME : { value: [] })))
+    const c = client(f.fetchImpl)
+    const me = await c.me()
+    expect(me.ok).toBe(true)
+    expect(f.calls.map((x) => versionOf(x.url))).toEqual(['6.0-preview', '4.1-preview'])
+    expect(c.apiVersion).toBe('4.1')
+
+    await c.projects()
+    expect(versionOf(f.calls[2].url)).toBe('4.1')
+  })
+
+  it('starts from a version handed in, skipping the discovery round trip', async () => {
+    const f = fake(json(ME))
+    const c = new AdoClient(f.fetchImpl, { baseUrl: BASE, token: TOKEN, userAgent: 'ua', apiVersion: '4.1' })
+    await c.me()
+    expect(f.calls).toHaveLength(1)
+    expect(versionOf(f.calls[0].url)).toBe('4.1-preview')
+  })
+
+  it('walks down the ladder when the server refuses without naming a version', async () => {
+    const f = fake((call) => (versionOf(call.url).startsWith('3.2') ? json(ME) : outOfRange(null)))
+    const c = client(f.fetchImpl)
+    expect((await c.me()).ok).toBe(true)
+    expect(f.calls.map((x) => versionOf(x.url))).toEqual(['6.0-preview', '5.0-preview', '4.1-preview', '3.2-preview'])
+  })
+
+  it('gives up with an api-version error once the ladder is exhausted', async () => {
+    const f = fake(outOfRange(null))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error.code).toBe('api-version')
+      expect(r.error.detail).toContain('6.0')
+    }
+    // The ladder is finite: no endless retry loop against a hostile server.
+    expect(f.calls.length).toBeLessThanOrEqual(8)
+  })
+
+  it('never re-offers a version the server already refused', async () => {
+    // A server that answers "the latest is 6.0" to a 6.0 request is lying or
+    // broken; taking it at its word would loop forever.
+    const f = fake(outOfRange('6.0'))
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    const offered = f.calls.map((x) => versionOf(x.url))
+    expect(new Set(offered).size).toBe(offered.length)
+  })
+})
+
 describe('AdoClient — status and body mapping', () => {
   it('203 with an HTML sign-in page → unauthorized', async () => {
     const f = fake(res({ status: 203, body: '<!DOCTYPE html><html><body>Sign In</body></html>' }))
@@ -202,6 +273,18 @@ describe('AdoClient — status and body mapping', () => {
     const r = await client(f.fetchImpl).me()
     expect(r.ok).toBe(false)
     if (!r.ok) expect(r.error.code).toBe('unauthorized')
+  })
+
+  it('quotes Azure DevOps’s own sentence rather than the raw JSON envelope', async () => {
+    const f = fake(
+      json({ $id: '1', innerException: null, message: 'TF400813: The user is not authorized.', typeKey: 'X' }, { status: 400 }),
+    )
+    const r = await client(f.fetchImpl).me()
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error.detail).toContain('TF400813: The user is not authorized.')
+      expect(r.error.detail).not.toContain('innerException')
+    }
   })
 
   it('an unfollowed redirect elsewhere → http, naming the target', async () => {

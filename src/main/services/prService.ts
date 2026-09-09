@@ -102,6 +102,25 @@ export class PrService {
 
   private readonly fetchImpl: FetchLike
 
+  /**
+   * The REST API version a server accepted, once negotiated — carried into
+   * every later client so an old on-prem server costs one extra round trip per
+   * process, not one per poll. Keyed by origin: negotiation only ever steps
+   * *down*, so handing server B the version server A settled on would pin B
+   * lower than it deserves for the life of the process.
+   */
+  private apiVersions = new Map<string, string>()
+
+  private apiVersionFor(baseUrl: string): string | undefined {
+    const origin = baseUrlOrigin(baseUrl)
+    return origin ? this.apiVersions.get(origin) : undefined
+  }
+
+  private rememberApiVersion(baseUrl: string, version: string): void {
+    const origin = baseUrlOrigin(baseUrl)
+    if (origin) this.apiVersions.set(origin, version)
+  }
+
   constructor(
     private chat: ChatService,
     private store: SecretStore,
@@ -281,10 +300,12 @@ export class PrService {
       baseUrl: this.config.baseUrl,
       token: this.token(),
       userAgent: this.ua(),
+      apiVersion: this.apiVersionFor(this.config.baseUrl),
     })
 
     if (!this.me) {
       const who = await client.me()
+      this.rememberApiVersion(this.config.baseUrl, client.apiVersion)
       if (gen !== this.configGen) return null
       if (!who.ok) {
         this.error = who.error
@@ -483,12 +504,19 @@ export class PrService {
     if (!token) {
       return { ok: false, error: { code: 'unauthorized', detail: 'Enter an Azure DevOps personal access token' } }
     }
-    const client = new AdoClient(this.fetchImpl, { baseUrl, token, userAgent: this.ua() })
+    const client = new AdoClient(this.fetchImpl, {
+      baseUrl,
+      token,
+      userAgent: this.ua(),
+      apiVersion: this.apiVersionFor(baseUrl),
+    })
     const me = await client.me()
+    this.rememberApiVersion(baseUrl, client.apiVersion)
     if (!me.ok) return this.probeFailed('connectionData', baseUrl, me.error)
     const projects = await client.projects()
+    this.rememberApiVersion(baseUrl, client.apiVersion)
     if (!projects.ok) return this.probeFailed('projects', baseUrl, projects.error)
-    return { ok: true, me: me.value, projects: projects.value }
+    return { ok: true, me: me.value, projects: projects.value, apiVersion: client.apiVersion }
   }
 
   /** `detail` is already redacted by AdoClient; the token itself never gets here. */
@@ -508,7 +536,10 @@ export class PrService {
     if (!token) {
       return { ok: false, error: { code: 'unauthorized', detail: 'Enter an Azure DevOps personal access token' } }
     }
-    return new AdoClient(this.fetchImpl, { baseUrl, token, userAgent: this.ua() }).repos(project)
+    const client = new AdoClient(this.fetchImpl, { baseUrl, token, userAgent: this.ua(), apiVersion: this.apiVersionFor(baseUrl) })
+    const res = await client.repos(project)
+    this.rememberApiVersion(baseUrl, client.apiVersion)
+    return res
   }
 
   // -------------------------------------------------------------------------

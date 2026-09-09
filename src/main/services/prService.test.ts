@@ -700,6 +700,7 @@ describe('PrService — prefs RPCs', () => {
       ok: true,
       me: { id: 'me-1', name: 'Ada' },
       projects: [{ id: 'p1', name: 'Proj' }],
+      apiVersion: '6.0',
     })
   })
 
