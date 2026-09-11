@@ -74,6 +74,23 @@ export function dmPairToken(dmKey: Buffer): string {
   return b32(mac).slice(0, 20)
 }
 
+/**
+ * Opaque private-group directory token (1.2). Derived from the group's EPOCH-1
+ * key — like `kMeta` for channels, it must survive every rekey, or a removal
+ * would move the whole log to a new directory. Only someone who was handed a
+ * group key can compute it, so `groups/` tells a non-member nothing: not the
+ * name, not the members, not even that a given group exists.
+ */
+export function groupDirToken(groupKey1: Buffer): string {
+  const mac = createHmac('sha256', groupKey1).update(HKDF_INFO.grpDirToken).digest()
+  return b32(mac).slice(0, 20)
+}
+
+/** A fresh 32-byte group key (epoch 1, or a rotation). */
+export function newGroupKey(): Buffer {
+  return randomBytes(32)
+}
+
 export function newTeamSalt(): Buffer {
   return randomBytes(KDF.saltBytes)
 }

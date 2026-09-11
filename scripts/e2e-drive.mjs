@@ -9,8 +9,9 @@
 //   npm run build && node scripts/e2e-drive.mjs
 
 import { spawn, execSync } from 'node:child_process'
+import { deflateRawSync, inflateRawSync } from 'node:zlib'
 import { createServer } from 'node:http'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import WebSocket from 'ws'
@@ -392,13 +393,30 @@ async function main() {
       check("alice sees bob's reaction", !!gotRct)
     }
 
-    // Presence: alice sees bob online
+    // Presence: alice sees bob's beacon (verified, with hostname + fingerprint).
+    // 1.2 finally plumbs the *real* OS-wide input-idle time into `idleSec`
+    // (src/main/services/ioTier.ts -> BeaconWriter.setTier), and
+    // Poller.presenceViews() has always turned that into 'away' once idleSec
+    // >= PRESENCE.awayIdleSec (300s) — that branch existed before 1.2 too, it
+    // just never fired because idleSec was hardcoded to 0. On a machine whose
+    // real mouse/keyboard has been untouched for 5+ minutes (exactly what an
+    // unattended CDP-driven run looks like), Bob's own beacon truthfully says
+    // he is idle, so alice correctly sees 'away' rather than 'online' — this
+    // is not a bug, and neither a longer wait nor Page.bringToFront() changes
+    // it: derive() in ioTier.ts checks powerMonitor.getSystemIdleTime() itself
+    // (a real OS-wide counter untouched by window focus or CDP-injected
+    // input) before it ever looks at focus. So accept either state as proof
+    // presence delivery works; only 'offline'/absent means something is wrong.
     const presA = await until(async () => {
       const list = await alice.eval(`window.bridge.presence.list()`)
       const bobView = list?.find((p) => p.name === 'Bob')
-      return bobView?.state === 'online' ? bobView : undefined
+      return bobView?.state === 'online' || bobView?.state === 'away' ? bobView : undefined
     }, 30000)
-    check('alice sees Bob online with device chip', !!presA, presA ? `${presA.hostname}·${presA.fingerprint}` : '')
+    check(
+      "alice sees Bob's presence (online, or away if this machine has been idle) with device chip",
+      !!presA,
+      presA ? `${presA.hostname}·${presA.fingerprint}·${presA.state}` : '',
+    )
 
     // E2E DM: bob -> alice
     const dm = await bob.eval(`window.bridge.chat.dmFor(${JSON.stringify(selfA.self.deviceId)})`)
@@ -415,6 +433,142 @@ async function main() {
     // Link preview fetch (network permitting — informational only)
     const lp = await alice.eval(`window.bridge.links.preview('https://example.com')`).catch(() => null)
     check('link preview resolves (failed:true acceptable offline)', !!lp, lp?.failed ? 'degraded card' : lp?.title ?? '')
+
+    // ---- Channels: rename + delete, fixed channel is protected (1.2) -------
+    const designCh = await alice.eval(`window.bridge.chat.createChannel('design')`)
+    check('alice creates #design', !!designCh?.conv, designCh ? `${designCh.name} (${designCh.conv})` : '')
+
+    const renameErr = await alice.eval(
+      `window.bridge.chat.renameChannel(${JSON.stringify(designCh?.conv)}, 'product').then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('alice renames #design to #product via chat.renameChannel', renameErr === '', renameErr)
+
+    const chansB = await until(async () => {
+      const chs = await bob.eval(`window.bridge.chat.channels()`)
+      return chs?.some((c) => c.name === 'product') ? chs : undefined
+    }, 20000)
+    check(
+      "bob's chat.channels() shows #product (renamed from #design)",
+      !!chansB && chansB.some((c) => c.name === 'product') && !chansB.some((c) => c.name === 'design'),
+      chansB ? chansB.map((c) => `${c.name}${c.fixed ? '(fixed)' : ''}`).join(' ') : 'timed out',
+    )
+    const generalFixed = chansB?.find((c) => c.name === 'general')?.fixed
+    const productFixed = chansB?.find((c) => c.name === 'product')?.fixed
+    check(
+      '#general is fixed:true and #product is fixed:false',
+      generalFixed === true && productFixed === false,
+      `general.fixed=${generalFixed} product.fixed=${productFixed}`,
+    )
+
+    const fixedRenameErr = await alice.eval(
+      `window.bridge.chat.renameChannel(${JSON.stringify(conv)}, 'nope').then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check(
+      "alice's chat.renameChannel on the fixed #general channel rejects",
+      fixedRenameErr !== '',
+      fixedRenameErr || 'no error thrown',
+    )
+
+    // ---- Private groups: create, DM-borne invite, message, rename (1.2) ----
+    const group = await alice.eval(
+      `window.bridge.groups.create('Duo', [${JSON.stringify(selfB.self.deviceId)}])`,
+    )
+    check('alice creates the private group Duo', !!group?.conv, group ? `${group.conv} role=${group.role}` : '')
+
+    const groupB = await until(async () => {
+      const gs = await bob.eval(`window.bridge.groups.list()`)
+      return gs?.find((g) => g.conv === group?.conv)
+    }, 25000)
+    check(
+      "bob's groups.list() discovers Duo via the DM invite",
+      !!groupB && groupB.role === 'member' && groupB.members?.length === 2,
+      groupB ? `${groupB.name} role=${groupB.role} members=${groupB.members?.length}` : 'timed out',
+    )
+
+    if (group?.conv) {
+      await alice.eval(`window.bridge.chat.send(${JSON.stringify(group.conv)}, { text: 'hi duo', kind: 'text' })`)
+      const gotGrpMsg = await until(async () => {
+        const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(group.conv)})`)
+        return evs?.find((e) => e.type === 'msg' && e.payload?.body?.text === 'hi duo')
+      }, 20000)
+      check("bob's chat.events(grp:<id>) has alice's message (verified)", !!gotGrpMsg && gotGrpMsg.verified === true)
+
+      const renameGrpErr = await bob.eval(
+        `window.bridge.groups.rename(${JSON.stringify(group.conv)}, 'Duo renamed').then(() => '', (x) => String(x && x.message || x))`,
+      )
+      check('bob renames the group', renameGrpErr === '', renameGrpErr)
+
+      const groupA = await until(async () => {
+        const gs = await alice.eval(`window.bridge.groups.list()`)
+        return gs?.find((g) => g.conv === group.conv && g.name === 'Duo renamed')
+      }, 20000)
+      check("alice sees the group's new name", !!groupA, groupA ? groupA.name : 'timed out')
+    }
+
+    // The group's dir must exist under Chat/groups/ and be an opaque token —
+    // no device-id (or its 8-hex prefix) anywhere in the directory name.
+    try {
+      const groupDirs = readdirSync(join(SHARE, 'Chat', 'groups'))
+      const aliceId = selfA.self.deviceId
+      const bobId = selfB.self.deviceId
+      const opaque =
+        groupDirs.length > 0 &&
+        groupDirs.every(
+          (d) => !d.includes(aliceId) && !d.includes(bobId) && !d.includes(aliceId.slice(0, 8)) && !d.includes(bobId.slice(0, 8)),
+        )
+      check(
+        'the group dir under Chat/groups/ exists and its name is an opaque token (no device-id prefix)',
+        groupDirs.length > 0 && opaque,
+        groupDirs.join(' '),
+      )
+    } catch (err) {
+      check(
+        'the group dir under Chat/groups/ exists and its name is an opaque token (no device-id prefix)',
+        false,
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+
+    // ---- Code block with an explicit language (1.2 language dropdown) ------
+    await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(conv)}, { text: 'const x: number = 1', kind: 'code', lang: 'typescript' })`,
+    )
+    const gotCode = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find(
+        (e) => e.type === 'msg' && e.payload?.body?.kind === 'code' && e.payload?.body?.text === 'const x: number = 1',
+      )
+    }, 20000)
+    check(
+      "bob's event body has lang === 'typescript'",
+      gotCode?.payload?.body?.lang === 'typescript',
+      gotCode ? `lang=${gotCode.payload.body.lang}` : 'timed out',
+    )
+
+    // ---- Delete a channel: gone on bob, sending into it rejects on alice ---
+    const deleteErr = await alice.eval(
+      `window.bridge.chat.deleteChannel(${JSON.stringify(designCh?.conv)}).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('alice deletes #product via chat.deleteChannel', deleteErr === '', deleteErr)
+
+    const chansB2 = await until(async () => {
+      const chs = await bob.eval(`window.bridge.chat.channels()`)
+      return chs && !chs.some((c) => c.name === 'product') ? chs : undefined
+    }, 20000)
+    check(
+      "bob's chat.channels() no longer lists #product",
+      !!chansB2,
+      chansB2 ? chansB2.map((c) => c.name).join(' ') : 'timed out',
+    )
+
+    const sendAfterDeleteErr = await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(designCh?.conv)}, { text: 'too late', kind: 'text' }).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check(
+      'chat.send into the deleted channel rejects on alice',
+      sendAfterDeleteErr !== '',
+      sendAfterDeleteErr || 'no error thrown',
+    )
 
     // ---- File sharing: alice attaches a real file; bob fetches the blob ----
     const testFile = join(process.cwd(), 'resources', 'icon.png')
@@ -443,6 +597,111 @@ async function main() {
         check('sfblob:// protocol serves the decrypted image', dims === '512x512', `decoded=${dims}`)
       }
     }
+
+    // ---- Diagrams: alice sends an inline scene; bob renders it locally -----
+    //
+    // The scene is built here rather than by driving the canvas: what matters
+    // is the wire contract (deflate-raw + base64 inside the event, a WebP thumb
+    // beside it, and a `text` line an old client can print), not Excalidraw's
+    // pointer handling. Compressing with node:zlib also proves the codec's
+    // format is the platform's, not something only the renderer can read.
+    const diagramScene = JSON.stringify({
+      type: 'excalidraw',
+      version: 2,
+      source: 'e2e',
+      elements: Array.from({ length: 14 }, (_, i) => ({
+        id: `e2e-el-${i}`,
+        type: i % 2 ? 'rectangle' : 'ellipse',
+        x: 100 + i * 40,
+        y: 120 + (i % 3) * 60,
+        width: 160,
+        height: 80,
+        angle: 0,
+        strokeColor: '#1e1e1e',
+        backgroundColor: 'transparent',
+        fillStyle: 'solid',
+        strokeWidth: 2,
+        strokeStyle: 'solid',
+        roughness: 1,
+        opacity: 100,
+        groupIds: [],
+        frameId: null,
+        roundness: { type: 3 },
+        seed: 1000 + i,
+        version: 1,
+        versionNonce: 1,
+        isDeleted: false,
+        boundElements: null,
+        updated: 1,
+        link: null,
+        locked: false,
+      })),
+      appState: { viewBackgroundColor: '#ffffff' },
+      files: {},
+    })
+    const diagramData = deflateRawSync(Buffer.from(diagramScene, 'utf8')).toString('base64')
+    const diagramThumb =
+      'data:image/webp;base64,UklGRhIAAABXRUJQVlA4TAYAAAAvAAAAAAfQ//73v/+BiOh/AAA='
+    const diagramDraft = {
+      text: 'Sprint plan',
+      kind: 'diagram',
+      diagram: { fmt: 'excalidraw', data: diagramData, w: 660, h: 320, elements: 14, thumb: diagramThumb },
+    }
+    const diagErr = await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(conv)}, ${JSON.stringify(diagramDraft)}).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('alice sends an inline diagram', diagErr === '', diagErr || `${diagramData.length}B compressed`)
+
+    const diagMsg = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'msg' && e.payload?.body?.kind === 'diagram')
+    }, 25000)
+    const diagBody = diagMsg?.payload?.body
+    check(
+      'bob receives the diagram message with its scene and thumb inline',
+      !!diagBody && !!diagBody.diagram?.data && !!diagBody.diagram?.thumb && diagBody.diagram.elements === 14,
+      diagBody ? `${diagBody.diagram?.data?.length}B data, thumb ${diagBody.diagram?.thumb?.length}B` : 'timed out',
+    )
+    check(
+      'the diagram message carries no attachment (zero extra share I/O to read it)',
+      !!diagMsg && !diagMsg.payload?.attachments,
+      diagMsg?.payload?.attachments ? 'unexpected attachment' : 'inline only',
+    )
+    check(
+      'a pre-1.2 client would still see a line naming the diagram',
+      diagBody?.text === '📐 Diagram: Sprint plan — update Chat to view it',
+      diagBody?.text ?? '',
+    )
+    if (diagBody?.diagram?.data) {
+      let roundTripped = ''
+      try {
+        roundTripped = inflateRawSync(Buffer.from(diagBody.diagram.data, 'base64')).toString('utf8')
+      } catch (err) {
+        roundTripped = `inflate failed: ${err}`
+      }
+      check(
+        "bob's copy of the scene inflates back to exactly what alice drew",
+        roundTripped === diagramScene,
+        roundTripped === diagramScene ? `${diagramScene.length}B scene` : roundTripped.slice(0, 80),
+      )
+    }
+
+    // The tile itself: bob opens the channel and the diagram renders locally
+    // (thumb first, then a crisp SVG from the scene) with no blob fetch.
+    let tileState = 'no tile'
+    const tileSeen = await until(async () => {
+      tileState = await bob.eval(
+        `(() => {
+          const el = document.querySelector('button[aria-label^="Open the diagram"]')
+          if (!el) return 'no tile'
+          if (el.querySelector('svg')) return 'svg'
+          if (el.querySelector('img')) return 'thumb'
+          return 'placeholder'
+        })()`,
+      )
+      return tileState === 'svg' ? tileState : undefined
+    }, 25000)
+    soft('bob renders the diagram tile as a locally drawn SVG', tileSeen === 'svg', tileState)
 
     // ---- Beams: alice beams a file directly to bob; auto-flow via bridge ----
     // Persistent collector attached BEFORE the send so no push is missed.

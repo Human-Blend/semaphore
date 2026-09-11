@@ -7,8 +7,10 @@ import {
   beginCapture,
   initScreenShare,
   leaveViewing,
+  presenterLabel,
   startShare,
   stopShare,
+  switchSource,
   useScreenStore,
   viewerStream,
 } from './manager'
@@ -122,9 +124,25 @@ function SourcePicker() {
   useEffect(() => {
     if (!conv) return
     let alive = true
+    let preselected = false
+    setSelected(null) // clear any previous session's pick before this one loads
     const load = () =>
       void window.bridge.screen.sources().then((r) => {
-        if (alive) setSources(r.sources)
+        if (!alive) return
+        setSources(r.sources)
+        // Pre-select the primary display (falling back to the first screen)
+        // so "Start sharing" works with one click — the picker used to start
+        // with nothing selected, which was half of why people ended up
+        // sharing only the Chat window itself. Only latch once a screen has
+        // actually shown up: a windows-only first poll (screens enumerate
+        // slower on some setups) must not lock the pick onto a window forever.
+        if (!preselected) {
+          const def = r.sources.find((s) => s.primary) ?? r.sources.find((s) => s.kind === 'screen')
+          if (def) {
+            preselected = true
+            setSelected(def.id)
+          }
+        }
       })
     load()
     const t = setInterval(load, 2000) // live-ish thumbnails
@@ -178,8 +196,13 @@ function SourcePicker() {
                       }}
                     >
                       <img src={s.thumbnailDataUrl} alt={s.name} style={{ width: '100%', height: 120, objectFit: 'cover', display: 'block' }} />
-                      <div style={{ padding: '6px 8px', fontSize: 12, color: 'var(--text-2)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {s.name}
+                      <div style={{ padding: '6px 8px', fontSize: 12, color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.name}</span>
+                        {s.primary && (
+                          <span style={{ flexShrink: 0, fontSize: 10, fontWeight: 600, color: 'var(--text-3)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--r-full)', padding: '1px 6px' }}>
+                            Primary
+                          </span>
+                        )}
                       </div>
                     </button>
                   ))}
@@ -198,9 +221,13 @@ function SourcePicker() {
             Cancel
           </Button>
           <Button
-            disabled={!selected}
+            // `!selected` alone stayed enabled on a stale pick — a source
+            // that closed (or was never in this poll's list) still looked
+            // selected, and the click below was a silent no-op.
+            disabled={!sources.some((s) => s.id === selected)}
             onClick={() => {
-              if (selected) void beginCapture(conv, selected)
+              const source = sources.find((s) => s.id === selected)
+              if (source) void beginCapture(conv, source)
             }}
           >
             Start sharing
@@ -239,8 +266,12 @@ function PermissionPanel() {
         </p>
         <p style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: '17px' }}>
           Look for <strong style={{ color: 'var(--text-2)' }}>Screen&nbsp;Recording</strong> specifically — not Microphone or
-          Camera. Chat never records audio. macOS may ask again after an app update; that's normal for an
-          internally-built app.
+          Camera. Chat never records audio. After updating Chat, macOS may ask for this again — that's normal for
+          internally built apps.
+        </p>
+        <p style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: '17px' }}>
+          On macOS 15 (Sequoia) and later, the OS also shows a periodic "Chat can record this screen" reminder while
+          you're sharing — that's Apple's own nudge, not a sign anything's wrong.
         </p>
         {status === 'granted' && (
           <p style={{ fontSize: 13, color: 'var(--success)', fontWeight: 600 }}>✓ Granted — restart Chat to finish.</p>
@@ -285,7 +316,10 @@ function PresenterBanner() {
         top: 8,
         left: '50%',
         transform: 'translateX(-50%)',
-        zIndex: 950,
+        // Above every full-window overlay (diagram editor 1100, lightbox 1000):
+        // "you are sharing your screen" must never be the thing that is hidden.
+        // See the ladder in app/toasts.tsx.
+        zIndex: 1150,
         display: 'flex',
         alignItems: 'center',
         gap: 10,
@@ -299,12 +333,18 @@ function PresenterBanner() {
       } as React.CSSProperties}
     >
       <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--danger)', animation: 'sem-pulse 1.6s ease-in-out infinite' }} />
-      <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-1)' }}>
-        Sharing your screen · {mm}:{ss}
+      <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-1)' }} title={sharing.sourceName}>
+        {presenterLabel(sharing.sourceName, sharing.sourceKind)} · {mm}:{ss}
       </span>
       <span style={{ fontSize: 12, color: 'var(--text-2)' }} title="live P2P viewers + relay viewers">
         👀 {sharing.viewers}
       </span>
+      <button
+        onClick={() => void switchSource()}
+        style={{ border: '1px solid var(--border-strong)', color: 'var(--text-1)', background: 'transparent', borderRadius: 'var(--r-sm)', fontSize: 12, fontWeight: 600, padding: '3px 10px', cursor: 'pointer' }}
+      >
+        Switch source
+      </button>
       <button
         onClick={() => void stopShare()}
         style={{ border: '1px solid var(--danger)', color: 'var(--danger)', background: 'transparent', borderRadius: 'var(--r-sm)', fontSize: 12, fontWeight: 600, padding: '3px 10px', cursor: 'pointer' }}

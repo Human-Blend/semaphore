@@ -1,8 +1,10 @@
-import { app, BrowserWindow, dialog, shell } from 'electron'
+import { app, BrowserWindow, dialog, powerMonitor, shell } from 'electron'
 import { basename, dirname, join } from 'node:path'
 import { existsSync, renameSync, rmSync } from 'node:fs'
 import { AppController } from './appController'
 import { registerIpc } from './ipc'
+import { lockNavigation } from './navGuard'
+import { IoTierManager } from './services/ioTier'
 import { registerBlobProtocol, registerBlobScheme } from './services/blobProtocol'
 import { registerGifProtocol, registerGifScheme } from './services/gifProtocol'
 
@@ -50,6 +52,31 @@ if (!gotLock) {
 
 let mainWindow: BrowserWindow | null = null
 const controller = new AppController(() => mainWindow)
+
+// ---------------------------------------------------------------------------
+// Share I/O tier (1.2). The whole read side reads its cadence from this: window
+// focus, OS input idleness, and the lock/sleep signals. powerMonitor is only
+// usable after `ready`, hence the try/catch in the sampler and the start()
+// inside whenReady.
+
+const ioTier = new IoTierManager({
+  getSystemIdleSec: () => powerMonitor.getSystemIdleTime(),
+  isWindowVisible: () => !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !mainWindow.isMinimized(),
+})
+controller.setIoTierManager(ioTier)
+
+function wirePowerMonitor(): void {
+  // Locked or asleep: nobody is reading, and on macOS a sleeping machine's
+  // SMB mount is gone anyway — polling it just piles up errors.
+  powerMonitor.on('lock-screen', () => ioTier.setLocked(true))
+  powerMonitor.on('unlock-screen', () => ioTier.setLocked(false))
+  powerMonitor.on('suspend', () => ioTier.setSuspended(true))
+  powerMonitor.on('resume', () => ioTier.setSuspended(false))
+  // Not every platform emits lock-screen; these are the same signal by another
+  // name on Windows and cost nothing where they never fire.
+  powerMonitor.on('shutdown', () => ioTier.setSuspended(true))
+  ioTier.start()
+}
 
 /**
  * Path to a file shipped in `resources/`. electron-builder copies that folder
@@ -119,6 +146,9 @@ function createSplash(): void {
     splash = null
   })
 
+  // No bridge here, but the same rule: this window shows one local page.
+  lockNavigation(splash.webContents)
+
   splash.loadFile(resourcePath('splash.html'))
 }
 
@@ -155,17 +185,26 @@ function createWindow(): void {
     const linger = Math.max(0, 1200 - (Date.now() - splashShownAt))
     setTimeout(destroySplash, linger)
   })
-  mainWindow.on('focus', () => controller.chat?.focusPollRate(true))
-  mainWindow.on('blur', () => controller.chat?.focusPollRate(false))
+  mainWindow.on('focus', () => ioTier.setFocused(true))
+  mainWindow.on('blur', () => ioTier.setFocused(false))
+  mainWindow.on('show', () => ioTier.setVisible(true))
+  mainWindow.on('restore', () => ioTier.setVisible(true))
+  mainWindow.on('hide', () => ioTier.setVisible(false))
+  mainWindow.on('minimize', () => ioTier.setVisible(false))
   mainWindow.on('closed', () => {
     mainWindow = null
+    ioTier.setVisible(false)
+    ioTier.setFocused(false)
   })
 
-  // Any external navigation opens in the OS browser, never inside the app.
+  // Any external navigation opens in the OS browser, never inside the app —
+  // whether the page asks for a new window (here) or tries to move this one
+  // (lockNavigation — see src/main/navGuard.ts).
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('http:') || url.startsWith('https:')) shell.openExternal(url)
     return { action: 'deny' }
   })
+  lockNavigation(mainWindow.webContents)
 
   if (!app.isPackaged && process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -189,6 +228,7 @@ app.whenReady().then(async () => {
   registerBlobProtocol(controller)
   registerGifProtocol()
   registerIpc(controller, () => mainWindow)
+  wirePowerMonitor()
   createSplash()
   try {
     await controller.init()
@@ -215,6 +255,7 @@ app.on('window-all-closed', () => {
 let quitting = false
 app.on('before-quit', (e) => {
   destroySplash()
+  ioTier.stop()
   if (quitting) return
   e.preventDefault()
   quitting = true

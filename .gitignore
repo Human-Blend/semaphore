@@ -15,3 +15,6 @@ scripts/.*.mjs
 *.keystore
 *.sealed
 *.tsbuildinfo
+
+# Derived: Excalidraw fonts copied out of node_modules (scripts/sync-excalidraw-assets.mjs)
+src/renderer/public/excalidraw-assets/

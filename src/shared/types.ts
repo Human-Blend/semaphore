@@ -42,7 +42,12 @@ export interface DevicePin {
 // ---------------------------------------------------------------------------
 // Events (one file per event; filename stem is the event id)
 
-export type EventType = 'msg' | 'edt' | 'del' | 'rct' | 'pin' | 'sys' | 'prv' | 'cal' | 'prs'
+// 'grp' (1.2) carries the private-group notices that travel in a DM log —
+// invite, rekey, "you were removed". They are deliberately NOT 'sys': a 1.1
+// client has no default in `sysLine()`, so a sys row it doesn't know renders as
+// a blank line in the DM timeline. A `.grp.e1` filename doesn't parse on 1.1 at
+// all, so the file is ignored in silence — the same trick 'cal'/'prs' use.
+export type EventType = 'msg' | 'edt' | 'del' | 'rct' | 'pin' | 'sys' | 'prv' | 'cal' | 'prs' | 'grp'
 
 export interface EventId {
   hlcMs: number
@@ -53,7 +58,10 @@ export interface EventId {
 
 // dm:<pairToken>; team:<fixed name> — team convs are app-defined logs
 // (see TEAM_CONV) that live under DIR.team and are never day-swept.
-export type ConvId = `chan:${string}` | `dm:${string}` | `team:${string}`
+// grp:<groupId> (1.2) — a private group: a random key sealed to each member
+// (delivered as a `group-invite` sys event in the owner↔member DM log), dir
+// token = HMAC(epoch-1 key, 'grp-dirtoken') so non-members can't even find it.
+export type ConvId = `chan:${string}` | `dm:${string}` | `team:${string}` | `grp:${string}`
 
 export type BodyEntity =
   | { type: 'code'; lang: string | null; start: number; end: number }
@@ -84,12 +92,34 @@ export interface LinkPreview {
   reason?: 'network' | 'http' | 'nometa'
 }
 
+/**
+ * A whiteboard/diagram message (1.2). The scene ships inline when small
+ * (deflate-raw + base64 of the .excalidraw JSON, ≤ DIAGRAM.maxInlineBytes
+ * compressed — it then lives as long as messages do, 180 days) and as a
+ * `.excalidraw` blob attachment otherwise (7-day media retention). `thumb` is
+ * the instant WebP preview; the crisp SVG is rendered locally from `data`.
+ */
+export interface DiagramBody {
+  fmt: 'excalidraw'
+  /** Compressed scene; absent when the scene is the blob attachment instead. */
+  data?: string
+  /** Scene bounding box in px, for tile layout before any decode. */
+  w: number
+  h: number
+  /** Inline WebP preview (data: URI), ≤ EVENT.maxThumbBytes. */
+  thumb?: string
+  /** Element count, for the tile caption ("Diagram · 14 shapes"). */
+  elements: number
+}
+
 export interface MsgBody {
-  kind: 'text' | 'code' | 'gif'
+  kind: 'text' | 'code' | 'gif' | 'diagram'
   text: string
   lang?: string | null // kind:'code'
   packId?: string // kind:'gif' from the bundled pack — zero share I/O
   entities?: BodyEntity[]
+  /** kind:'diagram' — `text` carries a fallback line for pre-1.2 clients. */
+  diagram?: DiagramBody
 }
 
 export interface MsgPayload {
@@ -144,14 +174,83 @@ export interface SysPayload {
   conv: ConvId
   kind:
     | 'channel-created'
-    | 'channel-renamed'
+    | 'channel-renamed' // data: { name } — any member, LWW by event id (1.2)
+    | 'channel-deleted' // data: {} — any member; never for the fixed channel (1.2)
     | 'topic-changed'
     | 'name-changed'
     | 'beam-receipt'
     | 'purge-blob'
     | 'screenshare'
     | 'screenshare-ended'
+    // Private groups (1.2). The two `group-invite`/`group-rekey` kinds travel in
+    // the owner↔member DM log (E2E) and carry key material — see GroupInviteData.
+    // The rest live in the group's own log and are LWW-materialized like
+    // channel metadata; `group-member-removed`/`group-deleted` count only when
+    // signed by the owner, the others when signed by a current member.
+    | 'group-invite'
+    | 'group-rekey'
+    | 'group-created' // data: { name, members }
+    | 'group-renamed' // data: { name }
+    | 'group-members-added' // data: { members }
+    | 'group-member-removed' // data: { member, epoch } — written under the new epoch key
+    | 'group-left' // data: {} — the author left
+    | 'group-deleted' // data: {}
+    | 'group-removed' // data: { groupId, epoch } — "you were removed", a `grp` event (1.2)
   data: Record<string, unknown>
+}
+
+/**
+ * A private-group notice inside the owner↔member DM log (1.2). Its own event
+ * type, not `sys`: `sysLine()` on a shipped 1.1 client has no default branch, so
+ * an unknown sys kind renders as an empty row in the DM. A `.grp.e1` file fails
+ * 1.1's `EVENT_RE` outright and is skipped without a trace instead.
+ *
+ * `group-invite`/`group-rekey` carry `GroupInviteData` (key material — the
+ * bridge blanks `key`/`key1` before the renderer ever sees them); the
+ * `group-removed` notice the owner sends to the person they removed carries
+ * only the group id and the epoch it rotated to.
+ *
+ * `materialize()` folds these into the same `sys` row list under the same kind
+ * strings, so `sysLine` and the conversation-vanished toast keep working.
+ */
+export interface GrpPayload {
+  t: 'grp'
+  /** The DM the notice travels in — never the group's own conv. */
+  conv: ConvId
+  kind: 'group-invite' | 'group-rekey' | 'group-removed'
+  data: GroupInviteData | GroupRemovedData
+}
+
+/** `data` of a `group-removed` notice: enough to drop the group, nothing more. */
+export interface GroupRemovedData {
+  groupId: string
+  /** The epoch the owner rotated to when removing this device. */
+  epoch: number
+  /**
+   * The group's name at that moment — for the DM row alone ("You were removed
+   * from 🔒 Ops crew"). The removed device is dropping its local state, so it
+   * has nowhere else left to look the name up; nothing secret travels here that
+   * the recipient did not already have.
+   */
+  name?: string
+}
+
+/** `data` of a `group-invite` (epoch 1) or `group-rekey` (epoch ≥ 2) DM sys event. */
+export interface GroupInviteData {
+  groupId: string // 8 hex, random, chosen by the owner
+  name: string
+  owner: string // deviceId
+  members: string[] // deviceIds, owner included
+  epoch: number
+  key: string // base64 32-byte group key for this epoch
+  /**
+   * Epoch-1 key, base64 — the directory token derives from it, so it rides
+   * along on every message that carries an epoch above 1: a rekey, and an
+   * invite sent to someone joining after a rotation. Absent at epoch 1, where
+   * `key` already is the epoch-1 key.
+   */
+  key1?: string
+  createdAt: number
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +300,7 @@ export type EventPayload =
   | SysPayload
   | CalPayload
   | PrsPayload
+  | GrpPayload
 
 /** What actually gets encrypted into an .e1 file. */
 export interface SignedRecord<T = unknown> {
@@ -227,6 +327,10 @@ export interface BeaconContent {
   cursors: Record<string, Cursor>
   /** DM section: pairToken -> SFC1-under-pair-key, base64. Hides DM activity from the team. */
   dmSealed?: Record<string, string>
+  /** Private groups (1.2): group dir token -> SFC1 under the group's current epoch key (KID.grp), base64. */
+  grpSealed?: Record<string, string>
+  /** App version of the writer (1.2) — peers on older builds raise an update banner. */
+  app?: string
   /** Live upload progress: blobId -> chunks done/total. */
   xfers?: Record<string, { done: number; total: number }>
   /** Drop hints: recipientDeviceId -> hlc of newest drop placed. */
@@ -241,6 +345,13 @@ export interface DmBeaconSection {
   heads: string[]
   cursor: Cursor
   typingUntil?: number
+  /**
+   * Heads of `grp` event files in this DM (1.2), kept out of `heads` on purpose:
+   * a 1.1 reader that meets a `.grp.e1` name there cannot parse it, counts it as
+   * a gap, and pays for a full `catchUp` on every bump we make. It ignores an
+   * unknown field instead. Short ring — invites and rekeys are rare.
+   */
+  grpHeads?: string[]
 }
 
 /** A device's watermarks in one conversation: event stems, plus when it last read. */
@@ -260,6 +371,12 @@ export interface ChannelMeta {
   topic: string
   creator: string
   created: number
+  /**
+   * The team's home channel (1.2): written by the bootstrap `general`
+   * creation; can't be renamed or deleted. Teams created before 1.2 have no
+   * flagged channel — then the oldest `created` (ties: lowest channelId) is it.
+   */
+  fixed?: true
 }
 
 export interface TeamConfig {
@@ -436,6 +553,8 @@ export interface PresenceView {
   lastSeenMs: number | null
   trust: TrustState
   dmConv: ConvId
+  /** Chat version this device last beaconed (1.2+ writers only). */
+  app?: string
   /**
    * Nobody is behind this registration any more (swept beacon, quiet for
    * days, or superseded by a re-setup). Kept in the list so names still

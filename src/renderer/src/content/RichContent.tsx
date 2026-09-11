@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
 import type { MessageView } from '@shared/merge'
 import type { Attachment, BodyEntity, ConvId } from '@shared/types'
+import { isDiagramAttachment } from '@shared/diagram'
+import { DiagramTile } from '@/diagram/DiagramTile'
 import { isMediaAttachment, sameUrl, segmentMessage } from './parse'
 import { LinkIcon } from './icons'
 import { CodeBlock } from './CodeBlock'
@@ -20,8 +22,13 @@ export function MessageBody({ view }: { view: MessageView }) {
     )
   }
 
-  const media = view.attachments.filter(isMediaAttachment)
-  const files = view.attachments.filter((a) => !isMediaAttachment(a))
+  // A diagram's scene, when it is too big to ride inline, travels as a
+  // `.excalidraw` attachment. That file is the tile — never a second download
+  // card underneath it.
+  const isDiagram = view.body.kind === 'diagram' && !!view.body.diagram
+  const attachments = isDiagram ? view.attachments.filter((a) => !isDiagramAttachment(a)) : view.attachments
+  const media = attachments.filter(isMediaAttachment)
+  const files = attachments.filter((a) => !isMediaAttachment(a))
   // The card carries the link, so the raw URL leaves the prose: a message
   // that is only the URL shows just the card; inside a sentence it becomes a
   // domain chip (full URL on hover).
@@ -42,7 +49,9 @@ export function MessageBody({ view }: { view: MessageView }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0, alignItems: 'flex-start' }}>
-      {view.body.kind === 'code' ? (
+      {isDiagram ? (
+        <DiagramTile view={view} />
+      ) : view.body.kind === 'code' ? (
         <div style={{ alignSelf: 'stretch', minWidth: 0 }}>
           <CodeBlock text={view.body.text} lang={view.body.lang ?? null} />
         </div>

@@ -1,6 +1,7 @@
 import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import type { ConvId, EventPayload } from '@shared/types'
-import type { PushMessage, SendDraft, SettingsView } from '@shared/bridge'
+import type { PushMessage, SendDraft, SettingsView, ShareStats } from '@shared/bridge'
+import { DIR } from '@shared/constants'
 import { redactEventForRenderer, redactPushForRenderer } from '@shared/prs'
 import { AppController, detectDevice } from './appController'
 import { fetchLinkPreview } from './services/linkPreview'
@@ -75,6 +76,43 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('chat:setTyping', (_e, conv: ConvId | null) => chat().setTyping(conv))
   ipcMain.handle('chat:cursors', (_e, conv: ConvId) => chat().cursors(conv))
   ipcMain.handle('chat:myReads', () => chat().myReads())
+
+  // Channel management (1.2): both publish a sys event into the channel's own
+  // log — the metadata file is never rewritten (clients cache it once).
+  ipcMain.handle('chat:renameChannel', (_e, conv: ConvId, name: string) => chat().renameChannel(conv, name))
+  ipcMain.handle('chat:deleteChannel', (_e, conv: ConvId) => chat().deleteChannel(conv))
+
+  // Private groups (1.2). Reading is the ordinary event path; these are the
+  // membership/key operations.
+  ipcMain.handle('groups:list', () => chat().groups.views())
+  ipcMain.handle('groups:create', (_e, name: string, members: string[]) => chat().groups.create(name, members))
+  ipcMain.handle('groups:rename', (_e, conv: ConvId, name: string) => chat().groups.rename(conv, name))
+  ipcMain.handle('groups:addMembers', (_e, conv: ConvId, members: string[]) =>
+    chat().groups.addMembers(conv, members),
+  )
+  ipcMain.handle('groups:removeMember', (_e, conv: ConvId, member: string) =>
+    chat().groups.removeMember(conv, member),
+  )
+  ipcMain.handle('groups:leave', (_e, conv: ConvId) => chat().groups.leave(conv))
+  ipcMain.handle('groups:remove', (_e, conv: ConvId) => chat().groups.remove(conv))
+  // files:pickFile / saveBytesAs / stageBytes are live — registerFileIpc below.
+
+  // Peer-announced updates (1.2): the banner's action when the signed manifest
+  // isn't there yet. Creating the folder first means the button always lands
+  // somewhere real rather than in an OS "no such directory" beep.
+  ipcMain.handle('app:openAppsFolder', async () => {
+    const io = controller.session?.io
+    if (!io) throw new Error('not-ready')
+    await io.ensureDir(DIR.apps).catch(() => {})
+    await shell.openPath(io.abs(DIR.apps))
+  })
+
+  // Live share traffic (1.2) — Settings' "Share traffic" line.
+  ipcMain.handle('diag:shareStats', (): ShareStats => {
+    const io = controller.session?.io
+    if (!io) throw new Error('not-ready')
+    return { ...io.stats(), tier: controller.chat?.ioTier ?? controller.ioTier?.tier ?? 'blurred' }
+  })
 
   // Presence
   ipcMain.handle('presence:list', () => chat().poller.presenceViews())

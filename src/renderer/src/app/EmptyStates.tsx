@@ -3,7 +3,8 @@ import type { ConvId } from '@shared/types'
 import { useStore, selfOf } from '@/store'
 import { Avatar, DeviceChip, identityHue } from '@/ui/atoms'
 import { modKey } from './chrome'
-import { useDmMap } from './dm'
+import { useDmMap, useGroupMap } from './dm'
+import { IconLock } from './icons'
 import { toast } from './toasts'
 
 // Spec §10 — delightful empty states. The channel/DM variant floats over the
@@ -74,6 +75,7 @@ export function EmptyConvOverlay({ conv }: { conv: ConvId }) {
   const boot = useStore((s) => s.boot)
   const send = useStore((s) => s.send)
   const dmPeers = useDmMap((s) => s.peers)
+  const groupMap = useGroupMap()
   const [sending, setSending] = useState(false)
 
   const self = selfOf(boot)
@@ -81,6 +83,7 @@ export function EmptyConvOverlay({ conv }: { conv: ConvId }) {
   if ((events ?? []).some((e) => e.payload.t === 'msg')) return null
 
   const channel = channels.find((c) => c.conv === conv)
+  const group = groupMap[conv]
   const peer = presence.find((p) => p.deviceId === dmPeers[conv])
   const hue = channel ? identityHue(channel.name) : 'var(--accent)'
 
@@ -129,6 +132,23 @@ export function EmptyConvOverlay({ conv }: { conv: ConvId }) {
             #
           </div>
         )}
+        {group && (
+          <div
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'color-mix(in srgb, var(--accent) 8%, transparent)',
+              userSelect: 'none',
+              pointerEvents: 'none',
+            }}
+          >
+            <IconLock size={220} />
+          </div>
+        )}
         <div style={{ position: 'relative' }}>
           {channel ? (
             <>
@@ -138,6 +158,18 @@ export function EmptyConvOverlay({ conv }: { conv: ConvId }) {
               </div>
               <div style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 8 }}>
                 Every message here is encrypted on the shared folder.
+              </div>
+            </>
+          ) : group ? (
+            <>
+              <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12, color: 'var(--text-2)' }}>
+                <IconLock size={32} />
+              </div>
+              <div style={{ fontSize: 22, fontWeight: 600, lineHeight: '28px', color: 'var(--text-1)' }}>
+                {group.name}
+              </div>
+              <div style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 8 }}>
+                Only {group.members.length} {group.members.length === 1 ? 'person' : 'people'} can read this. Say hi.
               </div>
             </>
           ) : (

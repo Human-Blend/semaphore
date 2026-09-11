@@ -26,6 +26,7 @@ import {
 import type { ShareIo } from '../transport/shareIo'
 import { setBlobRequestHandler } from './blobProtocol'
 import type { ChatService } from './chatService'
+import { discardStaged } from './staging'
 
 // Shared blob store: attachment uploads (SFB1 encrypt-stream → blobs/xx/<id>.blob)
 // and downloads (stream-decrypt into a local cache + the sfblob:// protocol that
@@ -76,6 +77,7 @@ const MIME_BY_EXT: Record<string, string> = {
   md: 'text/markdown',
   csv: 'text/csv',
   json: 'application/json',
+  excalidraw: 'application/vnd.excalidraw+json', // 1.2: a blob-backed diagram scene
   html: 'text/html',
   css: 'text/css',
   js: 'text/javascript',
@@ -100,11 +102,20 @@ export function mimeForName(name: string): string {
   return MIME_BY_EXT[ext] ?? 'application/octet-stream'
 }
 
+/**
+ * One safe, non-empty path segment from anything a caller (or a peer) offers.
+ *
+ * `basename` drops POSIX directories, the character class flattens Windows
+ * separators, shell/NTFS specials and control characters — and the last line is
+ * the one that matters for a path built with `join()`: "." and ".." survive
+ * everything above unchanged, and `join(dir, '..')` is not inside `dir`.
+ */
 export function sanitizeFileName(name: string): string {
   const base = basename(name)
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
     .trim()
-  return base || 'file'
+  if (base === '' || base === '.' || base === '..') return 'file'
+  return base
 }
 
 function relDir(rel: string): string {
@@ -339,6 +350,13 @@ export class BlobService {
       } catch {
         // cache seeding is best-effort
       }
+      // A staged file (a diagram scene written by `files:stageBytes`) exists
+      // only to be uploaded. It is now encrypted on the share and cached
+      // locally, so the plaintext copy under userData has no reason to outlive
+      // this call — nothing deleted it before, and the daily sweep only ran at
+      // launch. A no-op for an ordinary attachment: those are the user's own
+      // files, sitting wherever they keep them.
+      await discardStaged(item.path)
       return {
         blobId,
         key: blobKey.toString('base64'),

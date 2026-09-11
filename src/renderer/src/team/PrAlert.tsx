@@ -89,7 +89,10 @@ export function PrAlert() {
         position: 'fixed',
         top: 52,
         right: 12,
-        zIndex: 850,
+        // Above every full-window overlay (diagram editor 1100, lightbox
+        // 1000) — a PR alert the editor can hide is no alert. See the ladder
+        // in app/toasts.tsx.
+        zIndex: 1150,
         width: 320,
         padding: 14,
         background: 'color-mix(in srgb, var(--bg-panel) 92%, transparent)',

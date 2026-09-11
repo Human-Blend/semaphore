@@ -5,6 +5,7 @@ import type { AttachDraft } from '@shared/bridge'
 import type { BodyEntity } from '@shared/types'
 import type { MessageView, SysView } from '@shared/merge'
 import { EVENT } from '@shared/constants'
+import { diagramPreview } from '@shared/diagram'
 import { formatBytes } from '@/ui/atoms'
 import { firstLinkOf } from '@/content/parse'
 
@@ -44,6 +45,10 @@ export function formatFullDate(ms: number): string {
 export function snippetOf(m: MessageView): string {
   if (m.deleted) return 'message deleted'
   if (m.body.kind === 'gif') return 'GIF'
+  // `body.text` on a diagram is the fallback sentence a 1.1 client prints
+  // ("📐 Diagram: X — update Chat to view it"). Quoting that back at a 1.2 user
+  // tells them to update the app they are running; name the diagram instead.
+  if (m.body.kind === 'diagram') return diagramPreview(m.body.text)
   if (m.body.kind === 'code') return m.body.text.split('\n')[0]?.trim() || 'code block'
   if (m.body.text.trim()) return m.body.text.replace(/\s+/g, ' ').trim()
   if (m.attachments.length > 0)
@@ -237,6 +242,37 @@ export function sysLine(sys: SysView, nameOf: (device: string) => string): strin
       return `${author} started sharing their screen`
     case 'screenshare-ended':
       return `screen share ended`
+    // 1.2 — channel lifecycle and private groups
+    case 'channel-deleted':
+      return `${author} deleted this channel`
+    case 'group-invite':
+      return `${author} added you to 🔒 ${str('name') ?? 'a private group'}`
+    case 'group-rekey':
+      return `🔒 ${str('name') ?? 'group'} keys were rotated`
+    case 'group-created': {
+      const n = Array.isArray(sys.data.members) ? (sys.data.members as unknown[]).length : 0
+      return `${author} created this private group${n ? ` with ${n} member${n === 1 ? '' : 's'}` : ''}`
+    }
+    case 'group-renamed':
+      return `${author} renamed this group${str('name') ? ` to ${str('name')}` : ''}`
+    case 'group-members-added': {
+      const list = Array.isArray(sys.data.members) ? (sys.data.members as unknown[]) : []
+      const names = list.filter((d): d is string => typeof d === 'string').map(nameOf)
+      return `${author} added ${names.length ? names.join(', ') : 'members'}`
+    }
+    case 'group-member-removed':
+      return `${author} removed ${str('member') ? nameOf(str('member')!) : 'a member'}`
+    case 'group-left':
+      return `${author} left the group`
+    case 'group-deleted':
+      return `${author} deleted this group`
+    case 'group-removed':
+      return `You were removed from 🔒 ${str('name') ?? 'a private group'}`
+    default:
+      // A kind from a newer build. Never `undefined` on the row: an unknown
+      // notice reads as one neutral line rather than an empty gap — the exact
+      // failure this whole event type exists to avoid on 1.1.
+      return 'something changed in this conversation'
   }
 }
 

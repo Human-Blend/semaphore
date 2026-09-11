@@ -52,7 +52,9 @@
 .sem-code .hljs-type,
 .sem-code .hljs-built_in,
 .sem-code .hljs-selector-class,
-.sem-code .hljs-selector-id {
+.sem-code .hljs-selector-id,
+.sem-code .hljs-selector-attr,
+.sem-code .hljs-selector-pseudo {
   color: #5fd4d0;
 }
 .sem-code .hljs-comment,
@@ -65,13 +67,15 @@
 .sem-code .hljs-attr,
 .sem-code .hljs-attribute,
 .sem-code .hljs-params,
-.sem-code .hljs-subst {
+.sem-code .hljs-subst,
+.sem-code .hljs-property {
   color: #d6dae4;
 }
 .sem-code .hljs-punctuation,
 .sem-code .hljs-operator,
 .sem-code .hljs-meta,
-.sem-code .hljs-deletion {
+.sem-code .hljs-deletion,
+.sem-code .hljs-bullet {
   color: #8a8f9e;
 }
 
@@ -105,7 +109,9 @@
 [data-theme='light'] .sem-code .hljs-type,
 [data-theme='light'] .sem-code .hljs-built_in,
 [data-theme='light'] .sem-code .hljs-selector-class,
-[data-theme='light'] .sem-code .hljs-selector-id {
+[data-theme='light'] .sem-code .hljs-selector-id,
+[data-theme='light'] .sem-code .hljs-selector-attr,
+[data-theme='light'] .sem-code .hljs-selector-pseudo {
   color: #0e7c78;
 }
 [data-theme='light'] .sem-code .hljs-comment,
@@ -117,13 +123,15 @@
 [data-theme='light'] .sem-code .hljs-attr,
 [data-theme='light'] .sem-code .hljs-attribute,
 [data-theme='light'] .sem-code .hljs-params,
-[data-theme='light'] .sem-code .hljs-subst {
+[data-theme='light'] .sem-code .hljs-subst,
+[data-theme='light'] .sem-code .hljs-property {
   color: #33373f;
 }
 [data-theme='light'] .sem-code .hljs-punctuation,
 [data-theme='light'] .sem-code .hljs-operator,
 [data-theme='light'] .sem-code .hljs-meta,
-[data-theme='light'] .sem-code .hljs-deletion {
+[data-theme='light'] .sem-code .hljs-deletion,
+[data-theme='light'] .sem-code .hljs-bullet {
   color: #6e7383;
 }
 

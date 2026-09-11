@@ -236,3 +236,14 @@ export function IconExternal({ size }: IconProps) {
   )
 }
 
+/** Row context-menu trigger (channel/group "⋯" — 1.2). */
+export function IconMore({ size }: IconProps) {
+  return (
+    <Svg size={size}>
+      <circle cx="12" cy="5.5" r="1.5" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="18.5" r="1.5" fill="currentColor" stroke="none" />
+    </Svg>
+  )
+}
+

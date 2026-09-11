@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { BeamOfferView, BeamProgressView } from '@shared/bridge'
 import { useStore } from '@/store'
+import { safeThumbSrc } from '@/content/parse'
 import { Avatar, Button, DeviceChip, formatBytes, Spinner } from '@/ui/atoms'
 
 // Spec §6 — the AirDrop-feel receive surface: incoming-offer cards and live
@@ -32,7 +33,10 @@ export function BeamSurface() {
         position: 'fixed',
         top: 52,
         right: 12,
-        zIndex: 850,
+        // Above every full-window overlay (diagram editor 1100, lightbox
+        // 1000): an incoming beam is a notification, and one a drawing surface
+        // can hide is not a notification. Ladder: app/toasts.tsx.
+        zIndex: 1150,
         display: 'flex',
         flexDirection: 'column',
         gap: 8,
@@ -130,8 +134,8 @@ function OfferCard({
           background: 'var(--bg-raised)',
         }}
       >
-        {offer.thumb ? (
-          <img src={offer.thumb} alt="" style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 'var(--r-sm)', filter: 'blur(2px)' }} />
+        {safeThumbSrc(offer.thumb) ? (
+          <img src={safeThumbSrc(offer.thumb)} alt="" style={{ width: 40, height: 40, objectFit: 'cover', borderRadius: 'var(--r-sm)', filter: 'blur(2px)' }} />
         ) : (
           <span style={{ width: 40, height: 40, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--accent-soft)', color: 'var(--accent-text)', borderRadius: 'var(--r-sm)', fontFamily: 'var(--font-mono)', fontSize: 11, fontWeight: 700 }}>
             {(offer.name.split('.').pop() ?? 'bin').slice(0, 3).toUpperCase()}

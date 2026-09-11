@@ -1,8 +1,8 @@
 import { DST, EVENT } from '@shared/constants'
 import { hlcObserve, hlcTick } from '@shared/hlc'
-import { dayShard, eventFileName, parseEventFileName } from '@shared/ids'
+import { dayShard, eventFileName, isGrpConv, parseEventFileName } from '@shared/ids'
 import type { ConvId, EventPayload, EventType, SignedRecord, VerifiedEvent } from '@shared/types'
-import { buildAad, decryptRecord, encryptRecord } from '../crypto/envelope'
+import { buildAad, decryptRecord, encryptRecord, recordKid } from '../crypto/envelope'
 import { signRecord, verifyRecord } from '../crypto/identity'
 import type { Session } from './session'
 
@@ -15,9 +15,31 @@ interface ConvLog {
   /** Days already fully scanned (catch-up bookkeeping). */
   scannedDays: Set<string>
   newestStem: string | null
+  /**
+   * Private-group files written under an epoch whose key we don't have yet
+   * (day → file names). The rekey DM that carries it may simply be behind us
+   * in the ingest order, so these are parked, not quarantined: their day never
+   * counts as fully scanned, and `replayParked()` retries them the moment a
+   * new key lands.
+   */
+  parked: Map<string, Set<string>>
+  /**
+   * Day shard covered by the last *full* catch-up (one that listed the day
+   * directories). While it is still today, a sweep can skip that listing and
+   * open today's directory by name — see catchUp({ fast: true }).
+   */
+  fullScanDay: string | null
 }
 
 export type EventListener = (conv: ConvId, event: VerifiedEvent) => void
+
+/**
+ * Ceiling on files parked for one conversation while their key is in flight.
+ * Generous next to a real rotation (a rekey DM is on the share before the first
+ * record under the new key is), and small enough that a peer inventing epochs
+ * cannot make this device hold an unbounded list of names.
+ */
+const MAX_PARKED_PER_CONV = 500
 
 export class EventStore {
   private logs = new Map<ConvId, ConvLog>()
@@ -33,8 +55,28 @@ export class EventStore {
 
   private log(conv: ConvId): ConvLog {
     let l = this.logs.get(conv)
-    if (!l) this.logs.set(conv, (l = { events: new Map(), scannedDays: new Set(), newestStem: null }))
+    if (!l)
+      this.logs.set(
+        conv,
+        (l = {
+          events: new Map(),
+          scannedDays: new Set(),
+          newestStem: null,
+          parked: new Map(),
+          fullScanDay: null,
+        }),
+      )
     return l
+  }
+
+  /**
+   * Drop every cached event for a conversation. Used when a channel or group
+   * folds to deleted (or we leave a group): the log on the share is on its way
+   * out, and a local copy that outlives it would resurrect the conversation on
+   * the next materialize.
+   */
+  forget(conv: ConvId): void {
+    this.logs.delete(conv)
   }
 
   getEvents(conv: ConvId): VerifiedEvent[] {
@@ -88,6 +130,9 @@ export class EventStore {
     if (!parsed) return null
     const l = this.log(conv)
     if (l.events.has(parsed.stem)) return l.events.get(parsed.stem)!
+    // Already waiting for a key: don't pay for the read again on every sweep —
+    // replayParked() is what retries these, once a rekey actually arrives.
+    if (l.parked.get(day)?.has(fileName)) return null
 
     const s = this.session
     const info = s.convInfo(conv)
@@ -97,8 +142,22 @@ export class EventStore {
     if (!buf) return null
 
     try {
+      // Private groups rotate keys under a stable directory, so the record's
+      // own kid — not the conversation's current epoch — picks the key.
+      let key = info.key
+      let grpKid = ''
+      if (isGrpConv(conv)) {
+        grpKid = recordKid(buf)
+        const lookup = s.groups?.keyForKid(conv, grpKid) ?? { kind: 'reject' as const }
+        if (lookup.kind === 'unknown-epoch') {
+          this.park(conv, day, fileName)
+          return null
+        }
+        if (lookup.kind !== 'key') return null
+        key = lookup.key
+      }
       const aad = buildAad(info.scope, rel, parsed.stem)
-      const plain = decryptRecord(buf, info.key, aad)
+      const plain = decryptRecord(buf, key, aad)
       const signed = JSON.parse(plain.toString('utf8')) as SignedRecord<EventPayload>
 
       let author = s.roster.get(signed.by)
@@ -110,6 +169,30 @@ export class EventStore {
       // The filename's device prefix must match the signer — otherwise someone
       // is replaying another author's payload under their own slot.
       if (!signed.by.startsWith(parsed.deviceId8)) return null
+      // A channel or DM shows an unverified record with a warning chip: the
+      // team key already bounds who could have written it, and a lost roster
+      // entry must not silently swallow history. A private group cannot afford
+      // that: every rule it has — who may rename, who may remove, whose
+      // tombstone counts, whose retired-key write is refused — is a statement
+      // about the *author*, and an unverified record has no author to hold to
+      // any of them. Anyone holding a leaked epoch key could otherwise write as
+      // the owner. So a group record that does not verify never enters the log.
+      if (isGrpConv(conv) && !verified) return null
+      // Removing someone from a group rotates the key, which stops them
+      // reading it. They still hold the old key, so this is what stops them
+      // writing into it: a retired epoch used after the rotation, by someone
+      // who is no longer a member, does not count. The *stem* cannot decide
+      // that — a removed device picks its own filename and can back-date it
+      // freely — so the rotation point is compared against when the file
+      // actually appeared on the share.
+      if (grpKid) {
+        const cut = s.groups?.staleWriteCut(conv, grpKid, signed.by) ?? null
+        if (cut !== null) {
+          const st = await s.io.statMaybe(rel)
+          const wroteAt = st ? st.mtimeMs : parsed.hlcMs
+          if (wroteAt > Number(cut.slice(0, 13))) return null
+        }
+      }
 
       const skewed = hlcObserve(s.hlc, parsed.hlcMs, s.io.calibratedNow())
       if (skewed) this.skewFlagged.add(signed.by)
@@ -132,15 +215,34 @@ export class EventStore {
   /**
    * Scan a conversation's day directories and ingest everything missing.
    * Closed days that were fully scanned once are skipped forever.
+   *
+   * `fast` is the poller's blanket sweep (1.2): once a full scan has covered
+   * today, the only directory a live peer can be writing into is today's, and
+   * its name is computable — so the sweep opens it by name and skips listing
+   * the day directories, halving the sweep's cost per conversation. The moment
+   * the day rolls over (or this conversation has never been scanned) it falls
+   * back to the full walk on its own. Anything a peer writes into an older day
+   * still arrives through its beacon heads, exactly as before.
    */
-  async catchUp(conv: ConvId): Promise<number> {
+  async catchUp(conv: ConvId, opts?: { fast?: boolean }): Promise<number> {
     const s = this.session
     const info = s.convInfo(conv)
     if (!info) return 0
     const l = this.log(conv)
-    const days = (await s.io.listDirs(info.eventsDir)).sort()
     const today = dayShard(s.io.calibratedNow())
     let ingested = 0
+
+    if (opts?.fast && l.fullScanDay === today) {
+      const files = await s.io.list(`${info.eventsDir}/${today}`)
+      for (const f of files.sort()) {
+        const before = l.events.size
+        await this.ingestFile(conv, today, f)
+        if (l.events.size > before) ingested++
+      }
+      return ingested
+    }
+
+    const days = (await s.io.listDirs(info.eventsDir)).sort()
     for (const day of days) {
       if (l.scannedDays.has(day) && day < today) continue
       const files = await s.io.list(`${info.eventsDir}/${day}`)
@@ -149,7 +251,57 @@ export class EventStore {
         await this.ingestFile(conv, day, f)
         if (l.events.size > before) ingested++
       }
-      if (day < today) l.scannedDays.add(day)
+      // A day holding parked files is never "done": the key for them may still
+      // be in flight, and this scan is what will pick them up afterwards.
+      if (day < today && !l.parked.get(day)?.size) l.scannedDays.add(day)
+    }
+    l.fullScanDay = today
+    return ingested
+  }
+
+  private park(conv: ConvId, day: string, fileName: string): void {
+    const l = this.log(conv)
+    // Parking is unbounded work held in memory on someone else's say-so: every
+    // parked name is re-read the moment any key arrives, and the epoch in a kid
+    // is whatever its writer typed. Past the cap we simply stop remembering —
+    // the file is not lost, the next full day scan finds it again once the
+    // backlog clears (GroupService also refuses to park an epoch far above the
+    // newest key we hold, which is the other half of this).
+    if (this.parkedCount(conv) >= MAX_PARKED_PER_CONV) return
+    const set = l.parked.get(day) ?? new Set<string>()
+    set.add(fileName)
+    l.parked.set(day, set)
+    l.scannedDays.delete(day)
+  }
+
+  /** Is this exact file already waiting for a key? (Not a gap — see ingestHeads.) */
+  private isParked(conv: ConvId, day: string, fileName: string): boolean {
+    return this.log(conv).parked.get(day)?.has(fileName) ?? false
+  }
+
+  /** How many files are waiting for a key in this conversation (tests/diagnostics). */
+  parkedCount(conv: ConvId): number {
+    let n = 0
+    for (const set of this.log(conv).parked.values()) n += set.size
+    return n
+  }
+
+  /**
+   * Retry every parked file — called when a `group-rekey` hands us a key we
+   * were missing. Files still under an unknown epoch simply park again.
+   */
+  async replayParked(conv: ConvId): Promise<number> {
+    const l = this.log(conv)
+    if (l.parked.size === 0) return 0
+    const pending: [string, string[]][] = [...l.parked.entries()].map(([day, files]) => [day, [...files]])
+    l.parked.clear()
+    let ingested = 0
+    for (const [day, files] of pending) {
+      for (const f of files.sort()) {
+        const before = l.events.size
+        await this.ingestFile(conv, day, f)
+        if (l.events.size > before) ingested++
+      }
     }
     return ingested
   }
@@ -163,9 +315,14 @@ export class EventStore {
       const parsed = parseEventFileName(f)
       if (!parsed) continue
       if (l.events.has(parsed.stem)) continue
-      const ev = await this.ingestFile(conv, dayShard(parsed.hlcMs), f)
+      const day = dayShard(parsed.hlcMs)
+      const ev = await this.ingestFile(conv, day, f)
       if (ev) sawNew = true
-      else mayHaveGap = true
+      // A parked head is not a gap: we know exactly what that file is and are
+      // waiting for its key. Treating it as one made every peer bump during a
+      // rekey cost a full day-directory walk of the group, over and over, for
+      // as long as the rotation took to reach us.
+      else if (!this.isParked(conv, day, f)) mayHaveGap = true
     }
     // If the oldest advertised head is still missing, older un-advertised
     // events may exist too — fall back to a bounded day scan.

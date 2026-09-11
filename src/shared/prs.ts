@@ -1,5 +1,5 @@
 import type { PushMessage } from './bridge'
-import type { PrView, PrsConfig, PrsPayload, PrsRepo, VerifiedEvent } from './types'
+import type { GrpPayload, PrView, PrsConfig, PrsPayload, PrsRepo, VerifiedEvent } from './types'
 
 // Pure helpers for the pull-request group: the shape of the Azure DevOps JSON
 // we consume, the approval/tracking rules, and the LWW merge of the
@@ -152,16 +152,31 @@ export function materializePrsConfig(events: VerifiedEvent[]): { config: PrsConf
 }
 
 /**
- * A `team:prs` event as the renderer may see it. The config lives in a shared
- * log, so the raw payload carries the team's Azure DevOps PAT — a credential
- * for a system outside this app, and one `PrsStatus` deliberately narrows to
- * `sharedTokenSet: boolean`. Nothing in the renderer reads it, so it is
- * stripped at the bridge rather than copied into sandboxed web memory.
+ * An event as the renderer may see it. Two payloads carry secrets that no
+ * sandboxed web code has any use for, and both are stripped here rather than
+ * copied into renderer memory:
  *
- * Main-side readers (PrService materializing the config) must not go through
- * this — they need the token to poll.
+ * - a `team:prs` config, which carries the team's Azure DevOps PAT (a
+ *   credential for a system outside this app; `PrsStatus` deliberately narrows
+ *   it to `sharedTokenSet: boolean`);
+ * - a `grp` invite/rekey (1.2), whose `data` carries the group's raw epoch key
+ *   and `key1` — the key *is* the group, and `key1` is what derives its
+ *   directory token. The renderer only ever renders the name.
+ *
+ * Main-side readers (PrService materializing the config, GroupService adopting
+ * key material) must not go through this — they need what it removes.
  */
 export function redactEventForRenderer(ev: VerifiedEvent): VerifiedEvent {
+  const g = ev.payload as GrpPayload
+  if (g && g.t === 'grp') {
+    const data = g.data as unknown as Record<string, unknown>
+    if (!data || typeof data !== 'object') return ev
+    if (typeof data.key !== 'string' && typeof data.key1 !== 'string') return ev
+    const clean = { ...data }
+    if (typeof clean.key === 'string') clean.key = ''
+    if (typeof clean.key1 === 'string') clean.key1 = ''
+    return { ...ev, payload: { ...g, data: clean as unknown as GrpPayload['data'] } }
+  }
   const p = ev.payload as PrsPayload
   if (!p || p.t !== 'prs' || !validConfig(p.config) || p.config.sharedToken === '') return ev
   return { ...ev, payload: { ...p, config: { ...p.config, sharedToken: '' } } }

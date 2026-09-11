@@ -10,7 +10,7 @@ import {
   toPrView,
   type AdoPullRequest,
 } from './prs'
-import type { PrView, PrsConfig, PrsPayload, VerifiedEvent } from './types'
+import type { ConvId, GroupInviteData, GrpPayload, PrView, PrsConfig, PrsPayload, VerifiedEvent } from './types'
 
 type Reviewer = PrView['reviewers'][number]
 
@@ -261,6 +261,64 @@ describe('redactPushForRenderer', () => {
     expect(redactPushForRenderer(plain)).toBe(plain)
     const health = { kind: 'outbox', queued: 3 } as const
     expect(redactPushForRenderer(health)).toBe(health)
+  })
+})
+
+// Private-group key material rides the same bridge (1.2). A `grp` invite or
+// rekey carries the group's raw epoch key — the key *is* the group — and `key1`,
+// which derives its directory token. The renderer only ever renders the name, so
+// neither may be copied into sandboxed web memory.
+
+const GRP_DM: ConvId = 'dm:AAAABBBBCCCCDDDDEEEE'
+const KEY = 'Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyYQ=='
+const KEY1 = 'MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEx'
+
+function grpEvent(kind: GrpPayload['kind'], data: GrpPayload['data']): VerifiedEvent {
+  return {
+    id: '1700000000099-0001-aaaaaaaa',
+    type: 'grp',
+    payload: { t: 'grp', conv: GRP_DM, kind, data },
+    author: 'aaaaaaaabbbbbbbb',
+    verified: true,
+    receivedAt: 0,
+  }
+}
+
+const invite = (): GroupInviteData => ({
+  groupId: '0a1b2c3d',
+  name: 'Ops crew',
+  owner: 'a'.repeat(32),
+  members: ['a'.repeat(32), 'b'.repeat(32)],
+  epoch: 2,
+  key: KEY,
+  key1: KEY1,
+  createdAt: 1700000000000,
+})
+
+describe('redacting private-group key material', () => {
+  it('blanks key and key1 on an invite and leaves the name alone', () => {
+    const ev = grpEvent('group-invite', invite())
+    const out = redactEventForRenderer(ev)
+    const data = (out.payload as GrpPayload).data as GroupInviteData
+    expect(data.key).toBe('')
+    expect(data.key1).toBe('')
+    expect(data.name).toBe('Ops crew')
+    expect(data.epoch).toBe(2)
+    expect(JSON.stringify(out)).not.toContain(KEY)
+    expect(JSON.stringify(out)).not.toContain(KEY1)
+    expect(JSON.stringify(ev)).toContain(KEY) // the original is untouched
+  })
+
+  it('blanks a rekey the same way, through the push path', () => {
+    const ev = grpEvent('group-rekey', invite())
+    const out = redactPushForRenderer({ kind: 'event', conv: GRP_DM, event: ev })
+    expect(JSON.stringify(out)).not.toContain(KEY)
+    expect(JSON.stringify(out)).not.toContain(KEY1)
+  })
+
+  it('passes a notice that carries no key material through unchanged', () => {
+    const ev = grpEvent('group-removed', { groupId: '0a1b2c3d', epoch: 3, name: 'Ops crew' })
+    expect(redactEventForRenderer(ev)).toBe(ev)
   })
 })
 

@@ -112,6 +112,15 @@ const CSS = `
   transition: background var(--t-instant) var(--ease-standard);
 }
 .sem-row:hover { background: var(--bg-raised); }
+/* Row "⋯" menu triggers (Sidebar's ChannelRow/GroupRow, 1.2): the button is
+   always in the DOM — never conditionally rendered — so Tab can reach it;
+   only its visibility is hover/focus/open-gated, via CSS rather than a
+   render gate. */
+.sem-row-trigger { opacity: 0; pointer-events: none; transition: opacity var(--t-fast) var(--ease-standard); }
+.sem-row-hoverable:hover .sem-row-trigger,
+.sem-row-hoverable:focus-within .sem-row-trigger,
+.sem-row-trigger[data-open='1'] { opacity: 1; pointer-events: auto; }
+.sem-row-hoverable:focus-within .sem-row-badge { display: none; }
 .sem-frost {
   background: color-mix(in srgb, var(--bg-raised) 86%, transparent);
   backdrop-filter: blur(20px) saturate(1.2);

@@ -14,6 +14,15 @@ import bash from 'highlight.js/lib/languages/bash'
 import sql from 'highlight.js/lib/languages/sql'
 import xml from 'highlight.js/lib/languages/xml'
 import css from 'highlight.js/lib/languages/css'
+import kotlin from 'highlight.js/lib/languages/kotlin'
+import swift from 'highlight.js/lib/languages/swift'
+import php from 'highlight.js/lib/languages/php'
+import ruby from 'highlight.js/lib/languages/ruby'
+import yaml from 'highlight.js/lib/languages/yaml'
+import powershell from 'highlight.js/lib/languages/powershell'
+import markdown from 'highlight.js/lib/languages/markdown'
+import dockerfile from 'highlight.js/lib/languages/dockerfile'
+import { HLJS_LANG_IDS, LABEL_BY_ID, PLAIN_TEXT_ID } from './languages'
 import { CheckIcon, CopyIcon } from './icons'
 import './content.css'
 
@@ -34,21 +43,19 @@ hljs.registerLanguage('bash', bash)
 hljs.registerLanguage('sql', sql)
 hljs.registerLanguage('xml', xml)
 hljs.registerLanguage('css', css)
+hljs.registerLanguage('kotlin', kotlin)
+hljs.registerLanguage('swift', swift)
+hljs.registerLanguage('php', php)
+hljs.registerLanguage('ruby', ruby)
+hljs.registerLanguage('yaml', yaml)
+hljs.registerLanguage('powershell', powershell)
+hljs.registerLanguage('markdown', markdown)
+hljs.registerLanguage('dockerfile', dockerfile)
 
-const COMMON_LANGS = [
-  'javascript', 'typescript', 'python', 'java', 'go', 'rust', 'c', 'cpp', 'csharp',
-  'json', 'bash', 'sql', 'xml', 'css',
-]
-
-/** Short display aliases for the language chip. */
-const LANG_ALIAS: Record<string, string> = {
-  javascript: 'js',
-  typescript: 'ts',
-  python: 'py',
-  csharp: 'c#',
-  xml: 'html',
-  bash: 'sh',
-}
+// Auto-detect considers every registered grammar — kept as one list (not a
+// hand-maintained subset) so a language added to the table is automatically
+// in play for both the explicit and the auto path.
+const COMMON_LANGS = HLJS_LANG_IDS
 
 const ALIAS_TO_LANG: Record<string, string> = {
   js: 'javascript',
@@ -64,10 +71,57 @@ const ALIAS_TO_LANG: Record<string, string> = {
   shell: 'bash',
   zsh: 'bash',
   html: 'xml',
+  kt: 'kotlin',
+  kts: 'kotlin',
+  rb: 'ruby',
+  yml: 'yaml',
+  ps1: 'powershell',
+  ps: 'powershell',
+  md: 'markdown',
+  text: PLAIN_TEXT_ID,
+  plain: PLAIN_TEXT_ID,
 }
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+export interface LangResolution {
+  /** The hljs id actually used to highlight, or null when nothing was. */
+  language: string | null
+  mode: 'explicit' | 'auto' | 'plain' | 'none'
+  html: string
+}
+
+/**
+ * The explicit-vs-auto decision (plan §D1): an explicit `lang` always
+ * highlights, with no relevance gate — that gate only ever applied because
+ * `draft.lang` used to be hard-coded null. An explicit `lang` this build
+ * doesn't recognize (older/newer client, hand-typed metadata) falls back to
+ * auto-detect under the same gate as before. The `PLAIN_TEXT_ID` sentinel is
+ * its own explicit choice and must never fall through to auto-detect.
+ */
+export function resolveLanguage(lang: string | null, text: string): LangResolution {
+  const normalized = lang ? (ALIAS_TO_LANG[lang.toLowerCase()] ?? lang.toLowerCase()) : null
+  if (normalized === PLAIN_TEXT_ID) {
+    return { language: null, mode: 'plain', html: escapeHtml(text) }
+  }
+  if (normalized && hljs.getLanguage(normalized)) {
+    return {
+      language: normalized,
+      mode: 'explicit',
+      html: hljs.highlight(text, { language: normalized, ignoreIllegals: true }).value,
+    }
+  }
+  const auto = hljs.highlightAuto(text.slice(0, 2000), COMMON_LANGS)
+  if (auto.language && (auto.relevance ?? 0) >= 5) {
+    return {
+      language: auto.language,
+      mode: 'auto',
+      html: hljs.highlight(text, { language: auto.language, ignoreIllegals: true }).value,
+    }
+  }
+  return { language: null, mode: 'none', html: escapeHtml(text) }
 }
 
 const COLLAPSE_THRESHOLD = 18
@@ -79,23 +133,7 @@ export function CodeBlock({ text, lang }: { text: string; lang: string | null })
   const [copied, setCopied] = useState(false)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const { language, html } = useMemo(() => {
-    const normalized = lang ? (ALIAS_TO_LANG[lang.toLowerCase()] ?? lang.toLowerCase()) : null
-    if (normalized && hljs.getLanguage(normalized)) {
-      return {
-        language: normalized,
-        html: hljs.highlight(text, { language: normalized, ignoreIllegals: true }).value,
-      }
-    }
-    const auto = hljs.highlightAuto(text.slice(0, 2000), COMMON_LANGS)
-    if (auto.language && (auto.relevance ?? 0) >= 5) {
-      return {
-        language: auto.language,
-        html: hljs.highlight(text, { language: auto.language, ignoreIllegals: true }).value,
-      }
-    }
-    return { language: null, html: escapeHtml(text) }
-  }, [text, lang])
+  const { language, mode, html } = useMemo(() => resolveLanguage(lang, text), [lang, text])
 
   const lineCount = useMemo(() => text.split('\n').length, [text])
   const collapsible = lineCount > COLLAPSE_THRESHOLD
@@ -108,7 +146,15 @@ export function CodeBlock({ text, lang }: { text: string; lang: string | null })
     copyTimer.current = setTimeout(() => setCopied(false), 1500)
   }
 
-  const chipLabel = language ? (LANG_ALIAS[language] ?? language) : 'text'
+  // Badge shows the chosen language's full name (plan §D1), not the hljs id —
+  // "TypeScript", not "typescript" or the old 2-3 letter alias.
+  const chipLabel = language ? (LABEL_BY_ID[language] ?? language) : LABEL_BY_ID[PLAIN_TEXT_ID]
+  const chipTitle =
+    mode === 'explicit'
+      ? `Language: ${chipLabel}`
+      : mode === 'auto'
+        ? `Detected language: ${chipLabel}`
+        : 'Plain text'
 
   return (
     <div
@@ -134,7 +180,7 @@ export function CodeBlock({ text, lang }: { text: string; lang: string | null })
         }}
       >
         <span
-          title={language ? `Detected language: ${language}` : 'Plain text'}
+          title={chipTitle}
           style={{
             fontFamily: 'var(--font-mono)',
             fontSize: 11,

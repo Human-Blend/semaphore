@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { SettingsView } from '@shared/bridge'
+import type { SettingsView, ShareStats } from '@shared/bridge'
 import { useStore, selfOf } from '@/store'
 import { Avatar, DeviceChip, Spinner } from '@/ui/atoms'
 import { SectionLabel, Toggle, isMac, truncate } from './chrome'
@@ -445,6 +445,7 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
                       <span style={{ width: 90, color: 'var(--text-3)' }}>Platform</span>
                       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{window.bridge.platform}</span>
                     </div>
+                    <ShareTraffic />
                   </div>
                 </>
               )}
@@ -452,6 +453,62 @@ export default function SettingsModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
       </div>
+    </div>
+  )
+}
+
+/**
+ * What this client is actually costing the shared folder, right now (1.2). The
+ * number is the trailing-60 s rate from ShareIo's own counter plus the tier the
+ * poller is in, so "why is the NAS light blinking" has an answer that does not
+ * need a packet capture. Polled only while the About pane is open.
+ *
+ * It counts the metadata chatter this app's cadence controls — beacon listings
+ * and reads, event publishes, sweeps, the drops inbox. Blob and beam bodies
+ * stream straight through `node:fs` (one counted `stat` at the head, then raw
+ * reads/writes), so a file transfer barely moves this number even while it
+ * saturates the link — hence the label.
+ */
+function ShareTraffic() {
+  const [stats, setStats] = useState<ShareStats | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    const read = async () => {
+      try {
+        const s = await window.bridge.diag.shareStats()
+        if (alive) setStats(s)
+      } catch {
+        if (alive) setStats(null) // no session yet (locked / onboarding)
+      }
+    }
+    void read()
+    const t = setInterval(() => void read(), 2000)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [])
+
+  const TIER_LABEL: Record<ShareStats['tier'], string> = {
+    focused: 'active',
+    blurred: 'in the background',
+    idle: 'idle',
+    paused: 'paused (screen locked or asleep)',
+  }
+
+  return (
+    <div style={{ display: 'flex', gap: 8 }}>
+      <span style={{ width: 90, color: 'var(--text-3)' }}>
+        Share traffic
+        <br />
+        <span style={{ fontSize: 11 }}>excluding file transfers</span>
+      </span>
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, userSelect: 'text' }}>
+        {stats
+          ? `${stats.ratePerSec.toFixed(1)} ops/s now · ${stats.total.toLocaleString()} since launch · ${TIER_LABEL[stats.tier]}`
+          : '—'}
+      </span>
     </div>
   )
 }

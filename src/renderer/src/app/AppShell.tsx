@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
 import { TEAM_CONV } from '@shared/constants'
-import { isDmConv, isTeamConv } from '@shared/ids'
+import { isDmConv, isGrpConv, isTeamConv } from '@shared/ids'
 import { useStore } from '@/store'
 import ChatPane from '@/chat/ChatPane'
 import { CalendarPane } from '@/team/CalendarPane'
 import { PrsPane } from '@/team/PrsPane'
 import { PrAlert } from '@/team/PrAlert'
 import { Lightbox } from '@/content/Lightbox'
+import { DiagramRoot } from '@/diagram/DiagramRoot'
 import { ChromeCss, DRAG, NO_DRAG, isMac } from './chrome'
 import Sidebar from './Sidebar'
 import ChannelHeader from './ChannelHeader'
@@ -77,8 +78,10 @@ export default function AppShell() {
     document.documentElement.style.setProperty('--text-msg', FONT_PX[fontSize])
   }, [fontSize])
 
-  // Rail defaults: open in channels, closed in DMs (spec §2.4) and in the team
-  // panes, which own the whole centre column (spec §3).
+  // Rail defaults: open in channels and groups (members matter there), closed
+  // in DMs (spec §2.4) and in the team panes, which own the whole centre
+  // column (spec §3). Groups (1.2) join the channel side here — unlike a DM's
+  // fixed pair, a group's membership is exactly the thing worth surfacing.
   const convKind = useMemo(
     () =>
       activeConv === null
@@ -87,11 +90,13 @@ export default function AppShell() {
           ? 'team'
           : isDmConv(activeConv)
             ? 'dm'
-            : 'chan',
+            : isGrpConv(activeConv)
+              ? 'grp'
+              : 'chan',
     [activeConv],
   )
   useEffect(() => {
-    setRailOpen(convKind === 'chan')
+    setRailOpen(convKind === 'chan' || convKind === 'grp')
     if (convKind !== 'none') setRailTab('about')
   }, [convKind])
 
@@ -158,6 +163,7 @@ export default function AppShell() {
 
       <Toasts />
       <Lightbox />
+      <DiagramRoot />
       <ScreenShareRoot />
       <BeamSurface />
       <PrAlert />

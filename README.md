@@ -10,8 +10,22 @@ the only thing every machine can reach is an SMB share.
 
 - **Team channels + direct messages** — DMs are end-to-end encrypted
   (X25519); even teammates holding the team passphrase can't read them.
+  Channels can be renamed or deleted from their own menu (the team's home
+  channel is the one exception) — a deleted channel stays readable for a
+  few days before the cleanup removes it for good.
+- **Private groups** — quick encrypted group chats for a handful of people,
+  separate from channels and DMs. Invites travel as a direct message, so
+  nobody else on the team — not even someone holding the team passphrase —
+  can see who's in a group or read what's in it.
 - **Presence, typing, read receipts** — via per-device beacon files; one
-  directory listing per 1.5 s tells every client everything that changed.
+  directory listing per tick tells every client everything that changed.
+  The tick follows what you are doing: 1 s focused, 3 s in the background —
+  or in a focused window that's gone three minutes without input, which
+  slows to 3 s too, never all the way to 15 s — 15 s once a backgrounded
+  window has *also* gone that long idle, and nothing at all while the
+  screen is locked or the machine is asleep — about 88, 42 and 13 share
+  operations a minute for a quiet team of five, and zero when paused.
+  Settings → About shows the live rate.
 - **Anti-impersonation** — every message is Ed25519-signed. The gray chip
   next to each name (`MBP-ANA·Q7RC`) is the hostname plus a fingerprint of
   the key that actually signed the message. A new device claiming a known
@@ -20,11 +34,18 @@ the only thing every machine can reach is an SMB share.
   (inline image/video/GIF previews, streaming video scrub straight off the
   share). Drag a file onto a *person* to beam it directly to them,
   AirDrop-style, with accept/decline.
+- **Diagrams** — a FigJam-style whiteboard built into the composer
+  (Excalidraw): sketch a diagram and send it inline, export to PNG/SVG/
+  `.excalidraw`, or drop a file in to import and keep editing. Works fully
+  offline, bundled shape libraries included.
 - **Link previews** (Apple-Messages style), **code blocks** with syntax
-  highlighting + copy button, **reactions, pins, edits, mentions**.
+  highlighting + copy button (22 languages, selectable from a dropdown,
+  TypeScript by default), **reactions, pins, edits, mentions**.
 - **Screen sharing** — WebRTC peer-to-peer over the LAN when the network
   allows, automatic fallback to ~1 fps encrypted frame relay through the
-  folder when it doesn't. The UI always tells you which mode you're in.
+  folder when it doesn't. Chat always uses its own picker (screens listed
+  first, your main display pre-selected) — never an OS system picker — and
+  the presenter banner always names what's actually being shared.
 - **Self-cleaning** — clients cooperatively delete old media from the share
   (default: files after 7 days, messages after 180). No server needed.
 - **Native notifications**, dark/light themes, offline outbox.
@@ -35,8 +56,9 @@ the only thing every machine can reach is an SMB share.
   encrypted folder as everything else.
 - **Pull requests** — watch Azure DevOps repos from inside Chat: a red
   sidebar badge and popup when a PR needs your review, filters (assigned to
-  me / mine / by branch), and a PR drops off the list automatically once it's
-  approved.
+  me / mine / by branch), and a PR drops off the list automatically once
+  it's approved. The watched repo list can be edited any time — Chat
+  re-checks the saved connection on its own, no re-pasting a token.
 
 Everything written to the share is AES-256-GCM encrypted and bound to its
 location (a moved, renamed, or replayed file fails authentication). The team
@@ -111,6 +133,13 @@ ignore them until you bake a new public key and hand-deliver that build once.
 1.0.x clients shipped with the constant empty and accept any manifest, so they
 still see the 1.1.0 banner.
 
+Since 1.2, a teammate who's already running a newer build makes every other
+1.2+ client show an update banner right away, even before you've published a
+zip for it — it names them and says so as a claim, not a fact ("Ana says
+they're on Chat 1.2.0 — no signed build in the apps folder yet.") and points
+at the apps folder, then upgrades itself into the normal "copy to my machine"
+banner the moment the signed manifest actually lands.
+
 Users install by copying a zip from `<share>/Chat/apps/`, extracting,
 and double-clicking. No installers, no scripts. `README-INSTALL.txt` is
 published alongside with the Gatekeeper/SmartScreen notes.
@@ -126,9 +155,15 @@ published alongside with the Gatekeeper/SmartScreen notes.
    double-click. If AppLocker/WDAC blocks unsigned exes, ask IT for a path
    rule (e.g. `%LOCALAPPDATA%\Chat\*`) — no packaging trick beats
    allowlisting policy.
-3. macOS screen sharing needs the Screen Recording permission (System
-   Settings → Privacy & Security); expect a re-grant after app updates —
-   normal for ad-hoc-signed internal builds.
+3. Chat always uses its own picker (screens listed first, your main display
+   pre-selected) — there's no OS system picker involved on any macOS
+   version. On macOS, if Screen Recording isn't granted yet, Chat shows an
+   explainer instead of a picker full of misleading thumbnails; after
+   granting it in System Settings → Privacy & Security → Screen Recording,
+   restart Chat. Expect a re-grant after app updates — that's normal for
+   ad-hoc-signed internal builds. On macOS 15 (Sequoia) and later, the OS
+   may also show a periodic "Chat can record this screen" reminder while
+   sharing; that's Apple's own nudge, not an error.
 
 ## Layout
 

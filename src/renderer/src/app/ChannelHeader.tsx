@@ -3,8 +3,8 @@ import { useStore } from '@/store'
 import { Avatar, DeviceChip, IconButton, identityHue } from '@/ui/atoms'
 import { ShareButton } from '@/screenshare/ShareUi'
 import { truncate } from './chrome'
-import { IconPanel, IconPin } from './icons'
-import { useDmMap } from './dm'
+import { IconLock, IconPanel, IconPin } from './icons'
+import { useDmMap, useGroupMap } from './dm'
 import type { RailTab } from './RightRail'
 
 // Spec §2.3 — 52px conversation header with the right-rail controls.
@@ -25,8 +25,10 @@ export default function ChannelHeader({
   const channels = useStore((s) => s.channels)
   const presence = useStore((s) => s.presence)
   const dmPeers = useDmMap((s) => s.peers)
+  const groupMap = useGroupMap()
 
   const channel = channels.find((c) => c.conv === conv)
+  const group = groupMap[conv]
   const peer = presence.find((p) => p.deviceId === dmPeers[conv])
   const members = presence.filter((p) => !p.departed).length + 1
 
@@ -81,6 +83,19 @@ export default function ChannelHeader({
           ) : (
             <span style={{ flex: 1 }} />
           )}
+        </>
+      ) : group ? (
+        <>
+          <span aria-hidden="true" style={{ display: 'flex', color: 'var(--text-2)' }}>
+            <IconLock size={16} />
+          </span>
+          <span style={{ fontSize: 17, fontWeight: 600, color: 'var(--text-1)', whiteSpace: 'nowrap' }}>
+            {group.name}
+          </span>
+          <span style={{ fontSize: 13, color: 'var(--text-3)', whiteSpace: 'nowrap' }}>
+            {group.members.length} member{group.members.length === 1 ? '' : 's'}
+          </span>
+          <span style={{ flex: 1 }} />
         </>
       ) : peer ? (
         <>

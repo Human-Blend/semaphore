@@ -2,7 +2,7 @@ import { useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { Attachment, ConvId } from '@shared/types'
 import { useStore } from '@/store'
-import { blobUrl, fitMediaBox, formatDuration } from './parse'
+import { blobUrl, fitMediaBox, formatDuration, safeThumbSrc } from './parse'
 import './content.css'
 
 // Spec §4.1 — inline media. The box is reserved from event metadata (w/h) so
@@ -81,9 +81,14 @@ export function MediaAttachment({
     objectFit: 'cover',
   }
 
-  const thumbLayer = att.thumb ? (
+  // `att.thumb` is whatever the sending client wrote into the event. It is
+  // meant to be a tiny inline WebP; a remote URL there would turn opening a
+  // conversation into a callback to someone else's server (`img-src https:` is
+  // in the CSP), so anything but a data: URI is dropped.
+  const thumbSrc = safeThumbSrc(att.thumb)
+  const thumbLayer = thumbSrc ? (
     <img
-      src={att.thumb}
+      src={thumbSrc}
       alt=""
       aria-hidden
       draggable={false}

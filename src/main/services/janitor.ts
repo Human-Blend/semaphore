@@ -23,11 +23,19 @@ interface LastRun {
  * the whole team from Azure DevOps. Retention applies to chatter only.
  * Asserted by janitor.test.ts.
  */
-export const SWEEP_EVENT_ROOTS: readonly string[] = [DIR.channels, DIR.dm]
+export const SWEEP_EVENT_ROOTS: readonly string[] = [DIR.channels, DIR.dm, DIR.groups]
 
 export class Janitor {
   private timer: NodeJS.Timeout | null = null
   private running = false
+  /**
+   * Conversations tombstoned by a `channel-deleted` / `group-deleted` event,
+   * supplied by ChatService (which holds the folded state). The janitor removes
+   * the directory once `RETENTION.deletedConvGraceDays` have passed — the delay
+   * is what lets a client that was offline still read the tombstone and hide
+   * the conversation for itself.
+   */
+  deletedConvs: (() => { rel: string; deletedAt: number }[]) | null = null
 
   constructor(private session: Session) {}
 
@@ -88,7 +96,7 @@ export class Janitor {
     const s = this.session
     const now = s.io.calibratedNow()
     const config = await retentionFor(s)
-    const counts: Record<string, number> = { events: 0, blobs: 0, drops: 0, rtc: 0, screens: 0, tmp: 0, beacons: 0, claims: 0 }
+    const counts: Record<string, number> = { events: 0, convs: 0, blobs: 0, drops: 0, rtc: 0, screens: 0, tmp: 0, beacons: 0, claims: 0 }
 
     const olderThan = async (rel: string, ms: number): Promise<boolean> => {
       const st = await s.io.statMaybe(rel)
@@ -107,6 +115,23 @@ export class Janitor {
           }
         }
       }
+    }
+
+    // Deleted conversations: the whole directory goes, grace period passed.
+    // Idempotent like every other delete — a Windows EBUSY just retries next run.
+    //
+    // Two clocks have to agree before anything is removed. `deletedAt` comes
+    // from the tombstone's *filename* — an HLC stamp its writer chose, so a
+    // client with a badly wrong clock (or one being deliberate) can publish a
+    // `channel-deleted` dated last month and have the directory swept the same
+    // hour, taking the grace period — the whole point of which is to let an
+    // offline client come back and read the tombstone — with it. The directory's
+    // own mtime is the share's answer to the same question, and costs one stat.
+    const graceMs = RETENTION.deletedConvGraceDays * 86_400_000
+    for (const conv of this.deletedConvs?.() ?? []) {
+      if (now - conv.deletedAt <= graceMs) continue
+      if (!(await olderThan(conv.rel, graceMs))) continue
+      if ((await s.io.delete(conv.rel)) === 'deleted') counts.convs++
     }
 
     // Blobs older than retention (skip tmp — separate rule)

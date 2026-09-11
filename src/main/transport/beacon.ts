@@ -1,9 +1,33 @@
-import { BEACON, DIR, DST, KID } from '@shared/constants'
-import { beaconFileName, isDmConv, parseBeaconFileName, seqToBase36 } from '@shared/ids'
+import { BEACON, DIR, DST, KID, PRESENCE } from '@shared/constants'
+import {
+  beaconFileName,
+  isDmConv,
+  isGrpConv,
+  parseBeaconFileName,
+  parseEventFileName,
+  seqToBase36,
+} from '@shared/ids'
 import type { BeaconContent, ConvId, Cursor, DmBeaconSection, SignedRecord } from '@shared/types'
 import { buildAad, decryptRecord, encryptRecord } from '../crypto/envelope'
 import { signRecord, verifyRecord } from '../crypto/identity'
+import type { IoTier } from '../services/ioTier'
 import type { Session } from './session'
+
+/**
+ * How often a beacon publish also stats the file it just wrote to re-derive the
+ * share-clock offset. That offset is an EMA that moves 0.3 per sample and drifts
+ * by milliseconds an hour, so sampling it once every few minutes is generous —
+ * and every event publish calibrates as well, so an active conversation keeps
+ * it fresher still. Before 1.2 every single beacon bump paid for this stat.
+ */
+const CALIBRATE_EVERY_MS = 5 * 60_000
+
+/**
+ * How many `grp` notice filenames a DM section advertises (1.2). Invites and
+ * rekeys are rare — a handful over a group's whole life — and the blanket sweep
+ * picks up anything that falls off the end, so this stays small.
+ */
+const GRP_HEADS_RING = 4
 
 // The beacon: one single-writer file per device whose SEQUENCE lives in the
 // filename, so one readdir of beacon/ per poll tick reveals every device's
@@ -19,34 +43,49 @@ export class BeaconWriter {
   private pendingTimer: NodeJS.Timeout | null = null
   private heartbeat: NodeJS.Timeout | null = null
   private lastBumpAt = 0
+  /** I/O tier (1.2): heartbeat cadence, `presence.idleSec`, and paused = silent. */
+  private tier: IoTier = 'blurred'
+  private started = false
+  /** Share clock of the last calibration stat; 0 = never (the startup beacon). */
+  private lastCalibrateAt = 0
   /** Tail of the publish queue — see publishNow(). */
   private publishing: Promise<void> = Promise.resolve()
 
   // State assembled into each beacon
   presence: BeaconContent['presence'] = { state: 'online', status: '', idleSec: 0 }
   typing: BeaconContent['typing'] | undefined
-  private heads = new Map<ConvId, string[]>() // channels + team convs (DMs live in dmSections)
+  private heads = new Map<ConvId, string[]>() // channels + team convs (sealed convs live below)
   private cursors = new Map<ConvId, { read: string; ingested: string }>()
-  private dmSections = new Map<string, DmBeaconSection>() // pairToken -> section
+  /**
+   * Heads/cursor/typing for every conversation whose existence is private: DMs
+   * (who talks to whom) and private groups (1.2). Keyed by ConvId here, split
+   * into `dmSealed` / `grpSealed` at publish time and encrypted under that
+   * conversation's own key — everyone else sees an opaque token and nothing else.
+   */
+  private sealedSections = new Map<ConvId, DmBeaconSection>()
   xfers: BeaconContent['xfers'] = {}
   drops: BeaconContent['drops'] = {}
   lanIps: string[] = []
   wsPort: number | undefined
 
-  constructor(private session: Session) {
+  constructor(
+    private session: Session,
+    /** Injected so tests (and the budget harness) don't need electron's app. */
+    private getAppVersion: () => string = () => '',
+  ) {
     this.seq = session.store.readSecretJson<number>('beacon-seq') ?? 0
   }
 
   start(): void {
-    this.heartbeat = setInterval(
-      () => void this.bump('heartbeat'),
-      BEACON.heartbeatMs + Math.floor(Math.random() * 2 - 1) * BEACON.heartbeatJitterMs,
-    )
+    this.started = true
+    this.restartHeartbeat()
     void this.bump('startup')
   }
 
   async stop(goodbye = true): Promise<void> {
+    this.started = false
     if (this.heartbeat) clearInterval(this.heartbeat)
+    this.heartbeat = null
     if (this.pendingTimer) clearTimeout(this.pendingTimer)
     if (goodbye) {
       this.presence = { ...this.presence, state: 'offline' }
@@ -54,15 +93,93 @@ export class BeaconWriter {
     }
   }
 
+  /** Heartbeat period for the current tier; null while paused. */
+  private heartbeatMs(): number | null {
+    if (this.tier === 'paused') return null
+    return this.tier === 'idle' ? BEACON.idleHeartbeatMs : BEACON.heartbeatMs
+  }
+
+  private restartHeartbeat(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat)
+    this.heartbeat = null
+    const period = this.heartbeatMs()
+    if (!this.started || period === null) return
+    // Jitter spreads a team's writes apart; it must never pull the period in.
+    // `Math.floor(Math.random() * 2 - 1)` only ever yielded -1 or 0, so every
+    // client ran its beacon between 15% early and on time — a systematic
+    // overshoot of the cadence the constants describe.
+    this.heartbeat = setInterval(
+      () => void this.bump('heartbeat'),
+      period + Math.floor(Math.random() * BEACON.heartbeatJitterMs),
+    )
+  }
+
+  /**
+   * Follow the I/O tier (1.2). `idleSec` finally carries the truth — peers
+   * derive "away" from it (PRESENCE.awayIdleSec), which until now could only
+   * ever happen by a beacon going stale. A paused device (locked screen,
+   * suspended machine) publishes one last beacon saying so and then goes
+   * quiet: the idle heartbeat still beats PRESENCE.offlineAfterMs, so a 1.1
+   * reader shows "away" rather than a hole.
+   */
+  setTier(tier: IoTier, idleSec = 0): void {
+    const prev = this.tier
+    this.tier = tier
+    const changed = prev !== tier
+    const state =
+      this.presence.state === 'offline'
+        ? 'offline' // the user chose to appear offline — never override that
+        : tier === 'paused'
+          ? 'away'
+          : 'online'
+    // The goodbye beacon has to read as "away" to a reader that only looks at
+    // `idleSec` — which is every reader, 1.1 and 1.2 alike: presenceViews()
+    // special-cases `state:'offline'` and otherwise derives away/online from
+    // idleSec, and the paused device stops publishing right after this, so
+    // nothing later can correct it. The OS idle counter is meaningless behind a
+    // lock screen anyway, so floor it at the threshold rather than send a 0.
+    const sec = tier === 'paused' ? Math.max(idleSec, PRESENCE.awayIdleSec) : idleSec
+    // A drifting idleSec rides the next heartbeat rather than provoking a
+    // write of its own — otherwise "still idle" would cost more traffic than
+    // the idle tier saves.
+    this.presence = { ...this.presence, state, idleSec: sec }
+    if (!changed) return
+    this.restartHeartbeat()
+    if (this.started) void this.bump('presence')
+  }
+
+  /** DMs and private groups seal their section; channels/team convs go plain. */
+  private isSealed(conv: ConvId): boolean {
+    return isDmConv(conv) || isGrpConv(conv)
+  }
+
+  private sectionFor(conv: ConvId): DmBeaconSection {
+    const section = this.sealedSections.get(conv) ?? { heads: [], cursor: { read: '', ingested: '' } }
+    this.sealedSections.set(conv, section)
+    return section
+  }
+
   noteOwnEvent(conv: ConvId, fileName: string): void {
-    // Only DMs need the per-pair sealed section (who-talks-to-whom is private);
-    // channels and team convs advertise heads in the plain section.
-    if (isDmConv(conv)) {
-      const token = conv.slice(3)
-      const section = this.dmSections.get(token) ?? { heads: [], cursor: { read: '', ingested: '' } }
-      section.heads.push(fileName)
-      while (section.heads.length > BEACON.headsRingSize) section.heads.shift()
-      this.dmSections.set(token, section)
+    // Only DMs and private groups need a sealed section (who talks to whom, and
+    // who is in which group, is private); channels and team convs advertise
+    // heads in the plain section.
+    if (this.isSealed(conv)) {
+      const section = this.sectionFor(conv)
+      // A `grp` notice (invite, rekey, "you were removed") rides its own ring.
+      // The DM peer on the other end may be a 1.1 client, and it *can* open this
+      // section — it is their DM. A `.grp.e1` name in `heads` doesn't parse
+      // there, so it reads as a missing head and costs them a full catch-up of
+      // the DM on every beacon we publish afterwards. An unknown field costs
+      // them nothing.
+      if (parseEventFileName(fileName)?.type === 'grp') {
+        const ring = section.grpHeads ?? []
+        ring.push(fileName)
+        while (ring.length > GRP_HEADS_RING) ring.shift()
+        section.grpHeads = ring
+      } else {
+        section.heads.push(fileName)
+        while (section.heads.length > BEACON.headsRingSize) section.heads.shift()
+      }
     } else {
       const ring = this.heads.get(conv) ?? []
       ring.push(fileName)
@@ -84,12 +201,10 @@ export class BeaconWriter {
   primeCursor(conv: ConvId, cursor: Cursor): boolean {
     const same = (a: Cursor | undefined): boolean =>
       !!a && a.read === cursor.read && a.ingested === cursor.ingested && a.readAt === cursor.readAt
-    if (isDmConv(conv)) {
-      const token = conv.slice(3)
-      const section = this.dmSections.get(token) ?? { heads: [], cursor: { read: '', ingested: '' } }
+    if (this.isSealed(conv)) {
+      const section = this.sectionFor(conv)
       if (same(section.cursor)) return false
       section.cursor = cursor
-      this.dmSections.set(token, section)
     } else {
       if (same(this.cursors.get(conv))) return false
       this.cursors.set(conv, cursor)
@@ -99,11 +214,8 @@ export class BeaconWriter {
 
   setTyping(conv: ConvId | null): void {
     const until = this.session.io.calibratedNow() + BEACON.typingTtlMs
-    if (conv && isDmConv(conv)) {
-      const token = conv.slice(3)
-      const section = this.dmSections.get(token) ?? { heads: [], cursor: { read: '', ingested: '' } }
-      section.typingUntil = until
-      this.dmSections.set(token, section)
+    if (conv && this.isSealed(conv)) {
+      this.sectionFor(conv).typingUntil = until
       void this.bump('typing')
       return
     }
@@ -127,6 +239,25 @@ export class BeaconWriter {
     else delete x[blobId]
     this.xfers = x
     void this.bump('cursor') // coalesced cadence is fine for progress
+  }
+
+  /**
+   * Where one sealed section goes and what locks it: the DM pair key, or the
+   * group's current epoch key (whose epoch travels in the kid, so a member
+   * still catching up on a rotation knows which key to try).
+   */
+  private sealTarget(
+    conv: ConvId,
+  ): { bucket: 'dm' | 'grp'; token: string; key: Buffer; kid: string; aadScope: string } | null {
+    const s = this.session
+    if (isDmConv(conv)) {
+      const token = conv.slice(3)
+      const dm = s.dmsByToken.get(token)
+      return dm ? { bucket: 'dm', token, key: dm.key, kid: KID.dm(token), aadScope: 'dmb' } : null
+    }
+    const token = s.groups?.token(conv)
+    const info = token ? s.convInfo(conv) : null
+    return token && info ? { bucket: 'grp', token, key: info.key, kid: info.kid, aadScope: 'grpb' } : null
   }
 
   /** Coalesced bump: events/typing go fast, cursors coalesce. */
@@ -171,13 +302,18 @@ export class BeaconWriter {
     const name = beaconFileName(s.deviceId, this.seq)
     const seq36 = seqToBase36(this.seq)
 
-    // Seal DM sections per pair
+    // Seal each private conversation's section under its own key: a DM under
+    // the pair key, a group under its current epoch key. Everyone else reads a
+    // token and a blob.
     const dmSealed: Record<string, string> = {}
-    for (const [token, section] of this.dmSections) {
-      const dm = s.dmsByToken.get(token)
-      if (!dm) continue
-      const aad = buildAad('dmb', `${token}/${s.deviceId8}`, seq36)
-      dmSealed[token] = encryptRecord(dm.key, KID.dm(token), Buffer.from(JSON.stringify(section)), aad).toString('base64')
+    const grpSealed: Record<string, string> = {}
+    for (const [conv, section] of this.sealedSections) {
+      const target = this.sealTarget(conv)
+      if (!target) continue // key gone (left the group, unknown peer) — say nothing
+      const aad = buildAad(target.aadScope, `${target.token}/${s.deviceId8}`, seq36)
+      const sealed = encryptRecord(target.key, target.kid, Buffer.from(JSON.stringify(section)), aad).toString('base64')
+      if (target.bucket === 'dm') dmSealed[target.token] = sealed
+      else grpSealed[target.token] = sealed
     }
 
     const content: BeaconContent = {
@@ -190,17 +326,27 @@ export class BeaconWriter {
       heads: Object.fromEntries(this.heads),
       cursors: Object.fromEntries(this.cursors),
       dmSealed: Object.keys(dmSealed).length ? dmSealed : undefined,
+      // 1.2: same shape, group keys. 1.1 readers ignore the field.
+      grpSealed: Object.keys(grpSealed).length ? grpSealed : undefined,
       xfers: this.xfers && Object.keys(this.xfers).length ? this.xfers : undefined,
       drops: this.drops && Object.keys(this.drops).length ? this.drops : undefined,
       lanIps: this.lanIps.length ? this.lanIps : undefined,
       p2p: this.wsPort ? { caps: ['rtc-v1'], wsPort: this.wsPort } : undefined,
+      // 1.2: peers on an older build raise their own update banner from this.
+      // 1.1 readers parse the record and ignore the field (readOne does no
+      // schema validation), so adding it is safe mid-rollout.
+      app: this.getAppVersion() || undefined,
     }
 
     const signed = signRecord(s.identity, DST.record, content)
     const rel = `${DIR.beacon}/${name}`
     const aad = buildAad('pres', rel, s.deviceId8)
+    // Calibration is a second round trip; it rides an occasional beacon rather
+    // than every one of them.
+    const calibrate = Date.now() - this.lastCalibrateAt >= CALIBRATE_EVERY_MS
+    if (calibrate) this.lastCalibrateAt = Date.now()
     await s.io.publish(rel, encryptRecord(s.keys.kPres, KID.pres(s.proto.epoch), Buffer.from(JSON.stringify(signed)), aad), {
-      calibrate: true,
+      calibrate,
     })
     const old = this.lastPublishedName
     this.lastPublishedName = name
@@ -215,6 +361,8 @@ export interface BeaconObservation {
   content: BeaconContent
   verified: boolean
   dmSections: Map<string, DmBeaconSection> // pairToken -> decrypted section (ours only)
+  /** 1.2: grp dir token -> decrypted section, for groups we hold a key to. */
+  grpSections?: Map<string, DmBeaconSection>
   observedAtMono: number
 }
 
@@ -280,7 +428,40 @@ export class BeaconReader {
         }
       }
 
-      return { deviceId8: id8, content: signed.p, verified, dmSections, observedAtMono: Date.now() }
+      // Group sections (1.2): only groups we hold a key for open, and the
+      // writer may be an epoch ahead of or behind us, so try every key we have.
+      const grpSections = new Map<string, DmBeaconSection>()
+      if (signed.p.grpSealed) {
+        for (const [token, b64] of Object.entries(signed.p.grpSealed)) {
+          const conv = s.groups?.convForToken(token)
+          if (!conv) continue // not our group — unreadable by design
+          // Holding a key is not the same as being in the group: a removed
+          // member keeps every epoch key they were ever given, and their client
+          // goes on sealing a section for a group it no longer belongs to. Its
+          // heads would drag us back to their retired-key writes on every poll.
+          // Membership is the fold's answer, not the key's.
+          if (!s.groups?.isMember(conv, signed.by)) continue
+          const sAad = buildAad('grpb', `${token}/${id8}`, signed.p.seq)
+          for (const key of s.groups?.keys(conv) ?? []) {
+            try {
+              const sec = JSON.parse(decryptRecord(Buffer.from(b64, 'base64'), key, sAad).toString('utf8'))
+              grpSections.set(token, sec as DmBeaconSection)
+              break
+            } catch {
+              // wrong epoch (or a broken section) — try the next key
+            }
+          }
+        }
+      }
+
+      return {
+        deviceId8: id8,
+        content: signed.p,
+        verified,
+        dmSections,
+        grpSections: grpSections.size ? grpSections : undefined,
+        observedAtMono: Date.now(),
+      }
     } catch {
       return null
     }

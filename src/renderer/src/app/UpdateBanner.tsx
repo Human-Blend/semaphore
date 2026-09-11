@@ -1,16 +1,48 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useStore } from '@/store'
 import { Button } from '@/ui/atoms'
 import { toast } from './toasts'
+import {
+  dismissedFor,
+  forgetPeerDismissal,
+  peerSentence,
+  rememberLater,
+  type UpdateSource,
+} from './updateBannerState'
 
 // Spec §10 — the update surface. Non-blocking: a subtle bottom-left chip.
 // Blocking (below minSupported): a modal that explains, still no auto-install —
 // the human always performs the copy-and-swap.
+//
+// 1.2 adds a second source. A teammate's beacon now carries their Chat version,
+// so this machine can learn that it is behind before anyone has copied the new
+// zip into the team folder. That banner can't offer a copy (there is nothing to
+// copy yet), so it names the person and opens the apps folder instead, and
+// flips to the normal one the moment the signed manifest lands.
+
+// The dismissal keys and the peer wording live in ./updateBannerState so the suite
+// (node environment, no DOM) can pin them.
 
 export function UpdateBanner() {
   const update = useStore((s) => s.update)
   const [busy, setBusy] = useState(false)
   const [hidden, setHidden] = useState(false)
+  const version = update?.version ?? ''
+  const source: UpdateSource = update?.source === 'peer' ? 'peer' : 'manifest'
+  const isPeer = source === 'peer'
+
+  // A new version — or the same version arriving from a source this machine has
+  // not been told to hush — resets the session dismissal. The manifest banner
+  // also clears any peer dismissal for that version: once the zip is really
+  // there, "remind me later" about the rumour has been answered.
+  useEffect(() => {
+    if (!version) {
+      setHidden(false)
+      return
+    }
+    if (source === 'manifest') forgetPeerDismissal(version)
+    setHidden(dismissedFor(version, source))
+  }, [version, source])
 
   if (!update || (hidden && !update.blocking)) return null
 
@@ -29,6 +61,19 @@ export function UpdateBanner() {
     } finally {
       setBusy(false)
     }
+  }
+
+  const openApps = async () => {
+    try {
+      await window.bridge.app.openAppsFolder()
+    } catch {
+      toast('Could not open the apps folder — is the team folder reachable?')
+    }
+  }
+
+  const remindLater = () => {
+    rememberLater(update.version, source)
+    setHidden(true)
   }
 
   if (update.blocking) {
@@ -50,6 +95,15 @@ export function UpdateBanner() {
     )
   }
 
+  const linkStyle = {
+    border: 'none',
+    background: 'transparent',
+    color: 'var(--accent-text)',
+    fontWeight: 600,
+    fontSize: 12,
+    cursor: 'pointer',
+  } as const
+
   return (
     <div
       style={{
@@ -70,10 +124,27 @@ export function UpdateBanner() {
       }}
     >
       <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent)' }} />
-      Chat {update.version} is available
-      <button onClick={() => void copy()} disabled={busy} style={{ border: 'none', background: 'transparent', color: 'var(--accent-text)', fontWeight: 600, fontSize: 12, cursor: 'pointer' }}>
-        {busy ? 'Copying…' : 'Copy to my machine'}
-      </button>
+      {isPeer ? (
+        <>
+          {/* A peer beacon is a claim, not a release: nothing here has been
+              verified against the baked release key, so the wording names who
+              is saying it and never says an update "is available". */}
+          <span>{peerSentence(update.peerName, update.version)}</span>
+          <button onClick={() => void openApps()} style={linkStyle}>
+            Open apps folder
+          </button>
+          <button onClick={remindLater} style={{ ...linkStyle, color: 'var(--text-3)', fontWeight: 400 }}>
+            Remind me later
+          </button>
+        </>
+      ) : (
+        <>
+          Chat {update.version} is available
+          <button onClick={() => void copy()} disabled={busy} style={linkStyle}>
+            {busy ? 'Copying…' : 'Copy to my machine'}
+          </button>
+        </>
+      )}
       <button onClick={() => setHidden(true)} title="Dismiss" style={{ border: 'none', background: 'transparent', color: 'var(--text-3)', cursor: 'pointer', fontSize: 13 }}>
         ×
       </button>

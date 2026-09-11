@@ -7,6 +7,7 @@ import type { BeamProgressView, PushMessage, SettingsView } from '@shared/bridge
 import type { DropAck, DropOffer, SysPayload } from '@shared/types'
 import { APP, DIR, DROP, FILE_EXT, KID } from '@shared/constants'
 import { buildAad, importX25519Pub, openSealedRecord, sealRecord } from '../crypto/envelope'
+import { dropsInboxMsFor, type IoTier } from './ioTier'
 import type { Session } from '../transport/session'
 import type { ShareIo } from '../transport/shareIo'
 import { decryptSfb1File, encryptFileToShare, mimeForName, sanitizeFileName } from './blobs'
@@ -28,7 +29,6 @@ import type { ChatService } from './chatService'
 // sender deletes the ack once it has seen the terminal state.
 
 const ACK_POLL_MS = 2_000
-const INBOX_POLL_MS = 30_000
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`
@@ -75,6 +75,8 @@ export class DropService {
   /** Terminally handled dropIds — never re-offered within this session. */
   private handled = new Set<string>()
   private scanTimer: NodeJS.Timeout | null = null
+  /** I/O tier (1.2): 30 s awake, 5 min idle, nothing at all while paused. */
+  private tier: IoTier = 'blurred'
   private scanning = false
   private scanQueued = false
   private stopped = false
@@ -88,12 +90,39 @@ export class DropService {
 
   start(): void {
     void this.scanInbox()
-    this.scanTimer = setInterval(() => void this.scanInbox(), INBOX_POLL_MS)
+    this.scheduleScan()
+  }
+
+  /**
+   * Self-rescheduling rather than a fixed interval, so a tier change takes
+   * effect at the next scan instead of at the next restart. A beacon drop hint
+   * still scans immediately (noteHint), which is what makes the slow idle
+   * cadence acceptable: the poller notices the sender before this timer would.
+   */
+  private scheduleScan(): void {
+    if (this.scanTimer) clearTimeout(this.scanTimer)
+    this.scanTimer = null
+    if (this.stopped) return
+    const every = dropsInboxMsFor(this.tier)
+    if (every === null) return // paused
+    this.scanTimer = setTimeout(() => {
+      void this.scanInbox()
+      this.scheduleScan()
+    }, every)
+  }
+
+  setTier(tier: IoTier): void {
+    if (tier === this.tier) return
+    const wasPaused = this.tier === 'paused'
+    this.tier = tier
+    this.scheduleScan()
+    // Nothing was scanned while the machine slept; a beam may be waiting.
+    if (wasPaused && tier !== 'paused') void this.scanInbox()
   }
 
   stop(): void {
     this.stopped = true
-    if (this.scanTimer) clearInterval(this.scanTimer)
+    if (this.scanTimer) clearTimeout(this.scanTimer)
     for (const s of this.sends.values()) if (s.timer) clearInterval(s.timer)
     this.sends.clear()
   }

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { DragEvent } from 'react'
 import type { ConvId } from '@shared/types'
 import type { AttachDraft } from '@shared/bridge'
-import { isChanConv } from '@shared/ids'
+import { isChanConv, isGrpConv } from '@shared/ids'
 import { materialize } from '@shared/merge'
 import type { MessageView } from '@shared/merge'
 import { useStore, selfOf } from '@/store'
@@ -10,6 +10,7 @@ import { MessageList } from './MessageList'
 import { Composer } from './Composer'
 import type { ComposerApi } from './Composer'
 import { TypingLane } from './TypingLane'
+import { sniffDroppedDiagram } from '@/diagram/scene'
 import { CHAT_CSS, EMPTY, UNKNOWN_CHIP, buildAttachment, type ChipData } from './util'
 import { UploadIcon } from './icons'
 
@@ -21,6 +22,7 @@ export default function ChatPane({ conv }: { conv: ConvId }) {
   const loaded = useStore((s) => s.eventsLoaded[conv] ?? false)
   const presence = useStore((s) => s.presence)
   const channels = useStore((s) => s.channels)
+  const groups = useStore((s) => s.groups)
   const boot = useStore((s) => s.boot)
   const self = selfOf(boot)
   const selfId = self?.deviceId ?? ''
@@ -85,12 +87,19 @@ export default function ChatPane({ conv }: { conv: ConvId }) {
       const c = channels.find((ch) => ch.conv === conv)
       return c ? `#${c.name}` : 'this channel'
     }
+    // Private groups (1.2): named like a channel (no leading '#'), never
+    // inferred from the last non-self sender — a group can have more than
+    // one other member, so "who else spoke last" isn't a stable label.
+    if (isGrpConv(conv)) {
+      const g = groups.find((gr) => gr.conv === conv)
+      return g ? g.name : 'this group'
+    }
     for (let i = log.messages.length - 1; i >= 0; i--) {
       const m = log.messages[i]
       if (m.authorDevice !== selfId) return m.authorName
     }
     return 'this conversation'
-  }, [conv, channels, log, selfId])
+  }, [conv, channels, groups, log, selfId])
 
   const onEditLast = useCallback(() => {
     const msgs = logRef.current.messages
@@ -126,6 +135,23 @@ export default function ChatPane({ conv }: { conv: ConvId }) {
 
   const handleDropFiles = useCallback(
     async (files: File[]): Promise<void> => {
+      // A dropped diagram opens the editor instead of being shared as a file:
+      // a `.excalidraw` scene, or a PNG/SVG exported with "embed scene". Only
+      // when it is the single dropped file — a folder-full of screenshots is
+      // still a folder-full of screenshots.
+      if (files.length === 1) {
+        const scene = await sniffDroppedDiagram(files[0]).catch(() => null)
+        if (scene) {
+          useStore.getState().openDiagramEditor({
+            conv,
+            mode: 'edit',
+            title: '',
+            scene: null,
+            importFile: { name: scene.name, base64: scene.base64 },
+          })
+          return
+        }
+      }
       const attachments: AttachDraft[] = []
       for (const f of files) {
         try {

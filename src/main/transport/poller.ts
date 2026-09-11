@@ -1,7 +1,8 @@
 import { POLL, PRESENCE, TEAM_CONV } from '@shared/constants'
-import type { BeaconContent, ConvId, PresenceStateKind, PresenceView } from '@shared/types'
+import type { BeaconContent, ConvId, DmBeaconSection, PresenceStateKind, PresenceView } from '@shared/types'
 import { fingerprintFromEdPub } from '../crypto/identity'
 import { isChanConv, isTeamConv, sanitizeHostname } from '@shared/ids'
+import { sweepMsFor, tickMsFor, type IoTier } from '../services/ioTier'
 import { BeaconReader, type BeaconObservation } from './beacon'
 import type { EventStore } from './events'
 import type { RosterEntry } from './roster'
@@ -13,7 +14,6 @@ import type { Session } from './session'
 interface DeviceObservation {
   content: BeaconContent
   verified: boolean
-  lastSeqChangeMono: number
 }
 
 export interface PollerEvents {
@@ -24,6 +24,8 @@ export interface PollerEvents {
   onXfers?: (deviceId: string, xfers: NonNullable<BeaconContent['xfers']>) => void
   onHealthChange?: (reachable: boolean) => void
   onNewDevice?: () => void
+  /** A verified beacon named the Chat build behind it (1.2+ writers only). */
+  onPeerVersion?: (version: string, name: string) => void
 }
 
 export class Poller {
@@ -35,7 +37,24 @@ export class Poller {
   private running = false
   private degraded = false
   listeners: PollerEvents = {}
-  intervalMs: number = POLL.defaultMs
+  /** I/O tier (1.2) — drives both the tick and the blanket-sweep cadence. */
+  private tier: IoTier = 'blurred'
+  /**
+   * Current tick period. Derived from the tier, never from POLL.defaultMs: a
+   * client that launches unfocused never gets a setTier('blurred') (it is
+   * already there and setTier early-returns), so a default of defaultMs meant
+   * it polled at 1.5 s for the rest of its life.
+   */
+  intervalMs: number = tickMsFor(this.tier) ?? POLL.defaultMs
+  /** Share clock of the last blanket sweep; 0 = sweep on the next tick. */
+  private lastSweepAt = 0
+  private kick: (() => void) | null = null
+  /**
+   * Which loop chain is allowed to reschedule. A tier speed-up starts a fresh
+   * chain; any tick still in flight from the previous one carries an older id
+   * and bows out instead of scheduling a second, parallel wake-up.
+   */
+  private chain = 0
 
   constructor(
     private session: Session,
@@ -46,23 +65,77 @@ export class Poller {
 
   start(): void {
     this.running = true
-    const loop = async () => {
-      if (!this.running) return
+    this.intervalMs = tickMsFor(this.tier) ?? this.intervalMs
+    // Sweep on the very first tick. ChatService.start() has just caught every
+    // conversation up, but channel *discovery* lives inside the sweep, so
+    // deferring it a whole period means a channel created while we were away
+    // (or one whose first event nobody has beaconed) stays invisible for one
+    // to ten minutes after launch.
+    this.lastSweepAt = 0
+    const loop = async (id: number): Promise<void> => {
+      if (!this.running || this.isPaused() || id !== this.chain) return
       const t0 = Date.now()
       try {
         await this.tick()
       } catch {
         // tick errors surface through share health
       }
+      // Re-checked after the await: a lock-screen during a slow tick must not
+      // schedule one more wake-up, and neither must a tick whose chain was
+      // superseded by a speed-up while it was in flight.
+      if (!this.running || this.isPaused() || id !== this.chain) return
       const elapsed = Date.now() - t0
-      this.timer = setTimeout(loop, Math.max(200, this.intervalMs - elapsed))
+      this.timer = setTimeout(() => void loop(id), Math.max(200, this.intervalMs - elapsed))
     }
-    void loop()
+    this.kick = () => {
+      const id = ++this.chain
+      void loop(id)
+    }
+    this.kick()
   }
 
   stop(): void {
     this.running = false
+    this.chain++ // any tick still in flight loses its claim to reschedule
     if (this.timer) clearTimeout(this.timer)
+    this.timer = null
+  }
+
+  /**
+   * Move to an I/O tier: `paused` (screen locked / machine suspended) stops the
+   * loop dead, anything else sets the cadence and — when we are speeding up or
+   * coming back from paused — ticks once right away so the window is never
+   * showing a stale room for a whole idle interval.
+   */
+  setTier(tier: IoTier): void {
+    const prev = this.tier
+    if (tier === prev) return
+    this.tier = tier
+    const next = tickMsFor(tier)
+    if (next === null) {
+      // paused: the running loop returns on its own, but a scheduled wake-up
+      // would still fire once — drop it.
+      if (this.timer) clearTimeout(this.timer)
+      this.timer = null
+      return
+    }
+    const faster = next < this.intervalMs
+    this.intervalMs = next
+    if (!this.running) return
+    if (prev === 'paused' || faster) {
+      if (this.timer) clearTimeout(this.timer)
+      this.timer = null
+      this.kick?.()
+    }
+  }
+
+  private isPaused(): boolean {
+    return this.tier === 'paused'
+  }
+
+  /** Milliseconds between blanket catch-up sweeps at the current tier. */
+  private sweepMs(): number | null {
+    return sweepMsFor(this.tier)
   }
 
   async tick(): Promise<void> {
@@ -99,20 +172,33 @@ export class Poller {
 
     // Channel discovery + a full catch-up sweep on a slower cadence (new
     // channels, day rollover, events from devices whose beacons we missed).
-    if (this.ticks % 20 === 1) {
+    // Wall-clock driven since 1.2, so the tick rate and the sweep rate are
+    // independent: 1/3/10 minutes for focused/blurred/idle.
+    const sweepMs = this.sweepMs()
+    if (sweepMs !== null && Date.now() - this.lastSweepAt >= sweepMs) {
+      this.lastSweepAt = Date.now()
       const before = s.channels.size
       await s.loadChannels()
       if (s.channels.size !== before) this.listeners.onNewDevice?.()
-      for (const ch of s.channels.values()) {
-        await this.events.catchUp(s.convIdForChannel(ch.channelId))
+      // `fast` opens today's day directory by name instead of listing the day
+      // directories first — half the readdirs per conversation, and it lapses
+      // back to the full walk by itself at the day rollover (see catchUp).
+      const sweep = { fast: true } as const
+      for (const ch of s.activeChannels()) {
+        await this.events.catchUp(s.convIdForChannel(ch.channelId), sweep)
       }
       for (const dm of s.dms.values()) {
-        await this.events.catchUp(`dm:${dm.pairToken}`)
+        await this.events.catchUp(`dm:${dm.pairToken}`, sweep)
       }
       // Team logs (calendar, PR config) have no discovery step — their ids are
       // fixed, so the sweep just catches each one up.
       for (const conv of Object.values(TEAM_CONV)) {
-        await this.events.catchUp(conv)
+        await this.events.catchUp(conv, sweep)
+      }
+      // Private groups (1.2): no discovery either — the invite brought the key,
+      // and the sweep picks up anything the beacon heads missed.
+      for (const conv of s.groups?.convs() ?? []) {
+        await this.events.catchUp(conv, sweep)
       }
     }
 
@@ -125,29 +211,44 @@ export class Poller {
     const s = this.session
     const deviceId = obs.content.device
     const known = this.observations.has(deviceId)
-    this.observations.set(deviceId, {
-      content: obs.content,
-      verified: obs.verified,
-      lastSeqChangeMono: obs.observedAtMono,
-    })
+    this.observations.set(deviceId, { content: obs.content, verified: obs.verified })
     if (!known) this.listeners.onNewDevice?.()
     if (!obs.verified) return // unverified beacons never drive ingestion
+
+    // A teammate on a newer build (1.2+). Unverified beacons are excluded on
+    // purpose: an update banner must not be raisable by anyone who can write
+    // to the share. The listener dedupes per version.
+    if (obs.content.app) this.listeners.onPeerVersion?.(obs.content.app, obs.content.name)
 
     // Channel + team heads → ingest the exact new event files. Only channels
     // need a discovery refresh; team conv ids are fixed and always derivable.
     for (const [conv, heads] of Object.entries(obs.content.heads ?? {})) {
       if (!isChanConv(conv) && !isTeamConv(conv)) continue
       if (isChanConv(conv) && !s.channels.get(conv.slice(5))) await s.loadChannels()
+      // A tombstoned channel is closed: don't re-read a log on its way out.
+      if (isChanConv(conv) && s.channels.get(conv.slice(5))?.deletedAt) continue
       await this.events.ingestHeads(conv as ConvId, heads)
     }
     // Channel cursors → delivery/read receipts
     for (const [conv, cursor] of Object.entries(obs.content.cursors ?? {})) {
       this.listeners.onCursors?.(conv as ConvId, deviceId, cursor)
     }
-    // DM sections (only pairs that involve us decrypt)
-    for (const [token, section] of obs.dmSections) {
-      const conv: ConvId = `dm:${token}`
+    // Sealed sections: DM pairs that involve us, plus private groups we hold a
+    // key for (1.2) — same treatment, the reader already did the decrypting.
+    const sealed: [ConvId, DmBeaconSection][] = [...obs.dmSections].map(([token, section]) => [
+      `dm:${token}` as ConvId,
+      section,
+    ])
+    for (const [token, section] of obs.grpSections ?? []) {
+      const conv = s.groups?.convForToken(token)
+      if (conv) sealed.push([conv, section])
+    }
+    for (const [conv, section] of sealed) {
       if (section.heads.length) await this.events.ingestHeads(conv, section.heads)
+      // Private-group notices in a DM (1.2) travel in their own ring, out of
+      // `heads`, so that a 1.1 peer reading the same section never meets a
+      // filename it cannot parse. Same ingestion, one field over.
+      if (section.grpHeads?.length) await this.events.ingestHeads(conv, section.grpHeads)
       this.listeners.onCursors?.(conv, deviceId, section.cursor)
       if (section.typingUntil && section.typingUntil > s.io.calibratedNow()) {
         this.listeners.onTyping?.(conv, deviceId, section.typingUntil)
@@ -169,7 +270,6 @@ export class Poller {
 
   presenceViews(): PresenceView[] {
     const s = this.session
-    const now = Date.now()
     const shareNow = s.io.calibratedNow()
     const entries = s.roster.all().filter((e) => e.record.deviceId !== s.deviceId)
     const views: PresenceView[] = []
@@ -185,7 +285,13 @@ export class Poller {
         // last week reads as "last week" even on a fresh launch.
         lastSeenMs = Math.min(obs.content.hlc, shareNow)
         status = obs.content.presence.status
-        const age = now - obs.lastSeqChangeMono
+        // Freshness comes from that same stamp, not from when this reader got
+        // round to reading the file. Measuring from the observation made the
+        // answer depend on our own tick rate (a 45–48 s idle heartbeat has only
+        // 2 s of slack inside PRESENCE.onlineWithinMs, and an idle reader's poll
+        // delay is 15 s), and it let a beacon written hours ago read as "online"
+        // for a whole minute after a cold start or a resume from a locked screen.
+        const age = Math.max(0, shareNow - lastSeenMs)
         if (obs.content.presence.state === 'offline') state = 'offline'
         else if (age < PRESENCE.onlineWithinMs) {
           state = obs.content.presence.idleSec >= PRESENCE.awayIdleSec ? 'away' : 'online'
@@ -205,6 +311,9 @@ export class Poller {
         lastSeenMs,
         trust: entry.pin.trust,
         dmConv: `dm:${s.dmFor(deviceId)?.pairToken ?? ''}`,
+        // Same gate as onPeerVersion: a build number nobody signed for is not
+        // evidence, and it is what the update banner reads.
+        app: obs?.verified ? obs.content.app : undefined,
         departed,
       })
     }

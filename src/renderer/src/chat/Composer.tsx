@@ -6,6 +6,8 @@ import type { MessageView } from '@shared/merge'
 import { useStore, selfOf } from '@/store'
 import { Avatar, DeviceChip, IconButton } from '@/ui/atoms'
 import { GifPicker } from '@/content/GifPicker'
+import { DiagramButton } from '@/diagram/DiagramButton'
+import { CODE_LANGUAGES, readStoredLang, writeStoredLang } from '@/content/languages'
 import { detectEntities, firstUrlOf, looksLikeCode, snippetOf, withTimeout } from './util'
 import { ClockIcon, CloseIcon, CodeIcon, GifIcon, SendIcon } from './icons'
 
@@ -52,11 +54,21 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
   const [failed, setFailed] = useState(false)
   const [mention, setMention] = useState<{ at: number; q: string } | null>(null)
   const [sel, setSel] = useState(0)
+  // The code-block language: a sticky preference (localStorage), not reset
+  // per-conversation like the rest of the draft state below.
+  const [lang, setLangState] = useState<string | null>(() => readStoredLang())
+  const [langOpen, setLangOpen] = useState(false)
+  const langBtnRef = useRef<HTMLButtonElement>(null)
 
   const taRef = useRef<HTMLTextAreaElement>(null)
   const typingAt = useRef(0)
   const idleTimer = useRef<number | null>(null)
   const caretAfter = useRef<number | null>(null)
+
+  const setLang = useCallback((id: string | null) => {
+    setLangState(id)
+    writeStoredLang(id)
+  }, [])
 
   // Reset per conversation.
   useEffect(() => {
@@ -66,6 +78,7 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
     setGifOpen(false)
     setMention(null)
     setFailed(false)
+    setLangOpen(false)
     typingAt.current = 0
     taRef.current?.focus()
     return () => {
@@ -73,6 +86,13 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
       void window.bridge.chat.setTyping(null).catch(() => {})
     }
   }, [conv])
+
+  // The language dropdown only makes sense while the chip that opens it is on
+  // screen (code mode, or the paste-as-code chip below) — closing either must
+  // not leave a stale open popover for the next time one appears.
+  useEffect(() => {
+    if (!codeMode && !pasteChip) setLangOpen(false)
+  }, [codeMode, pasteChip])
 
   useEffect(() => {
     apiRef.current = {
@@ -210,7 +230,10 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
 
       const draft: SendDraft = { text: body, kind }
       if (kind === 'code') {
-        draft.lang = null
+        // null only for Auto-detect — every other choice (including the
+        // paste-as-code chip, which just uses whatever is current) rides
+        // through as the hljs id the language chip is set to.
+        draft.lang = lang
       } else {
         const entities = detectEntities(body, roster)
         if (entities.length) draft.entities = entities
@@ -231,7 +254,7 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
         setFailed(true)
       }
     },
-    [text, codeMode, replyTarget, roster, conv, send, onClearReply],
+    [text, codeMode, lang, replyTarget, roster, conv, send, onClearReply],
   )
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -305,6 +328,7 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
 
   const canSend = text.trim().length > 0
   const mono = codeMode || pasteChip
+  const selectedLang = useMemo(() => CODE_LANGUAGES.find((l) => l.id === lang) ?? CODE_LANGUAGES[0], [lang])
 
   return (
     <div style={{ position: 'relative' }}>
@@ -523,6 +547,86 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
         >
           <CodeIcon size={16} />
         </IconButton>
+        {(codeMode || pasteChip) && (
+          <div
+            style={{ position: 'relative' }}
+            onKeyDown={(e) => {
+              if (e.key !== 'Escape') return
+              e.stopPropagation()
+              setLangOpen(false)
+              langBtnRef.current?.focus()
+            }}
+          >
+            <button
+              ref={langBtnRef}
+              type="button"
+              className="sem-chip-btn sem-focus"
+              aria-haspopup="listbox"
+              aria-expanded={langOpen}
+              title="Code block language"
+              onClick={() => setLangOpen((v) => !v)}
+              style={{ height: 28, padding: '0 10px', fontSize: 12, color: 'var(--text-2)', flexShrink: 0 }}
+            >
+              {selectedLang.label}
+              <span aria-hidden style={{ fontSize: 9, color: 'var(--text-3)' }}>
+                ▾
+              </span>
+            </button>
+            {langOpen && (
+              <>
+                <div style={{ position: 'fixed', inset: 0, zIndex: 30 }} onMouseDown={() => setLangOpen(false)} />
+                <div
+                  className="sem-popover"
+                  role="listbox"
+                  aria-label="Code block language"
+                  style={{
+                    position: 'absolute',
+                    bottom: '100%',
+                    right: 0,
+                    marginBottom: 8,
+                    width: 190,
+                    maxHeight: 280,
+                    overflowY: 'auto',
+                    background: 'var(--bg-raised)',
+                    border: '1px solid var(--border-subtle)',
+                    borderRadius: 'var(--r-md)',
+                    boxShadow: 'var(--elev-3)',
+                    padding: 4,
+                    zIndex: 31,
+                  }}
+                >
+                  {CODE_LANGUAGES.map((opt) => (
+                    <button
+                      key={opt.id ?? '\0auto'}
+                      type="button"
+                      role="option"
+                      aria-selected={opt.id === lang}
+                      className="sem-row sem-focus"
+                      onClick={() => {
+                        setLang(opt.id)
+                        setLangOpen(false)
+                        langBtnRef.current?.focus()
+                      }}
+                      style={{
+                        width: '100%',
+                        height: 28,
+                        gap: 8,
+                        padding: '0 8px',
+                        borderRadius: 'var(--r-sm)',
+                        fontSize: 13,
+                        color: opt.id === lang ? 'var(--accent-text)' : 'var(--text-1)',
+                        background: opt.id === lang ? 'var(--accent-soft)' : 'transparent',
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        <DiagramButton conv={conv} />
         <IconButton label="Send a GIF" active={gifOpen} onClick={() => setGifOpen((v) => !v)}>
           <GifIcon size={17} />
         </IconButton>

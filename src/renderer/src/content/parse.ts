@@ -171,6 +171,31 @@ export function blobUrl(att: Pick<Attachment, 'blobId' | 'key' | 'name' | 'size'
   return `sfblob://blob/${att.blobId}?key=${encodeURIComponent(att.key)}&name=${encodeURIComponent(att.name)}&size=${att.size}`
 }
 
+/**
+ * True only for an inline `data:` URI. A URL's scheme is read the way a browser
+ * reads it — leading C0 controls and spaces are ignored — so a padded
+ * `" https://…"` is rejected along with the plain form.
+ */
+export function isDataUrl(url: unknown): boolean {
+  if (typeof url !== 'string') return false
+  return url.replace(/^[\u0000-\u0020]+/, '').slice(0, 5).toLowerCase() === 'data:'
+}
+
+/**
+ * A preview thumb, made safe to hand to an `<img src>`.
+ *
+ * Every `thumb` in the app arrives from a peer — inside an attachment, a beam
+ * offer, or a diagram body — and it is supposed to be a tiny WebP `data:` URI
+ * that costs no network. Nothing stopped a hand-made event from putting
+ * `https://tracker.example/pixel` there instead, and the renderer's CSP allows
+ * `img-src https:`, so simply *displaying* the message would call an
+ * attacker-chosen server from every recipient's machine. Anything that isn't a
+ * `data:` URI is dropped, and the caller falls back to its no-thumb state.
+ */
+export function safeThumbSrc(thumb: string | null | undefined): string | undefined {
+  return isDataUrl(thumb) ? (thumb as string) : undefined
+}
+
 /** Fit media into the spec box: max 420×320, min 120×80, unknown → 320×200. */
 export function fitMediaBox(w?: number, h?: number): { w: number; h: number; known: boolean } {
   if (!w || !h || w <= 0 || h <= 0) return { w: 320, h: 200, known: false }

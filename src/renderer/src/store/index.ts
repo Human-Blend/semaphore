@@ -3,6 +3,7 @@ import type {
   BootMode,
   ChannelView,
   CursorView,
+  GroupView,
   HealthView,
   PushMessage,
   SendDraft,
@@ -14,6 +15,9 @@ import type {
 } from '@shared/bridge'
 import type { ConvId, PresenceView, PrsStatus, PrView, VerifiedEvent } from '@shared/types'
 import { TEAM_CONV } from '@shared/constants'
+import { toast } from '@/app/toasts'
+import type { DiagramEditorState } from '@/diagram/state'
+import { findGroupRemovedEvent, resolveActiveConvVanish } from './convVanish'
 
 // Central renderer state. Raw events per conversation live here; components
 // materialize views with @shared/merge (memoized). All mutations go through
@@ -26,6 +30,16 @@ export interface TypingMap {
 interface ChatStore {
   boot: BootMode | null
   channels: ChannelView[]
+  /** Private groups this device belongs to (1.2) — full replace on every `groups` push. */
+  groups: GroupView[]
+  /**
+   * Bumped on every `channels`/`groups` push. `loadTeam()` fetches its own
+   * snapshot of each list across an await; if a fresher push lands while that
+   * fetch is in flight, the counter moves and `loadTeam()` drops its (now
+   * stale) result for that slice instead of clobbering the push that beat it.
+   */
+  channelsSeq: number
+  groupsSeq: number
   presence: PresenceView[]
   events: Record<string, VerifiedEvent[]> // conv -> raw events (sorted on insert)
   eventsLoaded: Record<string, boolean>
@@ -41,6 +55,8 @@ interface ChatStore {
   blobs: Record<string, BlobFetchState>
   update: UpdateView | null
   lightbox: { conv: ConvId; eventId: string; blobId: string } | null
+  /** The full-window diagram editor (1.2); null when it is closed — nothing is loaded until it isn't. */
+  diagramEditor: DiagramEditorState | null
   /** Tracked Azure DevOps pull requests (pushed by the main-side PR service). */
   prs: PrView[]
   prsStatus: PrsStatus | null
@@ -58,6 +74,8 @@ interface ChatStore {
   markRead(conv: ConvId, stem: string): void
   unreadCount(conv: ConvId): number
   openLightbox(v: { conv: ConvId; eventId: string; blobId: string } | null): void
+  /** Open (or, with null, close) the diagram editor overlay. */
+  openDiagramEditor(v: DiagramEditorState | null): void
   refreshSettings(): Promise<void>
 }
 
@@ -68,9 +86,52 @@ function insertEvent(list: VerifiedEvent[], ev: VerifiedEvent): VerifiedEvent[] 
   return next
 }
 
+/**
+ * After a `channels`/`groups` push lands, check whether the *active*
+ * conversation just disappeared from under the user (deleted, or this device
+ * left/was removed from a group) and, if so, land on the fixed channel and
+ * say why. Pure decision lives in convVanish.ts; this just wires it to the
+ * store and the toast rail.
+ */
+function checkConvVanish(get: () => ChatStore, prevChannels: ChannelView[], prevGroups: GroupView[]) {
+  const cur = get()
+  if (cur.activeConv === null) return
+  const selfId = cur.boot?.mode === 'ready' ? cur.boot.self.deviceId : ''
+  let events = cur.events[cur.activeConv] ?? []
+  // A group's own log never carries the `group-removed` notice that would
+  // explain why *this* device lost it (it travels, DM-sealed, over the
+  // owner's DM instead — GrpPayload's comment) — if the vanished conv was a
+  // group, look for that notice in whatever other conv's cache already holds
+  // it (the 'event' push for it lands before the 'groups' push that triggers
+  // this check, so by now it's there if it's coming at all).
+  const wasGroup = prevGroups.find((g) => g.conv === cur.activeConv)
+  if (wasGroup) {
+    const removed = findGroupRemovedEvent(cur.events, wasGroup.groupId)
+    if (removed && !events.some((e) => e.id === removed.id)) {
+      events = [...events, removed].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    }
+  }
+  const result = resolveActiveConvVanish({
+    activeConv: cur.activeConv,
+    channels: cur.channels,
+    groups: cur.groups,
+    prevChannels,
+    prevGroups,
+    events,
+    selfDeviceId: selfId,
+    nameOf: (d) => cur.presence.find((p) => p.deviceId === d)?.name ?? (d.slice(0, 8) || 'unknown'),
+  })
+  if (!result) return
+  cur.setActiveConv(result.target)
+  toast(result.toastText, 'info')
+}
+
 export const useStore = create<ChatStore>((set, get) => ({
   boot: null,
   channels: [],
+  groups: [],
+  channelsSeq: 0,
+  groupsSeq: 0,
   presence: [],
   events: {},
   eventsLoaded: {},
@@ -86,6 +147,7 @@ export const useStore = create<ChatStore>((set, get) => ({
   blobs: {},
   update: null,
   lightbox: null,
+  diagramEditor: null,
   prs: [],
   prsStatus: null,
   prsPrefsOpen: false,
@@ -107,6 +169,7 @@ export const useStore = create<ChatStore>((set, get) => ({
             void window.bridge.app.setBadge(0).catch(() => {})
             set({
               channels: [],
+              groups: [],
               presence: [],
               events: {},
               eventsLoaded: {},
@@ -119,6 +182,7 @@ export const useStore = create<ChatStore>((set, get) => ({
               blobs: {},
               update: null,
               lightbox: null,
+              diagramEditor: null,
               outboxQueued: 0,
               prs: [],
               prsStatus: null,
@@ -129,9 +193,18 @@ export const useStore = create<ChatStore>((set, get) => ({
         case 'event':
           set({ events: { ...s.events, [msg.conv]: insertEvent(s.events[msg.conv] ?? [], msg.event) } })
           break
-        case 'channels':
-          set({ channels: msg.channels })
+        case 'channels': {
+          const prevChannels = s.channels
+          set({ channels: msg.channels, channelsSeq: s.channelsSeq + 1 })
+          checkConvVanish(get, prevChannels, s.groups)
           break
+        }
+        case 'groups': {
+          const prevGroups = s.groups
+          set({ groups: msg.groups, groupsSeq: s.groupsSeq + 1 })
+          checkConvVanish(get, s.channels, prevGroups)
+          break
+        }
         case 'presence':
           set({ presence: msg.views })
           break
@@ -182,19 +255,40 @@ export const useStore = create<ChatStore>((set, get) => ({
   },
 
   async loadTeam() {
+    // A `channels`/`groups` push can land from the main process while these
+    // awaits are in flight (e.g. a `channel-deleted` sys event arriving right
+    // after boot). Capture the sequence counters *before* each fetch so a
+    // push that beat the fetch back is detected, not clobbered by the older
+    // snapshot this function requested first.
+    const channelsSeqAtStart = get().channelsSeq
     const [channels, presence, myReads] = await Promise.all([
       window.bridge.chat.channels(),
       window.bridge.presence.list(),
       window.bridge.chat.myReads(),
     ])
-    set({ channels, presence, myReads })
-    if (channels.length && !get().activeConv) get().setActiveConv(channels[0].conv)
+    set((s) => ({
+      channels: s.channelsSeq === channelsSeqAtStart ? channels : s.channels,
+      presence,
+      myReads,
+    }))
+    const liveChannels = get().channels
+    if (liveChannels.length && !get().activeConv) get().setActiveConv(liveChannels[0].conv)
+    // Private groups (1.2): best-effort — until the main-side handlers land,
+    // groups:list rejects 'not-implemented' and the sidebar just shows none.
+    const groupsSeqAtStart = get().groupsSeq
+    try {
+      const groups = await window.bridge.groups.list()
+      set((s) => (s.groupsSeq === groupsSeqAtStart ? { groups } : {}))
+    } catch (err) {
+      if (!/not-implemented/.test(String(err))) console.warn('groups: initial load failed', err)
+    }
     // Unread badges need every conversation's log, not just the open one; the
     // team logs (calendar, PR config) ride the same prefetch so the sidebar can
     // show a "something today" dot without opening the pane.
     for (const conv of [
-      ...channels.map((c) => c.conv),
+      ...get().channels.map((c) => c.conv),
       ...presence.map((p) => p.dmConv),
+      ...get().groups.map((g) => g.conv),
       ...Object.values(TEAM_CONV),
     ])
       void get().ensureEvents(conv)
@@ -256,6 +350,10 @@ export const useStore = create<ChatStore>((set, get) => ({
 
   openLightbox(v) {
     set({ lightbox: v })
+  },
+
+  openDiagramEditor(v) {
+    set({ diagramEditor: v })
   },
 
   async refreshSettings() {

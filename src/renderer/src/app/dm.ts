@@ -1,5 +1,7 @@
+import { useMemo } from 'react'
 import { create } from 'zustand'
 import type { ConvId } from '@shared/types'
+import type { GroupView } from '@shared/bridge'
 import { useStore } from '@/store'
 import { toast } from './toasts'
 
@@ -16,6 +18,21 @@ export const useDmMap = create<{
     set((s) => (s.peers[conv] === peerDeviceId ? s : { peers: { ...s.peers, [conv]: peerDeviceId } }))
   },
 }))
+
+/**
+ * conv -> GroupView lookup for private groups (1.2). Unlike useDmMap this
+ * needs no "remember" step: a GroupView already carries everything (name,
+ * owner, members, role) and arrives fully formed via the `groups` push, the
+ * same way ChannelView does — so it's just a memoized index over the store.
+ */
+export function useGroupMap(): Record<string, GroupView> {
+  const groups = useStore((s) => s.groups)
+  return useMemo(() => {
+    const map: Record<string, GroupView> = {}
+    for (const g of groups) map[g.conv] = g
+    return map
+  }, [groups])
+}
 
 /** Open (or create) the DM with a peer and make it the active conversation. */
 export async function openDm(peerDeviceId: string): Promise<void> {

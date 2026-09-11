@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CalPayload, CalendarEntry } from '@shared/types'
 import type { PushMessage, SettingsView } from '@shared/bridge'
-import { TEAM_CONV } from '@shared/constants'
+import { DIR, TEAM_CONV } from '@shared/constants'
 import { materializeCalendar } from '@shared/calendar'
 import { generateIdentity } from '../crypto/identity'
 import type { SecretStore } from '../store/secretStore'
@@ -159,4 +159,81 @@ describe('outbox replay across a restart', () => {
     // The UI hears about the restored backlog and about it draining.
     expect(pushes.filter((p) => p.kind === 'outbox').map((p) => (p as { queued: number }).queued)).toEqual([1, 0])
   })
+})
+
+// ---------------------------------------------------------------------------
+// Channel management (1.2). The home channel is the one thing here that must
+// never move: it is where a client lands when the conversation it was looking
+// at disappears, so rename and delete both refuse it.
+
+describe('renaming and deleting channels', () => {
+  it('refuses the home channel, normalizes names, and hides a deleted one', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-channels-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const pushes: PushMessage[] = []
+    chat.setPush((m) => pushes.push(m))
+    await chat.start() // bootstraps `general` with fixed: true
+
+    const home = chat.channelViews().find((v) => v.fixed)!
+    expect(home.name).toBe('general')
+    await expect(chat.renameChannel(home.conv, 'lobby')).rejects.toThrow('fixed-channel')
+    await expect(chat.deleteChannel(home.conv)).rejects.toThrow('fixed-channel')
+
+    const other = await chat.createChannel('random')
+    expect(other.fixed).toBe(false)
+    await expect(chat.renameChannel(other.conv, '   ')).rejects.toThrow('invalid-name')
+
+    const before = pushes.filter((p) => p.kind === 'channels').length
+    await chat.renameChannel(other.conv, '  Random Stuff ')
+    expect(chat.channelViews().find((v) => v.channelId === other.channelId)?.name).toBe('random-stuff')
+    expect(pushes.filter((p) => p.kind === 'channels').length).toBeGreaterThan(before)
+
+    await chat.deleteChannel(other.conv)
+    expect(chat.channelViews().some((v) => v.channelId === other.channelId)).toBe(false)
+    expect(chat.deletedConvDirs().map((d) => d.rel)).toContain(`${DIR.channels}/${session.channels.get(other.channelId)!.token}`)
+    // A send into a conversation that no longer exists fails outright rather
+    // than sitting in the outbox forever.
+    await expect(chat.send(other.conv, { kind: 'text', text: 'hello?' })).rejects.toThrow(/unknown conversation/)
+    expect(session.store.readSecretJson<unknown[]>('outbox') ?? []).toHaveLength(0)
+
+    await chat.stop()
+  }, 60_000)
+
+  it('refuses a tombstone for the home channel of a team that predates the flag', async () => {
+    // A team created before 1.2 carries `fixed` nowhere, so the home channel is
+    // whatever the fold computes: oldest, ties by lowest channelId. Every
+    // client computes the same answer, so every client can refuse a tombstone
+    // for it — otherwise one stale (or hostile) writer empties the sidebar and
+    // there is nowhere left to land.
+    const root = mkdtempSync(join(tmpdir(), 'sem-channels-legacy-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    await session.createChannel('general') // no `fixed` flag anywhere
+    await session.createChannel('random')
+    const chat = new ChatService(session, () => null, settings)
+    chat.setPush(() => {})
+    await chat.start() // channels already exist, so no bootstrap `general`
+
+    // Which of the two is home is the fold's answer (oldest, ties by lowest
+    // channelId) — the test asks it rather than assuming, because two channels
+    // created in the same millisecond are decided by a random id.
+    const home = chat.channelViews().find((v) => v.fixed)!
+    const other = chat.channelViews().find((v) => !v.fixed)!
+    expect(home).toBeDefined()
+    await expect(chat.deleteChannel(home.conv)).rejects.toThrow('fixed-channel')
+
+    // Published by hand, as a client that thinks a different channel is home
+    // would: the fold on this client refuses it.
+    await chat.events.publish(home.conv, 'sys', { t: 'sys', conv: home.conv, kind: 'channel-deleted', data: {} })
+    expect(session.channels.get(home.channelId)!.deletedAt).toBeUndefined()
+    expect(chat.channelViews().some((v) => v.channelId === home.channelId)).toBe(true)
+    expect(chat.deletedConvDirs()).toHaveLength(0)
+
+    // The same event for any other channel still tombstones it.
+    await chat.events.publish(other.conv, 'sys', { t: 'sys', conv: other.conv, kind: 'channel-deleted', data: {} })
+    expect(session.channels.get(other.channelId)!.deletedAt).toBeGreaterThan(0)
+    expect(chat.channelViews().some((v) => v.channelId === other.channelId)).toBe(false)
+
+    await chat.stop()
+  }, 60_000)
 })

@@ -12,6 +12,7 @@ import { Roster } from './transport/roster'
 import { Session } from './transport/session'
 import { ChatService } from './services/chatService'
 import { DRAG_TEMP_DIR } from './services/blobs'
+import type { IoTierManager } from './services/ioTier'
 import { Janitor } from './services/janitor'
 import { UpdateService } from './services/updates'
 import { PrService } from './services/prService'
@@ -52,6 +53,12 @@ const DEFAULT_SETTINGS: SettingsView = {
 
 export class AppController {
   readonly store = new LocalStore(app.getPath('userData'), platformKeystore())
+  /**
+   * Share I/O tier (1.2). Owned here so every service built in startSession can
+   * follow it, but constructed and fed in src/main/index.ts — that is where the
+   * powerMonitor and window signals live.
+   */
+  ioTier: IoTierManager | null = null
   chat: ChatService | null = null
   session: Session | null = null
   janitor: Janitor | null = null
@@ -67,6 +74,12 @@ export class AppController {
   setPush(push: (msg: PushMessage) => void): void {
     this.push = push
     this.chat?.setPush(push)
+  }
+
+  /** Wire the tier manager built in index.ts. Idempotent per manager. */
+  setIoTierManager(manager: IoTierManager): void {
+    this.ioTier = manager
+    manager.onChange((tier, idleSec) => this.chat?.setIoTier(tier, idleSec))
   }
 
   getBoot(): BootMode {
@@ -174,6 +187,8 @@ export class AppController {
       'outbox',
       'read-cursors',
       'prs-seen',
+      // Private-group keys and membership are this team's secrets (1.2).
+      'groups',
     ]) {
       this.store.deleteSecret(secret)
     }
@@ -328,13 +343,22 @@ export class AppController {
     if (!this.store.readSecretJson('first-seen')) this.store.writeSecretJson('first-seen', Date.now())
 
     this.session = session
-    this.chat = new ChatService(session, this.getWindow, () => this.settings)
+    this.chat = new ChatService(session, this.getWindow, () => this.settings, () => app.getVersion())
     this.chat.setPush((msg) => this.push(msg))
     await this.chat.start()
+    // A session built after the manager already settled (unlock, team change)
+    // would otherwise sit on the constructor default until the next transition.
+    if (this.ioTier) this.chat.setIoTier(this.ioTier.tier, this.ioTier.idleSec)
 
     this.janitor = new Janitor(session)
+    // Channels and groups tombstoned long enough ago that their directories can
+    // go; ChatService holds the folded state that knows when that was (1.2).
+    this.janitor.deletedConvs = () => this.chat?.deletedConvDirs() ?? []
     this.janitor.start()
     this.updates = new UpdateService(session, (msg) => this.push(msg))
+    // A teammate's beacon advertising a newer build raises the update banner —
+    // see UpdateService.notePeerVersion.
+    this.chat.peerVersionHandler = (version, name) => this.updates?.notePeerVersion(version, name)
     this.updates.start()
     // After chat.start(): the PR service materializes its config from the
     // 'team:prs' log the startup catch-up has just filled in.

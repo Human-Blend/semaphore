@@ -3,11 +3,13 @@ import type { Attachment, ConvId, MsgPayload, PresenceView } from '@shared/types
 import { materialize } from '@shared/merge'
 import { RETENTION } from '@shared/constants'
 import { useStore, selfOf } from '@/store'
+import { safeThumbSrc } from '@/content/parse'
 import { Avatar, DeviceChip, formatBytes, formatTime, IconButton } from '@/ui/atoms'
 import { SectionLabel, truncate } from './chrome'
-import { IconFile, IconPin, IconX } from './icons'
+import { IconFile, IconLock, IconPin, IconX } from './icons'
 import { useBeamTarget, BeamLabel } from './beam'
-import { openDm, useDmMap } from './dm'
+import { openDm, useDmMap, useGroupMap } from './dm'
+import { groupMemberRows } from './groupMembers'
 
 // Spec §2.4 — right rail: About / Members / Files / Pinned. Member rows are
 // beam drop targets, same as sidebar DM rows.
@@ -94,9 +96,11 @@ export default function RightRail({
   const events = useStore((s) => s.events[conv])
   const boot = useStore((s) => s.boot)
   const dmPeers = useDmMap((s) => s.peers)
+  const groupMap = useGroupMap()
   const self = selfOf(boot)
 
   const channel = channels.find((c) => c.conv === conv)
+  const group = groupMap[conv]
   const peer = presence.find((p) => p.deviceId === dmPeers[conv])
 
   const { pinnedMsgs, files } = useMemo(() => {
@@ -118,6 +122,29 @@ export default function RightRail({
       .filter((p) => !p.departed)
       .sort((a, b) => rank[a.state] - rank[b.state] || a.name.localeCompare(b.name))
   }, [presence])
+
+  // A group's Members tab is the group's own roster (owner + members), not
+  // the whole team — and unlike the channel/DM roster, it must include the
+  // local device itself (see groupMemberRows). The identity object is built
+  // fresh every render either way (it's cheap) — what matters is that the
+  // memo's dep list names the primitive fields, not that object, so an
+  // unrelated re-render (a new `boot`/`self` reference with the same values)
+  // doesn't defeat the memo by always looking "changed".
+  const groupMembers = useMemo(
+    () =>
+      group
+        ? groupMemberRows(
+            group.members,
+            presence,
+            self
+              ? { deviceId: self.deviceId, name: self.displayName, hostname: self.hostname, fingerprint: self.fingerprint }
+              : null,
+            group.conv,
+          )
+        : [],
+    [group, presence, self?.deviceId, self?.displayName, self?.hostname, self?.fingerprint],
+  )
+  const memberRows = group ? groupMembers : sortedMembers
 
   return (
     <div
@@ -189,6 +216,18 @@ export default function RightRail({
                   </div>
                 </div>
               </>
+            ) : group ? (
+              <div>
+                <SectionLabel style={{ marginBottom: 6 }}>Group</SectionLabel>
+                <div style={{ fontSize: 13, color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <IconLock size={13} /> {group.name}
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 4 }}>
+                  {group.role === 'owner' ? 'You own this group. ' : ''}
+                  Only {group.members.length} people can read it — invites travel as a direct message, so nobody else
+                  on the team can see who's in it. Only the owner can add or remove people.
+                </div>
+              </div>
             ) : (
               <div>
                 <SectionLabel style={{ marginBottom: 6 }}>Conversation</SectionLabel>
@@ -219,10 +258,10 @@ export default function RightRail({
 
         {tab === 'members' && (
           <div role="list" aria-label="Members" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {sortedMembers.map((p) => (
+            {memberRows.map((p) => (
               <MemberRow key={p.deviceId} p={p} isSelf={p.deviceId === self?.deviceId} />
             ))}
-            {!sortedMembers.length && (
+            {!memberRows.length && (
               <div style={{ fontSize: 12, color: 'var(--text-3)', padding: 8 }}>No members seen yet.</div>
             )}
           </div>
@@ -243,9 +282,9 @@ export default function RightRail({
                   background: 'var(--bg-raised)',
                 }}
               >
-                {att.thumb ? (
+                {safeThumbSrc(att.thumb) ? (
                   <img
-                    src={att.thumb}
+                    src={safeThumbSrc(att.thumb)}
                     alt=""
                     style={{ width: 32, height: 32, objectFit: 'cover', borderRadius: 'var(--r-sm)', flexShrink: 0 }}
                   />

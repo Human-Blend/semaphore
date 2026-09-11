@@ -9,6 +9,7 @@ import type {
   AdoResult,
   ConvId,
   Cursor,
+  DiagramBody,
   PresenceView,
   VerifiedEvent,
   BodyEntity,
@@ -49,11 +50,24 @@ export interface ChannelView {
   channelId: string
   name: string
   topic: string
+  /** The team's home channel — can't be renamed or deleted (1.2). */
+  fixed: boolean
 }
 
 export interface DmView {
   conv: ConvId
   peerDeviceId: string
+}
+
+/** A private group this device belongs to (1.2). */
+export interface GroupView {
+  conv: ConvId // grp:<groupId>
+  groupId: string
+  name: string
+  owner: string // deviceId
+  members: string[] // deviceIds, owner included, current epoch
+  epoch: number
+  role: 'owner' | 'member'
 }
 
 export interface HealthView {
@@ -79,7 +93,7 @@ export interface AttachDraft {
 
 export interface SendDraft {
   text: string
-  kind: 'text' | 'code' | 'gif'
+  kind: 'text' | 'code' | 'gif' | 'diagram'
   lang?: string | null
   packId?: string
   entities?: BodyEntity[]
@@ -88,6 +102,8 @@ export interface SendDraft {
   attachments?: AttachDraft[]
   /** Pre-fetched link preview (composer fetches via bridge.links.preview). */
   linkPreview?: LinkPreview
+  /** kind:'diagram' (1.2): the renderer-built scene; oversized scenes ride `attachments` instead. */
+  diagram?: DiagramBody
 }
 
 export type CursorView = Cursor
@@ -129,6 +145,8 @@ export interface ScreenSourceView {
   kind: 'screen' | 'window'
   thumbnailDataUrl: string
   appIconDataUrl?: string
+  /** The primary display — pre-selected in the picker (1.2). */
+  primary?: boolean
 }
 
 export interface ScreenSessionView {
@@ -143,6 +161,24 @@ export interface UpdateView {
   version: string
   notes: string
   blocking: boolean
+  /** 1.2: 'peer' when a teammate's beacon announced a newer build (absent = signed manifest). */
+  source?: 'manifest' | 'peer'
+  /** Who is already on `version` (source 'peer'). */
+  peerName?: string
+  /** False when no verified zip for `version` is in apps/ yet — the banner offers the folder instead of a copy. */
+  zipAvailable?: boolean
+}
+
+/** Live share-traffic readout (1.2) — see IO_BUDGET. */
+export interface ShareStats {
+  sinceMs: number
+  total: number
+  /** Per primitive: readdir / read / stat / publish / delete. */
+  byOp: Record<string, number>
+  /** Logical ops in the trailing 60 s and the derived rate. */
+  lastMinute: number
+  ratePerSec: number
+  tier: 'focused' | 'blurred' | 'idle' | 'paused'
 }
 
 export interface SettingsView {
@@ -162,6 +198,8 @@ export type PushMessage =
   | { kind: 'boot'; boot: BootMode }
   | { kind: 'event'; conv: ConvId; event: VerifiedEvent }
   | { kind: 'channels'; channels: ChannelView[] }
+  // Full replace, like 'channels' (1.2). Groups this device left or that were deleted are absent.
+  | { kind: 'groups'; groups: GroupView[] }
   | { kind: 'presence'; views: PresenceView[] }
   | { kind: 'typing'; conv: ConvId; deviceId: string; until: number }
   | { kind: 'cursors'; conv: ConvId; deviceId: string; cursor: CursorView }
@@ -203,6 +241,8 @@ export interface BridgeApi {
     copyText(text: string): Promise<void>
     showInFolder(path: string): Promise<void>
     setBadge(count: number): Promise<void>
+    /** Reveal <share>/Chat/apps in Finder/Explorer (1.2 — peer-announced updates). */
+    openAppsFolder(): Promise<void>
   }
 
   onboarding: {
@@ -234,6 +274,26 @@ export interface BridgeApi {
     cursors(conv: ConvId): Promise<Record<string, CursorView>>
     /** This device's own read watermarks, persisted across launches. */
     myReads(): Promise<Record<ConvId, string>>
+    /** 1.2: publish a `channel-renamed` sys event (any member; rejects the fixed channel). */
+    renameChannel(conv: ConvId, name: string): Promise<void>
+    /** 1.2: publish a `channel-deleted` tombstone (any member; rejects the fixed channel). */
+    deleteChannel(conv: ConvId): Promise<void>
+  }
+
+  /** Private groups (1.2). Reading is the ordinary event path (chat.events / 'event' pushes). */
+  groups: {
+    list(): Promise<GroupView[]>
+    /** Create with `members` (deviceIds; self is added). Invites go out as DM sys events. */
+    create(name: string, members: string[]): Promise<GroupView>
+    rename(conv: ConvId, name: string): Promise<void>
+    /** Owner only; the current epoch key is sealed to the newcomers (no rotation). */
+    addMembers(conv: ConvId, members: string[]): Promise<void>
+    /** Owner only: rotates to a new epoch key delivered to everyone but `member`. */
+    removeMember(conv: ConvId, member: string): Promise<void>
+    /** Publish `group-left` and forget the keys locally. */
+    leave(conv: ConvId): Promise<void>
+    /** Owner only: publish `group-deleted`; the janitor removes the dir after the grace period. */
+    remove(conv: ConvId): Promise<void>
   }
 
   presence: {
@@ -254,6 +314,15 @@ export interface BridgeApi {
     startDrag(blobId: string, name: string): Promise<void>
     /** Resolve a dropped DOM File to its absolute path (sync, via webUtils). */
     pathForFile(file: File): string
+    /** 1.2: native open-file dialog; `bytes` is base64 (files ≤ 32 MB). */
+    pickFile(opts: {
+      title?: string
+      filters: { name: string; extensions: string[] }[]
+    }): Promise<{ path: string; name: string; bytes: string } | null>
+    /** 1.2: native save dialog for renderer-produced bytes (base64). Resolves the path or null on cancel. */
+    saveBytesAs(suggestedName: string, bytes: string, mime?: string): Promise<string | null>
+    /** 1.2: write renderer-produced bytes (base64) to a staging file under userData, for AttachDraft.path. */
+    stageBytes(name: string, bytes: string): Promise<{ path: string }>
   }
 
   beams: {
@@ -347,5 +416,10 @@ export interface BridgeApi {
 
   update: {
     copyToMachine(): Promise<{ path: string } | { error: string }>
+  }
+
+  /** Diagnostics (1.2). */
+  diag: {
+    shareStats(): Promise<ShareStats>
   }
 }

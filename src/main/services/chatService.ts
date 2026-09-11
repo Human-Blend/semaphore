@@ -16,15 +16,21 @@ import type {
   MsgPayload,
   PresenceView,
   PrsPayload,
+  SysPayload,
   VerifiedEvent,
 } from '@shared/types'
 import type { AttachDraft } from '@shared/bridge'
-import { POLL, TEAM_CONV } from '@shared/constants'
-import { isDmConv, isTeamConv } from '@shared/ids'
+import { DIAGRAM, DIR, TEAM_CONV } from '@shared/constants'
+import { diagramFallbackText, diagramFitsInline, diagramPreview } from '@shared/diagram'
+import { isChanConv, isDmConv, isGrpConv, isTeamConv } from '@shared/ids'
 import { EventStore } from '../transport/events'
 import { BeaconWriter } from '../transport/beacon'
 import { Poller } from '../transport/poller'
+import type { IoTier } from './ioTier'
 import type { Session } from '../transport/session'
+import { fixedChannelId, foldChannelSys, normalizeChannelName } from './channels'
+import { GroupService } from './groups'
+import { notifyLineFor } from './notifyLine'
 
 // Orchestrates the live chat slice: event publishing with an offline outbox,
 // beacon lifecycle, polling, cursors/read receipts, notifications.
@@ -49,6 +55,8 @@ export class ChatService {
   readonly events: EventStore
   readonly beacon: BeaconWriter
   readonly poller: Poller
+  /** Private groups (1.2) — owns their keys, state and sys-event folding. */
+  readonly groups: GroupService
   private remoteCursors = new Map<ConvId, Map<string, CursorView>>()
   private outbox: OutboxItem[] = []
   private push: (msg: PushMessage) => void
@@ -58,15 +66,24 @@ export class ChatService {
   xferHandler: ((deviceId: string, xfers: Record<string, { done: number; total: number }>) => void) | null = null
   /** Set by the blobs service: uploads local files, returns attachment refs. */
   attachmentUploader: ((items: AttachDraft[], conv: ConvId) => Promise<Attachment[]>) | null = null
+  /** Set by the update service (1.2): a verified beacon named a newer build. */
+  peerVersionHandler: ((version: string, name: string) => void) | null = null
+  /** Current share-I/O tier (1.2); `diag:shareStats` reports it. */
+  ioTier: IoTier = 'blurred'
 
   constructor(
     readonly session: Session,
     private getWindow: () => BrowserWindow | null,
     private getSettings: () => SettingsView,
+    /** This build's version, for the beacon's `app` field. Injected for tests. */
+    getAppVersion: () => string = () => '',
   ) {
     this.events = new EventStore(session)
-    this.beacon = new BeaconWriter(session)
+    this.beacon = new BeaconWriter(session, getAppVersion)
     this.poller = new Poller(session, this.events)
+    // Registers itself as the session's `grp:` provider — construct it before
+    // anything can try to read a group conversation.
+    this.groups = new GroupService(session, this)
     this.outbox = session.store.readSecretJson<OutboxItem[]>('outbox') ?? []
     for (const [conv, r] of Object.entries(session.store.readSecretJson<Record<string, ReadMark>>(READS_SECRET) ?? {})) {
       this.readCursors.set(conv as ConvId, r)
@@ -83,6 +100,10 @@ export class ChatService {
 
     this.events.onEvent((conv, event) => {
       this.push({ kind: 'event', conv, event })
+      // Channel rename/delete and every group sys event fold into local state
+      // before the renderer hears about them, so the `channels`/`groups` push
+      // that follows is already the new truth.
+      this.foldSys(conv, event)
       if (event.author !== s.deviceId) {
         // Team logs carry no read receipts — nobody "reads" a calendar.
         if (!isTeamConv(conv)) this.beacon.setCursor(conv, this.ownCursor(conv))
@@ -110,15 +131,20 @@ export class ChatService {
       },
       onDropHint: (from) => this.dropHintHandler?.(from),
       onXfers: (deviceId, xfers) => this.xferHandler?.(deviceId, xfers),
+      onPeerVersion: (version, name) => this.peerVersionHandler?.(version, name),
     }
 
     await s.roster.refresh()
     s.refreshDms()
     await s.loadChannels()
     if (s.channels.size === 0) {
-      await s.createChannel('general', 'Team-wide chat').catch(() => {})
+      // The team's home channel: flagged at creation so every 1.2 client
+      // agrees on which one can never be renamed or deleted.
+      await s.createChannel('general', 'Team-wide chat', { fixed: true }).catch(() => {})
     }
-    for (const ch of s.channels.values()) {
+    // Channels first: a `channel-deleted` folded here closes the conversation,
+    // so the catch-up below skips what the tombstone already retired.
+    for (const ch of [...s.channels.values()]) {
       await this.events.catchUp(s.convIdForChannel(ch.channelId))
     }
     for (const dm of s.dms.values()) {
@@ -128,14 +154,20 @@ export class ChatService {
     for (const conv of Object.values(TEAM_CONV)) {
       await this.events.catchUp(conv)
     }
+    // Private groups: keys come from the DM logs just caught up, so any invite
+    // that arrived while this device was off has already been adopted.
+    await this.groups.settle()
+    await this.groups.catchUpAll()
     // Last launch's watermarks go into the very first beacon; without them
     // every peer's "Read"/"Delivered" would blink back to nothing.
-    for (const ch of s.channels.values()) this.primeCursor(s.convIdForChannel(ch.channelId))
+    for (const ch of s.activeChannels()) this.primeCursor(s.convIdForChannel(ch.channelId))
     for (const dm of s.dms.values()) this.primeCursor(`dm:${dm.pairToken}`)
+    for (const conv of this.groups.convs()) this.primeCursor(conv)
 
     this.beacon.start()
     this.poller.start()
     await this.pushChannels()
+    this.pushGroups()
     this.push({ kind: 'presence', views: this.poller.presenceViews() })
 
     // A backlog left by a previous run. The poller only calls onHealthChange
@@ -155,11 +187,16 @@ export class ChatService {
   // -------------------------------------------------------------------------
 
   channelViews(): ChannelView[] {
-    return [...this.session.channels.values()].map((ch) => ({
+    // Deleted channels are omitted everywhere: the tombstone is the truth, and
+    // the janitor removes the directory once the grace period passes.
+    const alive = this.session.activeChannels()
+    const fixed = fixedChannelId(alive)
+    return alive.map((ch) => ({
       conv: `chan:${ch.channelId}` as ConvId,
       channelId: ch.channelId,
-      name: ch.meta.name,
+      name: ch.name,
       topic: ch.meta.topic,
+      fixed: ch.channelId === fixed,
     }))
   }
 
@@ -167,10 +204,98 @@ export class ChatService {
     this.push({ kind: 'channels', channels: this.channelViews() })
   }
 
+  pushGroups(): void {
+    this.push({ kind: 'groups', groups: this.groups.views() })
+  }
+
+  /** Ring a file we just wrote into the beacon (GroupHost). */
+  noteOwnEvent(conv: ConvId, fileName: string): void {
+    this.beacon.noteOwnEvent(conv, fileName)
+  }
+
   async createChannel(name: string, topic = ''): Promise<ChannelView> {
     const ch = await this.session.createChannel(name, topic)
     await this.pushChannels()
-    return { conv: `chan:${ch.channelId}`, channelId: ch.channelId, name: ch.meta.name, topic: ch.meta.topic }
+    const view = this.channelViews().find((v) => v.channelId === ch.channelId)
+    return view ?? { conv: `chan:${ch.channelId}`, channelId: ch.channelId, name: ch.name, topic: ch.meta.topic, fixed: false }
+  }
+
+  /**
+   * Rename a channel for the whole team (1.2). Any member may do it; the home
+   * channel may not be renamed at all. The name is normalized exactly as the
+   * create field normalizes it, so a rename can never produce a name that
+   * creation would have refused.
+   */
+  async renameChannel(conv: ConvId, name: string): Promise<void> {
+    const ch = this.requireChannel(conv)
+    const clean = normalizeChannelName(name)
+    if (!clean) throw new Error('invalid-name')
+    if (clean === ch.name) return
+    await this.publishChannelSys(conv, 'channel-renamed', { name: clean })
+  }
+
+  /** Tombstone a channel for the whole team (1.2). Never the home channel. */
+  async deleteChannel(conv: ConvId): Promise<void> {
+    this.requireChannel(conv)
+    await this.publishChannelSys(conv, 'channel-deleted', {})
+  }
+
+  private requireChannel(conv: ConvId): { channelId: string; name: string } {
+    if (!isChanConv(conv)) throw new Error('not-a-channel')
+    const ch = this.session.channels.get(conv.slice(5))
+    if (!ch || ch.deletedAt) throw new Error('unknown-channel')
+    if (fixedChannelId(this.session.activeChannels()) === ch.channelId) throw new Error('fixed-channel')
+    return ch
+  }
+
+  private async publishChannelSys(conv: ConvId, kind: 'channel-renamed' | 'channel-deleted', data: Record<string, unknown>): Promise<void> {
+    const ev = await this.events.publish(conv, 'sys', { t: 'sys', conv, kind, data })
+    this.beacon.noteOwnEvent(conv, `${ev.id}.sys.e1`)
+    // The fold ran inside publish (via the event listener); this is the push
+    // that lands the new name — or the disappearance — in the sidebar.
+    await this.pushChannels()
+  }
+
+  /**
+   * Fold a `sys` event into channel or group state. Channel state is folded
+   * here; group state (including the DM-borne invites and rekeys) belongs to
+   * GroupService, which pushes for itself.
+   */
+  private foldSys(conv: ConvId, event: VerifiedEvent): void {
+    if (event.type !== 'sys' && event.type !== 'grp') return
+    if (isChanConv(conv)) {
+      if (event.type !== 'sys') return
+      const ch = this.session.channels.get(conv.slice(5))
+      if (!ch) return
+      // `foldChannelSys` refuses a tombstone for a channel flagged `fixed`;
+      // this is the same refusal for a team created before the flag existed,
+      // where the home channel is whatever the fold computes (oldest, lowest
+      // id). Both clients agree on that answer, so both ignore the event.
+      if (
+        (event.payload as SysPayload).kind === 'channel-deleted' &&
+        fixedChannelId(this.session.activeChannels()) === ch.channelId
+      ) {
+        return
+      }
+      if (!foldChannelSys(ch, event)) return
+      // A channel that just folded to deleted must not keep a local copy of
+      // its log around: it would resurrect the conversation on the next read.
+      if (ch.deletedAt) this.events.forget(conv)
+      void this.pushChannels()
+      return
+    }
+    this.groups.onEvent(conv, event)
+  }
+
+  /**
+   * Conversation directories whose tombstone has aged out — handed to the
+   * janitor, which does the deleting (one writer, idempotent).
+   */
+  deletedConvDirs(): { rel: string; deletedAt: number }[] {
+    const out = [...this.session.channels.values()]
+      .filter((c) => c.deletedAt)
+      .map((c) => ({ rel: `${DIR.channels}/${c.token}`, deletedAt: c.deletedAt! }))
+    return [...out, ...this.groups.deletedDirs()]
   }
 
   dmFor(peerDeviceId: string): DmView | null {
@@ -190,6 +315,20 @@ export class ChatService {
 
   async send(conv: ConvId, draft: SendDraft): Promise<{ id: string }> {
     const s = this.session
+    // A diagram's scene either rides inside the event (small, 180-day life) or
+    // goes to the blob store as a `.excalidraw` attachment (7-day life). The
+    // renderer has already made that call — it is the only side that knows the
+    // compressed size — so all that is left here is to hold it to the limits
+    // and write the pre-1.2 fallback line.
+    const diagram = draft.kind === 'diagram' ? draft.diagram : undefined
+    if (draft.kind === 'diagram' && !diagram) throw new Error('diagram-missing')
+    if (diagram?.data) {
+      if (diagram.data.length > DIAGRAM.maxInlineBytes) throw new Error('diagram-too-large')
+      if (!diagramFitsInline(diagram.data.length, diagram.thumb?.length ?? 0)) {
+        throw new Error('diagram-too-large')
+      }
+    }
+
     let attachments: Attachment[] | undefined
     if (draft.attachments?.length) {
       if (!this.attachmentUploader) throw new Error('files-not-ready')
@@ -203,10 +342,13 @@ export class ChatService {
       sentWall: Date.now(),
       body: {
         kind: draft.kind,
-        text: draft.text,
+        // `draft.text` is the diagram's title; the body text is what a 1.1.x
+        // client prints in its place, so it has to name the diagram itself.
+        text: diagram ? diagramFallbackText(draft.text) : draft.text,
         lang: draft.lang,
         packId: draft.packId,
         entities: draft.entities,
+        diagram,
       },
       replyTo: draft.replyTo,
       attachments,
@@ -247,6 +389,10 @@ export class ChatService {
       this.beacon.noteOwnEvent(item.conv, `${ev.id}.${item.type}.e1`)
       return ev
     } catch (err) {
+      // A conversation that no longer exists (a deleted channel, a group we
+      // left) is not a share outage: queueing it would retry forever and hold
+      // up everything behind it. Fail the call instead.
+      if (err instanceof Error && err.message.startsWith('unknown conversation')) throw err
       this.outbox.push(item)
       try {
         this.session.store.writeSecretJson('outbox', this.outbox)
@@ -328,7 +474,10 @@ export class ChatService {
     if (win?.isFocused()) return // in-app treatment only
     const settings = this.getSettings()
     const p = event.payload as MsgPayload
-    const isDm = isDmConv(conv)
+    // A private group is a conversation you were personally invited into, so
+    // it notifies like a DM rather than obeying the channel preference.
+    const isGrp = isGrpConv(conv)
+    const isDm = isDmConv(conv) || isGrp
     const mentioned = (p.body.entities ?? []).some(
       (e) => e.type === 'mention' && (e.special === 'here' || e.device === this.session.deviceId),
     )
@@ -338,15 +487,27 @@ export class ChatService {
 
     const entry = this.session.roster.get(event.author)
     const who = entry ? `${p.author.name}` : 'Someone'
-    const chName = !isDm ? this.session.channels.get(conv.slice(5))?.meta.name : null
-    const title = settings.notifyPreviews ? (isDm ? who : `${who} in #${chName ?? 'channel'}`) : 'Chat'
-    const body = settings.notifyPreviews
-      ? p.body.kind === 'gif'
-        ? 'sent a GIF'
-        : p.body.text.slice(0, 140)
-      : isDm
-        ? 'New direct message'
-        : 'New message'
+    const chName = !isDm ? this.session.channels.get(conv.slice(5))?.name : null
+    const grpName = isGrp ? (this.groups.nameOf(conv) ?? 'private group') : null
+    // The wording matrix (three conversation kinds x previews on/off) is a pure
+    // function and lives in notifyLine.ts, where it is unit-tested; what stays
+    // here is everything that needs this service — who, which conversation, and
+    // the one-line preview of the body.
+    const { title, body } = notifyLineFor({
+      kind: isGrp ? 'grp' : isDmConv(conv) ? 'dm' : 'chan',
+      who,
+      convName: isGrp ? grpName : chName,
+      previews: settings.notifyPreviews,
+      // A diagram's `body.text` is the sentence written FOR 1.1 clients
+      // ("…— update Chat to view it"); showing that to a 1.2 user tells them to
+      // update the app they are already running. Name the diagram instead.
+      snippet:
+        p.body.kind === 'gif'
+          ? 'sent a GIF'
+          : p.body.kind === 'diagram'
+            ? diagramPreview(p.body.text)
+            : p.body.text.slice(0, 140),
+    })
     const n = new Notification({ title, body, silent: false })
     n.on('click', () => {
       win?.show()
@@ -356,7 +517,17 @@ export class ChatService {
     n.show()
   }
 
-  focusPollRate(focused: boolean): void {
-    this.poller.intervalMs = focused ? POLL.focusedMs : POLL.backgroundMs
+  /**
+   * Move the whole read side to an I/O tier (1.2). The poller changes cadence
+   * (and stops dead when paused), the beacon changes heartbeat and starts
+   * telling peers the truth about idleness, and coming back from paused/idle
+   * costs one immediate beacon so nobody sees a ghost.
+   */
+  setIoTier(tier: IoTier, idleSec = 0): void {
+    this.ioTier = tier
+    // Both of these publish/tick once on a real tier change and do nothing on a
+    // repeat — coming back from a locked screen must not cost two beacons.
+    this.poller.setTier(tier)
+    this.beacon.setTier(tier, idleSec)
   }
 }

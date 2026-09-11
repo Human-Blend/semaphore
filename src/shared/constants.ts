@@ -24,6 +24,9 @@ export const DIR = {
   // top-level dir so the janitor's 180-day day-dir sweep (channels/, dm/ only)
   // never touches it — a birthday entered two years ago must survive.
   team: 'team',
+  // Private groups (1.2): one opaque dir per group, `<token>/events/<day>/…`
+  // like a channel but with no metadata file — the invite carries it.
+  groups: 'groups',
   blobs: 'blobs',
   blobsTmp: 'blobs/tmp',
   drops: 'drops',
@@ -51,6 +54,18 @@ export const POLL = {
   focusedMs: 1000,
   defaultMs: 1500,
   backgroundMs: 3000,
+  /** 1.2 idle tier: no input for `idleAfterMs` (powerMonitor) → slow ticks; locked/suspended → paused. */
+  idleMs: 15_000,
+  idleAfterMs: 3 * 60_000,
+  /** Blanket catch-up sweep (every conv's day dirs) per tier — heads carry the common case. */
+  sweepFocusedMs: 60_000,
+  sweepBlurredMs: 3 * 60_000,
+  sweepIdleMs: 10 * 60_000,
+  /** drops/<self> inbox scan; the beacon `drops` hint triggers an immediate one. */
+  dropsInboxMs: 30_000,
+  dropsInboxIdleMs: 5 * 60_000,
+  /** rtc/ polling stops this long after the last signal or session. */
+  rtcIdleOutMs: 2 * 60_000,
   /** rtc/ dir cadence while a handshake or live session involves this device. */
   rtcFastMs: 500,
   /** screens/<session> cadence for frame-relay viewers. */
@@ -68,6 +83,8 @@ export const POLL = {
 export const BEACON = {
   heartbeatMs: 20_000,
   heartbeatJitterMs: 3_000,
+  /** Idle tier heartbeat — still < PRESENCE.offlineAfterMs, so 1.1 readers show "away", not "offline". */
+  idleHeartbeatMs: 45_000,
   typingBumpMinMs: 3_000,
   typingTtlMs: 5_000,
   cursorCoalesceMs: 5_000,
@@ -152,6 +169,8 @@ export const RETENTION = {
   tmpHours: 24,
   departedBeaconDays: 30,
   janitorClaimHours: 24,
+  /** A deleted channel/group dir is removed by the janitor this long after its tombstone (1.2). */
+  deletedConvGraceDays: 3,
 } as const
 
 export const JANITOR = {
@@ -198,6 +217,7 @@ export const HKDF_INFO = {
   meta: 'smbchat/v1/meta', // dir tokens — derived from epoch-1 TMK, stable across rotations
   dmRoot: 'smbchat/v1/dm-root',
   dmDirToken: 'dirtoken',
+  grpDirToken: 'grp-dirtoken',
 } as const
 
 /** kid (key id) string builders — never contain secret material. */
@@ -207,6 +227,8 @@ export const KID = {
   conv: (epoch: number, convToken: string) => `e${epoch}/conv/${convToken}`,
   epochs: (epoch: number) => `e${epoch}/epochs`,
   dm: (pairToken: string) => `dm/${pairToken}`,
+  /** Private group (1.2): the epoch is in the kid so a reader knows which key a record wants. */
+  grp: (groupToken: string, epoch: number) => `grp/${groupToken}/e${epoch}`,
   blob: (blobIdHex: string) => `blob/${blobIdHex}`,
   seal: (deviceId: string) => `seal/${deviceId.slice(0, 8)}`,
   local: (purpose: string) => `local/${purpose}`,
@@ -218,6 +240,31 @@ export const FILE_EXT = {
   signal: '.sig',
   blob: '.blob',
   partial: '.partial',
+} as const
+
+/** Diagrams (1.2). */
+export const DIAGRAM = {
+  /** Compressed scene bytes above this go to the blob store instead of inline. */
+  maxInlineBytes: 120 * 1024,
+  mime: 'application/vnd.excalidraw+json',
+  ext: '.excalidraw',
+} as const
+
+/**
+ * Share I/O budget per client (1.2), in logical share operations per minute
+ * (one readdir, read, stat, or publish counts as one) with a team of ~5 and
+ * nobody chatting. `poller.test.ts` asserts these; Settings shows the live rate.
+ *
+ * Idle and blurred were raised from 12/42 once the harness existed — the
+ * originals sat exactly on the arithmetic floor of POLL.idleMs + four peers'
+ * BEACON.idleHeartbeatMs + this device's own beacon, leaving nothing for the
+ * blanket sweep, the drops inbox or the calibration stat. See
+ * docs/contract-changes-1.2.md for the derivation and the measured numbers.
+ */
+export const IO_BUDGET = {
+  idleOpsPerMin: 16,
+  blurredOpsPerMin: 48,
+  focusedOpsPerMin: 96,
 } as const
 
 export const APP = {

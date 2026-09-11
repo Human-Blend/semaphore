@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { DIR, DST, FILE_EXT, KID } from '@shared/constants'
 import type { ChannelMeta, ConvId, ProtocolFile, SignedRecord, TeamConfig } from '@shared/types'
-import { isChanConv, isTeamConv } from '@shared/ids'
+import { isChanConv, isGrpConv, isTeamConv } from '@shared/ids'
 import { newHlcState, type HlcState } from '@shared/hlc'
 import { buildAad, decryptRecord, encryptRecord } from '../crypto/envelope'
 import {
@@ -26,6 +26,17 @@ export interface ChannelState {
   token: string
   meta: ChannelMeta
   key: Buffer
+  /**
+   * Current name (1.2): `meta.name` folded with every `channel-renamed` sys
+   * event, LWW by event id. The metadata file is never rewritten — clients
+   * read it once and cache it, so a rewrite would reach nobody.
+   */
+  name: string
+  /** Author of the winning rename, and its event id (LWW bookkeeping). */
+  renamedBy?: string
+  renameStem?: string
+  /** Set by a folded `channel-deleted` tombstone — sticky: a later rename never resurrects. */
+  deletedAt?: number
 }
 
 export interface DmState {
@@ -45,6 +56,50 @@ export interface TeamState {
   key: Buffer
 }
 
+/** Where a conversation's log lives and what unlocks it. */
+export interface ConvInfo {
+  key: Buffer
+  eventsDir: string
+  kid: string
+  scope: string
+}
+
+/**
+ * Result of routing one group record to a key by the epoch named in its kid.
+ * `unknown-epoch` is not a failure: the rekey DM that carries that key may
+ * still be in flight, so the reader parks the file instead of quarantining it.
+ */
+export type GroupKeyLookup = { kind: 'key'; key: Buffer } | { kind: 'unknown-epoch' } | { kind: 'reject' }
+
+/**
+ * Private groups (1.2) live outside the team key hierarchy: their keys arrive
+ * as DM sys events, so the session can only answer `grp:` questions through
+ * the GroupService, which registers itself here at construction.
+ */
+export interface GroupProvider {
+  /** Conv info at the group's current epoch; null when unknown, left or deleted. */
+  info(conv: ConvId): ConvInfo | null
+  /** Key for the epoch named in a record's kid. */
+  keyForKid(conv: ConvId, kid: string): GroupKeyLookup
+  /**
+   * When this record's epoch stopped being current, if it is a former member's
+   * write under a retired key — else null. The verdict is the caller's: a
+   * filename stem is chosen by its writer, so only the file's own mtime can say
+   * whether it landed after the rotation (see EventStore.ingestFile).
+   */
+  staleWriteCut(conv: ConvId, kid: string, author: string): string | null
+  /** Folded membership test — a beacon section from a former member is not news. */
+  isMember(conv: ConvId, deviceId: string): boolean
+  /** Opaque directory token of a group we hold keys for. */
+  token(conv: ConvId): string | null
+  /** Reverse lookup for beacon sections: dir token → conv id. */
+  convForToken(token: string): ConvId | null
+  /** Every epoch key we hold, newest first (beacon sections carry no epoch hint). */
+  keys(conv: ConvId): Buffer[]
+  /** Live groups (not left, not deleted) — the poller's catch-up list. */
+  convs(): ConvId[]
+}
+
 export class Session {
   readonly hlc: HlcState = newHlcState()
   readonly channels = new Map<string, ChannelState>() // channelId -> state
@@ -53,6 +108,8 @@ export class Session {
   readonly dmsByToken = new Map<string, DmState>()
   /** Derived lazily per team conv id; HKDF is cheap but convInfo() is hot. */
   private teams = new Map<string, TeamState>()
+  /** Private groups (1.2) — set by GroupService; null before it loads. */
+  groups: GroupProvider | null = null
   readonly keys: TeamKeys
   /** Per-conversation monotonic sequence for our own messages (gap detection). */
   private senderSeqs: Record<string, number>
@@ -114,6 +171,7 @@ export class Session {
         channelId: meta.channelId,
         token,
         meta,
+        name: meta.name,
         key: deriveConvKey(this.tmk, this.teamSalt, this.proto.epoch, meta.channelId),
       }
       this.channels.set(meta.channelId, state)
@@ -124,7 +182,12 @@ export class Session {
     }
   }
 
-  async createChannel(name: string, topic = ''): Promise<ChannelState> {
+  /**
+   * `fixed` is written once, by the bootstrap `general` creation (1.2): the
+   * team's home channel can never be renamed or deleted. Teams created before
+   * 1.2 carry no flag anywhere — readers then fall back to the oldest channel.
+   */
+  async createChannel(name: string, topic = '', opts?: { fixed?: true }): Promise<ChannelState> {
     const channelId = randomBytes(4).toString('hex')
     const token = convToken(this.keys.kMeta, channelId)
     const meta: ChannelMeta = {
@@ -134,6 +197,7 @@ export class Session {
       topic,
       creator: this.deviceId,
       created: this.io.calibratedNow(),
+      ...(opts?.fixed ? { fixed: true as const } : {}),
     }
     const signed = signRecord(this.identity, DST.record, meta)
     const rel = `${DIR.channels}/${token}/channel.json${FILE_EXT.record}`
@@ -144,11 +208,17 @@ export class Session {
       channelId,
       token,
       meta,
+      name,
       key: deriveConvKey(this.tmk, this.teamSalt, this.proto.epoch, channelId),
     }
     this.channels.set(channelId, state)
     this.channelsByToken.set(token, state)
     return state
+  }
+
+  /** Channels that still exist — a folded tombstone hides one everywhere. */
+  activeChannels(): ChannelState[] {
+    return [...this.channels.values()].filter((c) => !c.deletedAt)
   }
 
   // -------------------------------------------------------------------------
@@ -194,10 +264,12 @@ export class Session {
     return state
   }
 
-  convInfo(conv: ConvId): { key: Buffer; eventsDir: string; kid: string; scope: string } | null {
+  convInfo(conv: ConvId): ConvInfo | null {
     if (isChanConv(conv)) {
       const ch = this.channels.get(conv.slice(5))
-      if (!ch) return null
+      // A tombstoned channel is closed for reading and writing alike: the
+      // events are on their way out and nothing new belongs in them.
+      if (!ch || ch.deletedAt) return null
       return {
         key: ch.key,
         eventsDir: `${DIR.channels}/${ch.token}/events`,
@@ -214,6 +286,7 @@ export class Session {
         scope: 'team',
       }
     }
+    if (isGrpConv(conv)) return this.groups?.info(conv) ?? null
     const dm = this.dmsByToken.get(conv.slice(3))
     if (!dm) return null
     return {

@@ -29,6 +29,7 @@ const bridge: BridgeApi = {
     copyText: (text) => invoke('app:copyText', text),
     showInFolder: (path) => invoke('app:showInFolder', path),
     setBadge: (count) => invoke('app:setBadge', count),
+    openAppsFolder: () => invoke('app:openAppsFolder'),
   },
 
   onboarding: {
@@ -52,6 +53,18 @@ const bridge: BridgeApi = {
     setTyping: (conv) => invoke('chat:setTyping', conv),
     cursors: (conv) => invoke('chat:cursors', conv),
     myReads: () => invoke('chat:myReads'),
+    renameChannel: (conv, name) => invoke('chat:renameChannel', conv, name),
+    deleteChannel: (conv) => invoke('chat:deleteChannel', conv),
+  },
+
+  groups: {
+    list: () => invoke('groups:list'),
+    create: (name, members) => invoke('groups:create', name, members),
+    rename: (conv, name) => invoke('groups:rename', conv, name),
+    addMembers: (conv, members) => invoke('groups:addMembers', conv, members),
+    removeMember: (conv, member) => invoke('groups:removeMember', conv, member),
+    leave: (conv) => invoke('groups:leave', conv),
+    remove: (conv) => invoke('groups:remove', conv),
   },
 
   presence: {
@@ -69,6 +82,9 @@ const bridge: BridgeApi = {
     saveBlobAs: (blobId, suggestedName) => invoke('files:saveBlobAs', blobId, suggestedName),
     startDrag: (blobId, name) => invoke('files:startDrag', blobId, name),
     pathForFile: (file) => webUtils.getPathForFile(file),
+    pickFile: (opts) => invoke('files:pickFile', opts),
+    saveBytesAs: (suggestedName, bytes, mime) => invoke('files:saveBytesAs', suggestedName, bytes, mime),
+    stageBytes: (name, bytes) => invoke('files:stageBytes', name, bytes),
   },
 
   beams: {
@@ -132,6 +148,10 @@ const bridge: BridgeApi = {
 
   update: {
     copyToMachine: () => invoke('update:copyToMachine'),
+  },
+
+  diag: {
+    shareStats: () => invoke('diag:shareStats'),
   },
 }
 

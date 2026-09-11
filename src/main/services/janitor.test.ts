@@ -8,14 +8,16 @@ import { SWEEP_EVENT_ROOTS } from './janitor'
 // future "sweep every conv scope" refactor fails here instead of on a share.
 
 describe('janitor sweep roots', () => {
-  it('sweeps channels and dms', () => {
+  it('sweeps channels, dms and private groups', () => {
     expect(SWEEP_EVENT_ROOTS).toContain(DIR.channels)
     expect(SWEEP_EVENT_ROOTS).toContain(DIR.dm)
+    // Private groups (1.2) are ordinary chatter and age out like the rest.
+    expect(SWEEP_EVENT_ROOTS).toContain(DIR.groups)
   })
 
   it('never sweeps the team log dir', () => {
     expect(SWEEP_EVENT_ROOTS).not.toContain(DIR.team)
-    expect(SWEEP_EVENT_ROOTS).toEqual([DIR.channels, DIR.dm])
+    expect(SWEEP_EVENT_ROOTS).toEqual([DIR.channels, DIR.dm, DIR.groups])
   })
 
   it('never sweeps apps/', () => {

@@ -16,6 +16,16 @@ export class SignalService {
   private mode: 'fast' | 'idle' = 'idle'
   private seq = 0
   private seen = new Set<string>()
+  /**
+   * When rtc/ polling stops entirely (1.2). Before, an app that had screen-
+   * shared once kept listing rtc/ every 3 s for the rest of the session — 20
+   * readdirs a minute forever, for a directory that is empty except during a
+   * handshake. Every path that expects an incoming signal (`screen:start`,
+   * `screen:join`, `watchSession`) calls setPollMode('fast') first, which
+   * restarts the loop; anything received or sent extends the window.
+   */
+  private idleOutAt = 0
+  private stopped = false
 
   constructor(
     private session: Session,
@@ -23,21 +33,37 @@ export class SignalService {
   ) {}
 
   start(): void {
+    this.extendIdleOut()
     this.schedule()
   }
 
   stop(): void {
+    this.stopped = true
     if (this.timer) clearTimeout(this.timer)
+    this.timer = null
   }
 
   setPollMode(mode: 'fast' | 'idle'): void {
-    if (this.mode === mode) return
+    this.extendIdleOut()
+    if (this.mode === mode && this.timer) return
     this.mode = mode
     if (this.timer) clearTimeout(this.timer)
+    this.timer = null
     this.schedule()
   }
 
+  private extendIdleOut(): void {
+    this.idleOutAt = Date.now() + POLL.rtcIdleOutMs
+  }
+
   private schedule(): void {
+    if (this.stopped) return // a service replaced on a team change must stay dead
+    // 'fast' means a handshake or a live session is in flight — never idle out
+    // from under it; only the slow listening mode gives up.
+    if (this.mode !== 'fast' && Date.now() >= this.idleOutAt) {
+      this.timer = null
+      return
+    }
     const interval = this.mode === 'fast' ? POLL.rtcFastMs : POLL.defaultMs * 2
     this.timer = setTimeout(async () => {
       try {
@@ -73,6 +99,9 @@ export class SignalService {
       aad,
     )
     await s.io.publish(rel, buf)
+    // We just spoke; an answer is likely on its way.
+    this.extendIdleOut()
+    if (!this.timer) this.schedule()
   }
 
   private async poll(): Promise<void> {
@@ -93,6 +122,7 @@ export class SignalService {
         const author = s.roster.get(signed.by) ?? (await s.roster.loadOne(signed.by))
         if (!author || !verifyRecord(signed, DST.rtc, author.edPubKey)) continue
         if (!signed.by.startsWith(parsed.from8)) continue
+        this.extendIdleOut()
         this.push({ kind: 'rtc-signal', signal: signed.p })
       } catch {
         // not for us / corrupt — leave for the janitor

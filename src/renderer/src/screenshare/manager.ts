@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ConvId, RtcSignal, ScreenshareAnnounce, SysPayload, VerifiedEvent } from '@shared/types'
+import type { ScreenSourceView } from '@shared/bridge'
 import { FRAME, RTC } from '@shared/constants'
 
 // Screen-share runtime: presenter capture + mesh answering + frame pipeline;
@@ -19,8 +20,20 @@ export interface ViewingState {
   streamId: string | null
 }
 
+export interface SharingState {
+  sessionId: string
+  conv: ConvId
+  viewers: number
+  liveViewers: number
+  /** Name of the chosen source, for the presenter banner (1.2). */
+  sourceName: string
+  /** Cross-checked against the actual capture (`getSettings().displaySurface`),
+   *  not just the picked source's kind — see `resolveSourceKind`. */
+  sourceKind: 'screen' | 'window'
+}
+
 interface ScreenState {
-  sharing: { sessionId: string; conv: ConvId; viewers: number; liveViewers: number } | null
+  sharing: SharingState | null
   viewing: ViewingState | null
   pickerOpen: ConvId | null
   permissionPanel: boolean
@@ -105,34 +118,69 @@ async function waitGathering(pc: RTCPeerConnection, timeoutMs = 1000): Promise<v
 // ---------------------------------------------------------------------------
 // Presenter
 
+/**
+ * A uniform-color capture PNG-compresses to a fraction of the size a real
+ * desktop or window snapshot does (menu bars, docks, wallpaper detail, text —
+ * all of that costs bytes; flat color doesn't). There's no cheap way to
+ * decode actual pixels here without a native image dependency (forbidden —
+ * see CLAUDE.md's zero-native-modules rule), so compressed size is the
+ * signal: below the ceiling, treat the thumbnail as blank.
+ */
+const BLANK_THUMBNAIL_BYTE_CEILING = 1200
+
+export function looksBlankThumbnail(dataUrl: string): boolean {
+  const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0
+  const bytes = Math.floor((b64.length * 3) / 4) - padding
+  return bytes > 0 && bytes < BLANK_THUMBNAIL_BYTE_CEILING
+}
+
+export function allScreensLookBlank(sources: readonly Pick<ScreenSourceView, 'kind' | 'thumbnailDataUrl'>[]): boolean {
+  const screens = sources.filter((s) => s.kind === 'screen')
+  return screens.length > 0 && screens.every((s) => looksBlankThumbnail(s.thumbnailDataUrl))
+}
+
+/**
+ * macOS-only decision: block the picker behind the permission explainer
+ * instead of a grid of (possibly wallpaper-only, possibly literally blank)
+ * thumbnails. Only ever consulted *after* `listSources()` has already run —
+ * see the comment in `startShare` — never before an attempt.
+ */
+export function shouldShowPermissionPanel(
+  isMacPlatform: boolean,
+  permission: string,
+  sources: readonly Pick<ScreenSourceView, 'kind' | 'thumbnailDataUrl'>[],
+): boolean {
+  if (!isMacPlatform) return false
+  if (permission !== 'granted') return true
+  return allScreensLookBlank(sources)
+}
+
 export async function startShare(conv: ConvId): Promise<void> {
   // Never gate on getMediaAccessStatus BEFORE attempting a capture: macOS only
-  // lists an app under Privacy → Screen Recording once it has actually tried to
-  // capture. Checking-then-bailing sent people to a Settings pane where
-  // Semaphore wasn't listed at all (they'd only find it under Microphone).
-  // On macOS 15+ the native ScreenCaptureKit picker handles the grant itself.
-  const { sources, systemPicker } = await window.bridge.screen.sources()
-  if (systemPicker) {
-    await beginCapture(conv, null)
-    return
-  }
-  if (sources.length > 0) {
-    useScreenStore.setState({ pickerOpen: conv })
-    return // picker calls beginCapture(conv, sourceId)
-  }
-  // Enumeration returned nothing — the OS blocked it. Now the app is
-  // registered with TCC, so the Settings pane will actually list it.
-  const perm = await window.bridge.screen.permission()
-  if (perm === 'denied' || perm === 'restricted') {
+  // lists an app under Privacy → Screen Recording once it has actually tried
+  // to capture — the desktopCapturer enumeration inside `sources()` below IS
+  // that attempt. Checking first sent people to a Settings pane where Chat
+  // wasn't listed at all. Chat's own picker is used on every platform and
+  // macOS version now (1.2) — no more native system-picker branch.
+  const [{ sources }, permission] = await Promise.all([
+    window.bridge.screen.sources(),
+    window.bridge.screen.permission(),
+  ])
+  if (shouldShowPermissionPanel(window.bridge.platform === 'darwin', permission, sources)) {
     useScreenStore.setState({ permissionPanel: true })
     return
   }
-  await beginCapture(conv, null)
+  useScreenStore.setState({ pickerOpen: conv })
+  // picker calls beginCapture(conv, source)
 }
 
-export async function beginCapture(conv: ConvId, sourceId: string | null): Promise<void> {
+export async function beginCapture(
+  conv: ConvId,
+  source: Pick<ScreenSourceView, 'id' | 'name' | 'kind'> | null,
+): Promise<void> {
   useScreenStore.setState({ pickerOpen: null })
-  if (sourceId) await window.bridge.screen.primeSource(sourceId)
+  if (source) await window.bridge.screen.primeSource(source.id)
   let stream: MediaStream
   try {
     stream = await navigator.mediaDevices.getDisplayMedia({
@@ -165,10 +213,44 @@ export async function beginCapture(conv: ConvId, sourceId: string | null): Promi
   nonceBase = b64ToBytes(nb)
   frameSeq = 0
   frameQuality = FRAME.quality
-  useScreenStore.setState({ sharing: { sessionId, conv, viewers: 0, liveViewers: 0 } })
+  useScreenStore.setState({
+    sharing: {
+      sessionId,
+      conv,
+      viewers: 0,
+      liveViewers: 0,
+      sourceName: source?.name ?? 'your screen',
+      sourceKind: resolveSourceKind(source?.kind ?? 'screen', settings.displaySurface),
+    },
+  })
   await window.bridge.frames.watchViewers(sessionId, true)
   startFramePipeline(sessionId, stream)
   track.addEventListener('ended', () => void stopShare()) // OS-side revoke / stop
+}
+
+/**
+ * `getSettings().displaySurface` reflects what was actually captured, which
+ * is the ground truth if it disagrees with the source the user picked (e.g.
+ * platform quirks around full-screen windows). Falls back to the picked
+ * source's own kind when the browser doesn't report a surface.
+ */
+export function resolveSourceKind(pickedKind: 'screen' | 'window', displaySurface?: string): 'screen' | 'window' {
+  if (displaySurface === 'monitor') return 'screen'
+  if (displaySurface === 'window' || displaySurface === 'application' || displaySurface === 'browser') return 'window'
+  return pickedKind
+}
+
+/** Presenter banner text — "Sharing Display 1" / "Sharing window: Xcode". */
+export function presenterLabel(sourceName: string, sourceKind: 'screen' | 'window'): string {
+  return sourceKind === 'screen' ? `Sharing ${sourceName}` : `Sharing window: ${sourceName}`
+}
+
+/** Stop the current share and reopen the picker for the same conversation. */
+export async function switchSource(): Promise<void> {
+  const conv = useScreenStore.getState().sharing?.conv
+  if (!conv) return
+  await stopShare()
+  useScreenStore.setState({ pickerOpen: conv })
 }
 
 function startFramePipeline(sessionId: string, stream: MediaStream): void {

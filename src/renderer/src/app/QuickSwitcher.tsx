@@ -5,7 +5,7 @@ import { TEAM_CONV } from '@shared/constants'
 import { useStore, selfOf } from '@/store'
 import { Avatar, identityHue } from '@/ui/atoms'
 import { modKey, truncate } from './chrome'
-import { IconCalendar, IconGitPull, IconSearch } from './icons'
+import { IconCalendar, IconGitPull, IconLock, IconSearch } from './icons'
 import { openDm } from './dm'
 
 // Sidebar quick switcher (spec §2.2.2): ⌘K/Ctrl-K focuses it; fuzzy-matches
@@ -13,7 +13,7 @@ import { openDm } from './dm'
 
 interface Item {
   key: string
-  kind: 'channel' | 'person' | 'team'
+  kind: 'channel' | 'person' | 'team' | 'group'
   label: string
   sub: string
   conv?: ConvId
@@ -47,6 +47,7 @@ function fuzzyScore(query: string, text: string): number | null {
 
 export default function QuickSwitcher() {
   const channels = useStore((s) => s.channels)
+  const groups = useStore((s) => s.groups)
   const presence = useStore((s) => s.presence)
   const boot = useStore((s) => s.boot)
   const setActiveConv = useStore((s) => s.setActiveConv)
@@ -82,6 +83,11 @@ export default function QuickSwitcher() {
       if (s !== null)
         out.push({ key: `t:${t.conv}`, kind: 'team', label: t.label, sub: t.sub, conv: t.conv, icon: t.icon, score: s + 0.5 })
     }
+    for (const g of groups) {
+      const s = fuzzyScore(q, g.name)
+      if (s !== null)
+        out.push({ key: `g:${g.conv}`, kind: 'group', label: g.name, sub: 'private group', conv: g.conv, score: s + 0.5 })
+    }
     for (const p of presence) {
       if (p.deviceId === self?.deviceId || p.departed) continue
       const s = fuzzyScore(q, p.name) ?? fuzzyScore(q, p.hostname)
@@ -97,14 +103,14 @@ export default function QuickSwitcher() {
     }
     out.sort((a, b) => b.score - a.score)
     return out.slice(0, 8)
-  }, [q, channels, presence, self?.deviceId])
+  }, [q, channels, groups, presence, self?.deviceId])
 
   useEffect(() => {
     setSel(0)
   }, [q])
 
   function openItem(it: Item) {
-    if ((it.kind === 'channel' || it.kind === 'team') && it.conv) setActiveConv(it.conv)
+    if ((it.kind === 'channel' || it.kind === 'team' || it.kind === 'group') && it.conv) setActiveConv(it.conv)
     else if (it.peerDeviceId) void openDm(it.peerDeviceId)
     setQ('')
     inputRef.current?.blur()
@@ -206,7 +212,7 @@ export default function QuickSwitcher() {
               title={
                 it.kind === 'channel'
                   ? `Open #${it.label}`
-                  : it.kind === 'team'
+                  : it.kind === 'team' || it.kind === 'group'
                     ? `Open ${it.label}`
                     : `Message ${it.label}`
               }
@@ -253,6 +259,21 @@ export default function QuickSwitcher() {
                   }}
                 >
                   {it.icon}
+                </span>
+              ) : it.kind === 'group' ? (
+                <span
+                  aria-hidden="true"
+                  style={{
+                    width: 20,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: identityHue(it.label),
+                    filter: 'saturate(0.6)',
+                    flexShrink: 0,
+                  }}
+                >
+                  <IconLock size={14} />
                 </span>
               ) : (
                 <Avatar name={it.label} size={20} />

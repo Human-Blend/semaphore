@@ -32,7 +32,11 @@ export function base36ToSeq(s: string): number {
 // ---------------------------------------------------------------------------
 // Event file naming: "<hlcMs 13>-<ctr 4>-<deviceId8>.<type>.e1"
 
-const EVENT_RE = /^(\d{13})-(\d{4})-([0-9a-f]{8})\.(msg|edt|del|rct|pin|sys|prv|cal|prs)\.e1$/
+// `grp` (1.2) is last on purpose: a 1.1 client's copy of this pattern does not
+// list it, so a `.grp.e1` file simply doesn't parse there and is skipped in
+// silence — which is exactly what we want a private-group notice to do on an
+// old client, rather than render as a blank sys row.
+const EVENT_RE = /^(\d{13})-(\d{4})-([0-9a-f]{8})\.(msg|edt|del|rct|pin|sys|prv|cal|prs|grp)\.e1$/
 
 export function eventFileName(hlcMs: number, ctr: number, deviceId: string, type: EventType): string {
   return `${String(hlcMs).padStart(13, '0')}-${String(ctr).padStart(4, '0')}-${deviceId.slice(0, 8)}.${type}${FILE_EXT.record}`
@@ -73,6 +77,10 @@ export function isChanConv(conv: string): conv is `chan:${string}` {
 
 export function isDmConv(conv: string): conv is `dm:${string}` {
   return conv.startsWith('dm:')
+}
+
+export function isGrpConv(conv: string): conv is `grp:${string}` {
+  return conv.startsWith('grp:')
 }
 
 // ---------------------------------------------------------------------------

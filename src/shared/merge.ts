@@ -3,6 +3,7 @@ import type {
   ConvId,
   EdtPayload,
   DelPayload,
+  GrpPayload,
   LinkPreview,
   MsgBody,
   MsgPayload,
@@ -138,6 +139,22 @@ export function materialize(events: VerifiedEvent[], admins: string[] = []): Mat
       case 'sys': {
         const s = p as SysPayload
         sys.push({ id: ev.id, conv: s.conv, kind: s.kind, data: s.data, authorDevice: ev.author, hlcMs: hlcOf(ev.id) })
+        break
+      }
+      // Private-group notices in a DM log (1.2). They ride their own event type
+      // so a 1.1 client never meets them at all, but for a 1.2 reader they are
+      // just sys rows: same kinds, same `sysLine`, same conversation-vanished
+      // handling. Key material in `data` is blanked at the bridge (shared/prs).
+      case 'grp': {
+        const g = p as GrpPayload
+        sys.push({
+          id: ev.id,
+          conv: g.conv,
+          kind: g.kind,
+          data: g.data as unknown as Record<string, unknown>,
+          authorDevice: ev.author,
+          hlcMs: hlcOf(ev.id),
+        })
         break
       }
     }

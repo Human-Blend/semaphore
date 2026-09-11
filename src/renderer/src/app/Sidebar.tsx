@@ -1,16 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { ConvId, PresenceView } from "@shared/types";
-import { TEAM_CONV } from "@shared/constants";
+import type { GroupView } from "@shared/bridge";
+import { CHANNEL_NAME_MAX, normalizeChannelName } from "@shared/channelName";
+import { RETENTION, TEAM_CONV } from "@shared/constants";
 import { materializeCalendar, occurrencesInRange, ymd } from "@shared/calendar";
 import { useStore, selfOf } from "@/store";
 import { Avatar, DeviceChip, identityHue } from "@/ui/atoms";
 import { SectionLabel, Toggle, truncate } from "./chrome";
-import { IconCalendar, IconGear, IconGitPull, IconPlus } from "./icons";
+import {
+  IconCalendar,
+  IconGear,
+  IconGitPull,
+  IconLock,
+  IconMore,
+  IconPlus,
+} from "./icons";
 import { useBeamTarget, BeamLabel } from "./beam";
 import { openDm, useDmMap } from "./dm";
+import { countPreTombstonePeers } from "./outdatedPeers";
 import { toast } from "./toasts";
 import QuickSwitcher from "./QuickSwitcher";
+import { ConfirmDialog, Dropdown, MenuItem, MenuNote } from "./ChannelMenu";
+import { GroupDialog } from "./GroupDialog";
 
 // Spec §2.2 — the sidebar: quick switcher, channels, DMs (beam drop targets),
 // self footer with status popover. The team block lives in the titlebar row.
@@ -20,76 +32,248 @@ function ChannelRow({
   name,
   active,
   unread,
+  fixed,
   onClick,
 }: {
-  conv: string;
+  conv: ConvId;
   name: string;
   active: boolean;
   unread: number;
+  fixed: boolean;
   onClick: () => void;
 }) {
-  void conv;
+  const [hover, setHover] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(name);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const renameRef = useRef<HTMLInputElement>(null);
+  // Feeds the delete-confirm warning below (older-build teammates who won't
+  // see the tombstone) — cheap enough to keep memoized off `presence` alone.
+  const presence = useStore((s) => s.presence);
+  const outdatedPeers = useMemo(() => countPreTombstonePeers(presence), [presence]);
+
+  useEffect(() => {
+    if (renaming) {
+      renameRef.current?.focus();
+      renameRef.current?.select();
+    }
+  }, [renaming]);
+
   const hasUnread = unread > 0;
+  const showTrigger = hover || menuOpen;
+
+  async function submitRename() {
+    const next = normalizeChannelName(renameValue);
+    setRenaming(false);
+    if (!next || next === name) return;
+    try {
+      await window.bridge.chat.renameChannel(conv, next);
+    } catch (err) {
+      toast(
+        `Could not rename #${name} — ${err instanceof Error ? err.message : String(err)}`,
+        "danger",
+      );
+    }
+  }
+
+  async function confirmDelete() {
+    setBusy(true);
+    try {
+      await window.bridge.chat.deleteChannel(conv);
+      setDeleteOpen(false);
+    } catch (err) {
+      toast(
+        `Could not delete #${name} — ${err instanceof Error ? err.message : String(err)}`,
+        "danger",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (renaming) {
+    return (
+      <div style={{ padding: "2px 8px 2px 10px" }}>
+        <input
+          ref={renameRef}
+          className="sem-input"
+          style={{ height: 28, fontSize: 12 }}
+          value={renameValue}
+          maxLength={CHANNEL_NAME_MAX}
+          aria-label={`Rename #${name}`}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void submitRename();
+            if (e.key === "Escape") setRenaming(false);
+          }}
+          onBlur={() => void submitRename()}
+          spellCheck={false}
+        />
+      </div>
+    );
+  }
+
   return (
-    <button
-      className="sem-row"
-      onClick={onClick}
-      title={`#${name}`}
-      aria-label={`Channel ${name}${hasUnread ? `, ${unread} unread` : ""}`}
-      style={{
-        position: "relative",
-        width: "100%",
-        height: 30,
-        gap: 8,
-        padding: "0 8px 0 10px",
-        borderRadius: "var(--r-sm)",
-        background: active ? "var(--accent-soft)" : undefined,
-      }}
+    <div
+      className="sem-row-hoverable"
+      style={{ position: "relative" }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
     >
-      {active && (
+      <button
+        className="sem-row"
+        onClick={onClick}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenuOpen(true);
+        }}
+        title={`#${name}`}
+        aria-label={`Channel ${name}${hasUnread ? `, ${unread} unread` : ""}`}
+        style={{
+          position: "relative",
+          width: "100%",
+          height: 30,
+          gap: 8,
+          padding: "0 8px 0 10px",
+          borderRadius: "var(--r-sm)",
+          background: active ? "var(--accent-soft)" : undefined,
+        }}
+      >
+        {active && (
+          <span
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 7,
+              bottom: 7,
+              width: 2,
+              borderRadius: 2,
+              background: "var(--accent)",
+            }}
+          />
+        )}
         <span
           aria-hidden="true"
           style={{
-            position: "absolute",
-            left: 0,
-            top: 7,
-            bottom: 7,
-            width: 2,
-            borderRadius: 2,
-            background: "var(--accent)",
+            width: 14,
+            textAlign: "center",
+            fontWeight: 600,
+            fontSize: 13,
+            color: identityHue(name),
+            filter: "saturate(0.6)",
+            flexShrink: 0,
+            userSelect: "none",
           }}
+        >
+          #
+        </span>
+        <span
+          style={{
+            ...truncate,
+            flex: 1,
+            minWidth: 0,
+            fontSize: 13,
+            fontWeight: hasUnread ? 600 : 400,
+            color: active || hasUnread ? "var(--text-1)" : "var(--text-2)",
+            transition: "color var(--t-fast) var(--ease-standard)",
+          }}
+        >
+          {name}
+        </span>
+        {!showTrigger && hasUnread && (
+          <span className="sem-row-badge">
+            <UnreadBadge count={unread} />
+          </span>
+        )}
+      </button>
+
+      <button
+        className="sem-row sem-focus sem-row-trigger"
+        data-open={menuOpen ? "1" : undefined}
+        onClick={(e) => {
+          e.stopPropagation();
+          setMenuOpen((v) => !v);
+        }}
+        title="Channel options"
+        aria-label={`Options for #${name}`}
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        style={{
+          position: "absolute",
+          right: 6,
+          top: 6,
+          width: 18,
+          height: 18,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          borderRadius: "var(--r-xs)",
+          color: "var(--text-3)",
+        }}
+      >
+        <IconMore size={13} />
+      </button>
+      <Dropdown open={menuOpen} onClose={() => setMenuOpen(false)}>
+        {fixed ? (
+          <>
+            <MenuItem disabled title="Home channel — can't be renamed or deleted">
+              Rename…
+            </MenuItem>
+            <MenuItem disabled title="Home channel — can't be renamed or deleted">
+              Delete…
+            </MenuItem>
+            <MenuNote>Home channel — can't be renamed or deleted.</MenuNote>
+          </>
+        ) : (
+          <>
+            <MenuItem
+              onClick={() => {
+                setMenuOpen(false);
+                setRenameValue(name);
+                setRenaming(true);
+              }}
+            >
+              Rename…
+            </MenuItem>
+            <MenuItem
+              danger
+              onClick={() => {
+                setMenuOpen(false);
+                setDeleteOpen(true);
+              }}
+            >
+              Delete…
+            </MenuItem>
+          </>
+        )}
+      </Dropdown>
+
+      {deleteOpen && (
+        <ConfirmDialog
+          title={`Delete #${name}?`}
+          message={
+            <>
+              {`Delete #${name} for everyone? Messages stay on the share until the next cleanup (about ${RETENTION.deletedConvGraceDays} days), then they're gone.`}
+              {outdatedPeers > 0 && (
+                <div style={{ marginTop: 8, color: "var(--warning)" }}>
+                  {outdatedPeers} teammate{outdatedPeers === 1 ? "" : "s"}{" "}
+                  {outdatedPeers === 1 ? "is" : "are"} on an older Chat and will keep seeing this channel until they
+                  update.
+                </div>
+              )}
+            </>
+          }
+          confirmLabel="Delete"
+          tone="danger"
+          busy={busy}
+          onConfirm={() => void confirmDelete()}
+          onClose={() => setDeleteOpen(false)}
         />
       )}
-      <span
-        aria-hidden="true"
-        style={{
-          width: 14,
-          textAlign: "center",
-          fontWeight: 600,
-          fontSize: 13,
-          color: identityHue(name),
-          filter: "saturate(0.6)",
-          flexShrink: 0,
-          userSelect: "none",
-        }}
-      >
-        #
-      </span>
-      <span
-        style={{
-          ...truncate,
-          flex: 1,
-          minWidth: 0,
-          fontSize: 13,
-          fontWeight: hasUnread ? 600 : 400,
-          color: active || hasUnread ? "var(--text-1)" : "var(--text-2)",
-          transition: "color var(--t-fast) var(--ease-standard)",
-        }}
-      >
-        {name}
-      </span>
-      {hasUnread && <UnreadBadge count={unread} />}
-    </button>
+    </div>
   );
 }
 
@@ -459,6 +643,282 @@ function DmRow({
   );
 }
 
+/** Private-group sidebar row (1.2): lock glyph, DM-style unread badge, role-based menu. */
+function GroupRow({
+  group,
+  active,
+  unread,
+  onClick,
+}: {
+  group: GroupView;
+  active: boolean;
+  unread: number;
+  onClick: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(group.name);
+  const [addOpen, setAddOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [leaveOpen, setLeaveOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const renameRef = useRef<HTMLInputElement>(null);
+  const isOwner = group.role === "owner";
+
+  useEffect(() => {
+    if (renaming) {
+      renameRef.current?.focus();
+      renameRef.current?.select();
+    }
+  }, [renaming]);
+
+  const hasUnread = unread > 0;
+  const showTrigger = hover || menuOpen;
+
+  async function submitRename() {
+    const next = renameValue.trim().slice(0, 60);
+    setRenaming(false);
+    if (!next || next === group.name) return;
+    try {
+      await window.bridge.groups.rename(group.conv, next);
+    } catch (err) {
+      toast(
+        `Could not rename the group — ${err instanceof Error ? err.message : String(err)}`,
+        "danger",
+      );
+    }
+  }
+
+  async function doLeave() {
+    setBusy(true);
+    try {
+      await window.bridge.groups.leave(group.conv);
+      setLeaveOpen(false);
+    } catch (err) {
+      toast(`Could not leave — ${err instanceof Error ? err.message : String(err)}`, "danger");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function doDelete() {
+    setBusy(true);
+    try {
+      await window.bridge.groups.remove(group.conv);
+      setDeleteOpen(false);
+    } catch (err) {
+      toast(
+        `Could not delete the group — ${err instanceof Error ? err.message : String(err)}`,
+        "danger",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (renaming) {
+    return (
+      <div style={{ padding: "2px 8px 2px 10px" }}>
+        <input
+          ref={renameRef}
+          className="sem-input"
+          style={{ height: 28, fontSize: 12 }}
+          value={renameValue}
+          maxLength={60}
+          aria-label={`Rename ${group.name}`}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void submitRename();
+            if (e.key === "Escape") setRenaming(false);
+          }}
+          onBlur={() => void submitRename()}
+          spellCheck={false}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="sem-row-hoverable"
+      style={{ position: "relative" }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <button
+        className="sem-row"
+        onClick={onClick}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenuOpen(true);
+        }}
+        title={group.name}
+        aria-label={`Group ${group.name}${hasUnread ? `, ${unread} unread` : ""}`}
+        style={{
+          position: "relative",
+          width: "100%",
+          height: 30,
+          gap: 8,
+          padding: "0 8px 0 10px",
+          borderRadius: "var(--r-sm)",
+          background: active ? "var(--accent-soft)" : undefined,
+        }}
+      >
+        {active && (
+          <span
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 7,
+              bottom: 7,
+              width: 2,
+              borderRadius: 2,
+              background: "var(--accent)",
+            }}
+          />
+        )}
+        <span
+          aria-hidden="true"
+          style={{
+            width: 14,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: identityHue(group.name),
+            filter: "saturate(0.6)",
+            flexShrink: 0,
+          }}
+        >
+          <IconLock size={12} />
+        </span>
+        <span
+          style={{
+            ...truncate,
+            flex: 1,
+            minWidth: 0,
+            fontSize: 13,
+            fontWeight: hasUnread ? 600 : 400,
+            color: active || hasUnread ? "var(--text-1)" : "var(--text-2)",
+            transition: "color var(--t-fast) var(--ease-standard)",
+          }}
+        >
+          {group.name}
+        </span>
+        {!showTrigger && hasUnread && (
+          <span className="sem-row-badge">
+            <UnreadBadge count={unread} />
+          </span>
+        )}
+      </button>
+
+      <button
+        className="sem-row sem-focus sem-row-trigger"
+        data-open={menuOpen ? "1" : undefined}
+        onClick={(e) => {
+          e.stopPropagation();
+          setMenuOpen((v) => !v);
+        }}
+        title="Group options"
+        aria-label={`Options for ${group.name}`}
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        style={{
+          position: "absolute",
+          right: 6,
+          top: 6,
+          width: 18,
+          height: 18,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          borderRadius: "var(--r-xs)",
+          color: "var(--text-3)",
+        }}
+      >
+        <IconMore size={13} />
+      </button>
+      <Dropdown open={menuOpen} onClose={() => setMenuOpen(false)}>
+        <MenuItem
+          onClick={() => {
+            setMenuOpen(false);
+            setRenameValue(group.name);
+            setRenaming(true);
+          }}
+        >
+          Rename…
+        </MenuItem>
+        {isOwner ? (
+          <>
+            <MenuItem
+              onClick={() => {
+                setMenuOpen(false);
+                setAddOpen(true);
+              }}
+            >
+              Add people…
+            </MenuItem>
+            <MenuItem
+              onClick={() => {
+                setMenuOpen(false);
+                setManageOpen(true);
+              }}
+            >
+              Manage members…
+            </MenuItem>
+            <MenuItem
+              danger
+              onClick={() => {
+                setMenuOpen(false);
+                setDeleteOpen(true);
+              }}
+            >
+              Delete group…
+            </MenuItem>
+          </>
+        ) : (
+          <MenuItem
+            danger
+            onClick={() => {
+              setMenuOpen(false);
+              setLeaveOpen(true);
+            }}
+          >
+            Leave…
+          </MenuItem>
+        )}
+      </Dropdown>
+
+      {addOpen && <GroupDialog mode="edit" group={group} canRemove={false} onClose={() => setAddOpen(false)} />}
+      {manageOpen && <GroupDialog mode="edit" group={group} canRemove={true} onClose={() => setManageOpen(false)} />}
+      {leaveOpen && (
+        <ConfirmDialog
+          title={`Leave 🔒 ${group.name}?`}
+          message="You'll stop seeing new messages here. Someone still in the group can add you back later."
+          confirmLabel="Leave"
+          tone="danger"
+          busy={busy}
+          onConfirm={() => void doLeave()}
+          onClose={() => setLeaveOpen(false)}
+        />
+      )}
+      {deleteOpen && (
+        <ConfirmDialog
+          title={`Delete 🔒 ${group.name}?`}
+          message={`Delete this group for everyone? Messages stay on the share until the next cleanup (about ${RETENTION.deletedConvGraceDays} days), then they're gone.`}
+          confirmLabel="Delete"
+          tone="danger"
+          busy={busy}
+          onConfirm={() => void doDelete()}
+          onClose={() => setDeleteOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
 function StatusPopover({
   currentStatus,
   appearOffline,
@@ -664,6 +1124,7 @@ export default function Sidebar({
   onOpenSettings: () => void;
 }) {
   const channels = useStore((s) => s.channels);
+  const groups = useStore((s) => s.groups);
   const presence = useStore((s) => s.presence);
   const boot = useStore((s) => s.boot);
   const activeConv = useStore((s) => s.activeConv);
@@ -678,6 +1139,7 @@ export default function Sidebar({
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [statusOpen, setStatusOpen] = useState(false);
+  const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const addRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -703,11 +1165,7 @@ export default function Sidebar({
   const selfPresence = presence.find((p) => p.deviceId === self?.deviceId);
 
   async function createChannel() {
-    const name = newName
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "-")
-      .replace(/^#/, "");
+    const name = normalizeChannelName(newName);
     if (!name) {
       setAdding(false);
       return;
@@ -782,6 +1240,7 @@ export default function Sidebar({
               style={{ height: 28, fontSize: 12 }}
               placeholder="channel-name"
               aria-label="New channel name"
+              maxLength={CHANNEL_NAME_MAX}
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => {
@@ -807,6 +1266,7 @@ export default function Sidebar({
             name={ch.name}
             active={activeConv === ch.conv}
             unread={activeConv === ch.conv ? 0 : unreadCount(ch.conv)}
+            fixed={ch.fixed}
             onClick={() => setActiveConv(ch.conv)}
           />
         ))}
@@ -815,6 +1275,49 @@ export default function Sidebar({
             style={{ padding: "4px 8px", fontSize: 12, color: "var(--text-3)" }}
           >
             No channels yet — create one.
+          </div>
+        )}
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            padding: "16px 8px 4px",
+          }}
+        >
+          <SectionLabel>Groups</SectionLabel>
+          <button
+            className="sem-row sem-focus"
+            onClick={() => setGroupDialogOpen(true)}
+            title="Create a private group"
+            aria-label="Create a private group"
+            style={{
+              width: 18,
+              height: 18,
+              alignItems: "center",
+              justifyContent: "center",
+              borderRadius: "var(--r-xs)",
+              color: "var(--text-3)",
+            }}
+          >
+            <IconPlus size={12} />
+          </button>
+        </div>
+        {groups.map((g) => (
+          <GroupRow
+            key={g.conv}
+            group={g}
+            active={activeConv === g.conv}
+            unread={activeConv === g.conv ? 0 : unreadCount(g.conv)}
+            onClick={() => setActiveConv(g.conv)}
+          />
+        ))}
+        {!groups.length && (
+          <div
+            style={{ padding: "4px 8px", fontSize: 12, color: "var(--text-3)" }}
+          >
+            No private groups yet.
           </div>
         )}
 
@@ -935,6 +1438,10 @@ export default function Sidebar({
             />
           )}
         </div>
+      )}
+
+      {groupDialogOpen && (
+        <GroupDialog mode="create" onClose={() => setGroupDialogOpen(false)} />
       )}
     </div>
   );
