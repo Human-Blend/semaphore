@@ -7,6 +7,8 @@
 
 import type {
   AdoResult,
+  BoardFrame,
+  BoardFrameDraft,
   ConvId,
   Cursor,
   DiagramBody,
@@ -15,6 +17,7 @@ import type {
   BodyEntity,
   CalendarEntry,
   LinkPreview,
+  PollBody,
   PrView,
   PrsProbe,
   PrsRepo,
@@ -73,6 +76,16 @@ export interface GroupView {
 export interface HealthView {
   reachable: boolean
   latencyMs: number | null
+  /**
+   * Add this to `Date.now()` for the share clock (1.3, additive — absent when
+   * main has not calibrated against the folder yet, and on older builds).
+   *
+   * The renderer needs it because deadlines travel in share time: a poll's
+   * `closesAt` is restated on the share clock by main (`calibrateClosesAt`), so
+   * a machine whose clock is an hour fast was closing polls an hour early —
+   * locally, and only for the person with the wrong clock.
+   */
+  offsetMs?: number
 }
 
 export interface OnboardHealth {
@@ -93,7 +106,7 @@ export interface AttachDraft {
 
 export interface SendDraft {
   text: string
-  kind: 'text' | 'code' | 'gif' | 'diagram'
+  kind: 'text' | 'code' | 'gif' | 'diagram' | 'poll'
   lang?: string | null
   packId?: string
   entities?: BodyEntity[]
@@ -104,6 +117,8 @@ export interface SendDraft {
   linkPreview?: LinkPreview
   /** kind:'diagram' (1.2): the renderer-built scene; oversized scenes ride `attachments` instead. */
   diagram?: DiagramBody
+  /** kind:'poll' (1.3). */
+  poll?: PollBody
 }
 
 export type CursorView = Cursor
@@ -200,6 +215,11 @@ export type PushMessage =
   | { kind: 'channels'; channels: ChannelView[] }
   // Full replace, like 'channels' (1.2). Groups this device left or that were deleted are absent.
   | { kind: 'groups'; groups: GroupView[] }
+  // Live boards (1.3): frames from other participants, delivered once each, in seq order per device.
+  | { kind: 'board-frames'; sessionId: string; frames: BoardFrame[] }
+  | { kind: 'board-ended'; sessionId: string }
+  // Window fullscreen state (1.3), from enter/leave-full-screen.
+  | { kind: 'fullscreen'; on: boolean }
   | { kind: 'presence'; views: PresenceView[] }
   | { kind: 'typing'; conv: ConvId; deviceId: string; until: number }
   | { kind: 'cursors'; conv: ConvId; deviceId: string; cursor: CursorView }
@@ -243,6 +263,9 @@ export interface BridgeApi {
     setBadge(count: number): Promise<void>
     /** Reveal <share>/Chat/apps in Finder/Explorer (1.2 — peer-announced updates). */
     openAppsFolder(): Promise<void>
+    /** 1.3: OS fullscreen for the main window (the diagram editor's whole-window mode). */
+    setFullScreen(on: boolean): Promise<void>
+    isFullScreen(): Promise<boolean>
   }
 
   onboarding: {
@@ -278,6 +301,33 @@ export interface BridgeApi {
     renameChannel(conv: ConvId, name: string): Promise<void>
     /** 1.2: publish a `channel-deleted` tombstone (any member; rejects the fixed channel). */
     deleteChannel(conv: ConvId): Promise<void>
+    /** 1.3: vote on a poll message (`vot` event; [] retracts). Rejects unknown ids, multi violations, closed polls. */
+    vote(conv: ConvId, target: string, choice: string[]): Promise<void>
+    /** 1.3: author only — publish an `edt` of the poll with `closedAt`. */
+    closePoll(conv: ConvId, target: string): Promise<void>
+  }
+
+  /**
+   * Live boards (1.3): a real-time diagram session over boards/<sessionId>/.
+   * Frames from others arrive as 'board-frames' pushes while joined.
+   */
+  boards: {
+    /** Publish `board-live` and create the session dir. `boardId` ties it to a diagram message when seeded from one. */
+    start(conv: ConvId, title: string, boardId?: string): Promise<{ sessionId: string }>
+    /** Read every current frame, then keep polling and pushing until leave/end. */
+    join(sessionId: string, conv: ConvId): Promise<{ frames: BoardFrame[] }>
+    /**
+     * Coalesced in main (BOARD.writeMinMs); the latest draft wins. Resolves
+     * with the `files` ids the frame budget dropped (1.3), so the caller can
+     * offer them again on a later frame rather than leaving a peer with a shape
+     * whose image never arrives. A frame that is over budget on its elements
+     * alone — or over `BOARD.maxElements` — rejects with `frame-too-large`.
+     */
+    write(sessionId: string, conv: ConvId, draft: BoardFrameDraft): Promise<{ droppedFiles: string[] }>
+    /** Stop polling and delete this device's frame file. */
+    leave(sessionId: string, conv: ConvId): Promise<void>
+    /** Host only: publish `board-ended` and remove the dir. */
+    end(sessionId: string, conv: ConvId, resultStem?: string): Promise<void>
   }
 
   /** Private groups (1.2). Reading is the ordinary event path (chat.events / 'event' pushes). */

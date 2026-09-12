@@ -3,6 +3,7 @@ import type { MessageView } from '@shared/merge'
 import type { Attachment, BodyEntity, ConvId } from '@shared/types'
 import { isDiagramAttachment } from '@shared/diagram'
 import { DiagramTile } from '@/diagram/DiagramTile'
+import { PollTile } from '@/poll/PollTile'
 import { isMediaAttachment, sameUrl, segmentMessage } from './parse'
 import { LinkIcon } from './icons'
 import { CodeBlock } from './CodeBlock'
@@ -51,6 +52,11 @@ export function MessageBody({ view }: { view: MessageView }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0, alignItems: 'flex-start' }}>
       {isDiagram ? (
         <DiagramTile view={view} />
+      ) : view.body.kind === 'poll' ? (
+        // The body text under a poll is the line written for pre-1.3 clients
+        // ("…— update Chat to vote"); the tile replaces it outright rather than
+        // sitting under it.
+        <PollTile view={view} />
       ) : view.body.kind === 'code' ? (
         <div style={{ alignSelf: 'stretch', minWidth: 0 }}>
           <CodeBlock text={view.body.text} lang={view.body.lang ?? null} />

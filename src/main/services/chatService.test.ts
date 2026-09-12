@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { CalPayload, CalendarEntry } from '@shared/types'
-import type { PushMessage, SettingsView } from '@shared/bridge'
+import type { CalPayload, CalendarEntry, ConvId, PollBody } from '@shared/types'
+import type { PushMessage, SendDraft, SettingsView } from '@shared/bridge'
 import { DIR, TEAM_CONV } from '@shared/constants'
 import { materializeCalendar } from '@shared/calendar'
+import { materialize } from '@shared/merge'
 import { generateIdentity } from '../crypto/identity'
 import type { SecretStore } from '../store/secretStore'
 import { createOrJoinTeam } from '../transport/bootstrap'
@@ -235,5 +236,194 @@ describe('renaming and deleting channels', () => {
     expect(chat.channelViews().some((v) => v.channelId === other.channelId)).toBe(false)
 
     await chat.stop()
+  }, 60_000)
+})
+
+// ---------------------------------------------------------------------------
+// Polls (1.3). The interesting half is main's refusals: the renderer's dialog
+// can be bypassed (every argument here crosses the bridge from sandboxed web
+// code), so the option ids, `multi`, the closed state and "only the author
+// closes it" are all decided here, against the poll as it currently stands.
+
+function pollDraft(over: Partial<PollBody> = {}): SendDraft {
+  const poll: PollBody = {
+    question: 'Ship on Friday?',
+    options: [
+      { id: '', text: 'Yes, ship it' },
+      { id: '', text: 'Wait for Monday' },
+    ],
+    multi: false,
+    anonymous: false,
+    ...over,
+  }
+  return { kind: 'poll', text: poll.question, poll }
+}
+
+/** The poll message as the log currently reads it (edits applied). */
+function pollIn(chat: ChatService, conv: ConvId, id: string) {
+  return materialize(chat.getEvents(conv)).messages.find((m) => m.id === id)!
+}
+
+describe('polls', () => {
+  it('sends with a pre-1.3 fallback line, generated option ids, and a calibrated deadline', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-send-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const conv: ConvId = `chan:${(await session.createChannel('polls')).channelId}`
+
+    const { id } = await chat.send(conv, pollDraft({ closesAt: Date.now() + 4 * 3600_000 }))
+    const body = pollIn(chat, conv, id).body
+    expect(body.kind).toBe('poll')
+    // What a 1.1/1.2 client prints in place of the tile — it cannot vote at all
+    // (its filename regex rejects `.vot.e1`), so the line has to say so.
+    expect(body.text).toBe('📊 Poll: Ship on Friday? — update Chat to vote')
+    expect(body.poll?.options.map((o) => o.id)).toEqual(['o1', 'o2'])
+    expect(body.poll?.closedAt).toBeUndefined()
+    // Slack at both ends: the span is measured from `Date.now()` inside `send`
+    // and read back against a `calibratedNow()` taken here, and a recalibration
+    // between the two can move the share clock a few ms either way. The point of
+    // the assertion is "four hours, on the share clock", not the millisecond.
+    const closesIn = (body.poll!.closesAt ?? 0) - session.io.calibratedNow()
+    expect(closesIn).toBeGreaterThan(3.5 * 3600_000)
+    expect(closesIn).toBeLessThanOrEqual(4 * 3600_000 + 1000)
+  }, 60_000)
+
+  it('refuses a draft the limits do not allow', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-limits-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const conv: ConvId = `chan:${(await session.createChannel('polls')).channelId}`
+
+    await expect(chat.send(conv, { kind: 'poll', text: 'x' })).rejects.toThrow('poll-missing')
+    await expect(chat.send(conv, pollDraft({ question: '   ' }))).rejects.toThrow('poll-question-empty')
+    await expect(chat.send(conv, pollDraft({ options: [{ id: '', text: 'Only one' }] }))).rejects.toThrow(
+      'poll-too-few-options',
+    )
+    await expect(
+      chat.send(
+        conv,
+        pollDraft({ options: Array.from({ length: 11 }, (_, i) => ({ id: '', text: `option ${i}` })) }),
+      ),
+    ).rejects.toThrow('poll-too-many-options')
+    // Two rows that read the same: the renderer's dialog says so too, but main
+    // runs the same validator because renderer input is untrusted — and a
+    // duplicate is the one draft problem that still *works*, quietly splitting
+    // one answer in two.
+    await expect(
+      chat.send(conv, pollDraft({ options: [{ id: '', text: 'Friday' }, { id: '', text: ' friday ' }] })),
+    ).rejects.toThrow('poll-duplicate-option')
+    expect(chat.getEvents(conv)).toHaveLength(0)
+  }, 60_000)
+
+  it('records a vote, replaces it, and takes it back', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-vote-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const conv: ConvId = `chan:${(await session.createChannel('polls')).channelId}`
+    const { id } = await chat.send(conv, pollDraft())
+
+    await chat.vote(conv, id, ['o1'])
+    expect(pollIn(chat, conv, id).votes).toEqual({ [session.deviceId]: ['o1'] })
+    await chat.vote(conv, id, ['o2'])
+    expect(pollIn(chat, conv, id).votes).toEqual({ [session.deviceId]: ['o2'] })
+    await chat.vote(conv, id, [])
+    expect(pollIn(chat, conv, id).votes).toEqual({})
+    // Three votes, three events — LWW per voter, nothing deleted or rewritten.
+    expect(chat.getEvents(conv).filter((e) => e.type === 'vot')).toHaveLength(3)
+  }, 60_000)
+
+  it('refuses an unknown option, a second pick on a single-choice poll, and a vote on nothing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-invalid-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const conv: ConvId = `chan:${(await session.createChannel('polls')).channelId}`
+    const { id } = await chat.send(conv, pollDraft())
+    const multi = await chat.send(conv, pollDraft({ multi: true }))
+    const plain = await chat.send(conv, { kind: 'text', text: 'not a poll' })
+
+    await expect(chat.vote(conv, id, ['nope'])).rejects.toThrow('unknown-option')
+    await expect(chat.vote(conv, id, ['o1', 'o2'])).rejects.toThrow('single-choice')
+    await expect(chat.vote(conv, plain.id, ['o1'])).rejects.toThrow('not-a-poll')
+    await expect(chat.vote(conv, 'nosuchevent', ['o1'])).rejects.toThrow('unknown-poll')
+    // The same two picks are fine once the poll says they are.
+    await chat.vote(conv, multi.id, ['o1', 'o2'])
+    expect(pollIn(chat, conv, multi.id).votes).toEqual({ [session.deviceId]: ['o1', 'o2'] })
+    expect(chat.getEvents(conv).filter((e) => e.type === 'vot')).toHaveLength(1)
+  }, 60_000)
+
+  it('closes by the author only, and a closed poll takes no more votes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-close-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const conv: ConvId = `chan:${(await session.createChannel('polls')).channelId}`
+    const { id } = await chat.send(conv, pollDraft())
+    await chat.vote(conv, id, ['o1'])
+
+    await chat.closePoll(conv, id)
+    const closed = pollIn(chat, conv, id)
+    expect(closed.body.poll?.closedAt).toBeGreaterThan(0)
+    // Closing is an ordinary author `edt` — so it travels, and it merges, by
+    // the rules every client already has.
+    expect(chat.getEvents(conv).filter((e) => e.type === 'edt')).toHaveLength(1)
+    expect(closed.votes).toEqual({ [session.deviceId]: ['o1'] })
+    await expect(chat.vote(conv, id, ['o2'])).rejects.toThrow('poll-closed')
+    // Idempotent: closing again writes nothing.
+    await chat.closePoll(conv, id)
+    expect(chat.getEvents(conv).filter((e) => e.type === 'edt')).toHaveLength(1)
+  }, 60_000)
+
+  it('refuses a vote once the poll’s own deadline has passed, with no event needed', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-deadline-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const conv: ConvId = `chan:${(await session.createChannel('polls')).channelId}`
+    const { id } = await chat.send(conv, pollDraft({ closesAt: Date.now() + 3600_000 }))
+    await chat.vote(conv, id, ['o1'])
+
+    // The share clock moves past the deadline; nobody publishes anything.
+    const closesAt = pollIn(chat, conv, id).body.poll!.closesAt!
+    const realNow = session.io.calibratedNow.bind(session.io)
+    session.io.calibratedNow = () => closesAt + 1000
+    try {
+      await expect(chat.vote(conv, id, ['o2'])).rejects.toThrow('poll-closed')
+    } finally {
+      session.io.calibratedNow = realNow
+    }
+    expect(pollIn(chat, conv, id).votes).toEqual({ [session.deviceId]: ['o1'] })
+  }, 60_000)
+
+  it('refuses a close from anyone but the author', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-author-'))
+    const alice = await makeSession(root, new FakeStore(), 'Alice')
+    const chatA = new ChatService(alice, () => null, settings)
+    const conv: ConvId = `chan:${(await alice.createChannel('polls')).channelId}`
+    const { id } = await chatA.send(conv, pollDraft())
+
+    const bob = await makeSession(root, new FakeStore(), 'Bob')
+    await bob.roster.refresh()
+    const chatB = new ChatService(bob, () => null, settings)
+    await bob.loadChannels()
+    await chatB.events.catchUp(conv)
+    await expect(chatB.closePoll(conv, id)).rejects.toThrow('not-poll-author')
+    // Bob can still vote in it — being someone else's poll is the point.
+    await chatB.vote(conv, id, ['o1'])
+    expect(pollIn(chatB, conv, id).votes).toEqual({ [bob.deviceId]: ['o1'] })
+  }, 60_000)
+
+  it('advertises a vote in heads2, never in the heads a 1.2 peer parses', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sem-poll-heads2-'))
+    const session = await makeSession(root, new FakeStore(), 'Alice')
+    const chat = new ChatService(session, () => null, settings)
+    const conv: ConvId = `chan:${(await session.createChannel('polls')).channelId}`
+    const { id } = await chat.send(conv, pollDraft())
+    await chat.vote(conv, id, ['o1'])
+
+    const beacon = chat.beacon as unknown as {
+      heads: Map<string, string[]>
+      heads2: Map<string, string[]>
+    }
+    expect((beacon.heads.get(conv) ?? []).some((h) => h.endsWith('.vot.e1'))).toBe(false)
+    expect((beacon.heads.get(conv) ?? []).some((h) => h.endsWith('.msg.e1'))).toBe(true)
+    expect((beacon.heads2.get(conv) ?? []).some((h) => h.endsWith('.vot.e1'))).toBe(true)
   }, 60_000)
 })

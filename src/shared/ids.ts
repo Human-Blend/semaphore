@@ -36,7 +36,7 @@ export function base36ToSeq(s: string): number {
 // list it, so a `.grp.e1` file simply doesn't parse there and is skipped in
 // silence — which is exactly what we want a private-group notice to do on an
 // old client, rather than render as a blank sys row.
-const EVENT_RE = /^(\d{13})-(\d{4})-([0-9a-f]{8})\.(msg|edt|del|rct|pin|sys|prv|cal|prs|grp)\.e1$/
+const EVENT_RE = /^(\d{13})-(\d{4})-([0-9a-f]{8})\.(msg|edt|del|rct|pin|sys|prv|cal|prs|grp|vot)\.e1$/
 
 export function eventFileName(hlcMs: number, ctr: number, deviceId: string, type: EventType): string {
   return `${String(hlcMs).padStart(13, '0')}-${String(ctr).padStart(4, '0')}-${deviceId.slice(0, 8)}.${type}${FILE_EXT.record}`
@@ -135,6 +135,13 @@ export function parseBeaconFileName(name: string): { deviceId8: string; seq: num
   if (!m) return null
   return { deviceId8: m[1], seq: base36ToSeq(m[2]) }
 }
+
+// ---------------------------------------------------------------------------
+// Live board frames (1.3) share the beacon naming: "<deviceId8>.<seq base36 8>"
+// under boards/<sessionId>/ — one file per participant, seq in the name.
+
+export const boardFrameFileName = beaconFileName
+export const parseBoardFrameFileName = parseBeaconFileName
 
 // ---------------------------------------------------------------------------
 

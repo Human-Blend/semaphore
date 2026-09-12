@@ -6,6 +6,7 @@ import type { BodyEntity } from '@shared/types'
 import type { MessageView, SysView } from '@shared/merge'
 import { EVENT } from '@shared/constants'
 import { diagramPreview } from '@shared/diagram'
+import { pollPreview } from '@shared/poll'
 import { formatBytes } from '@/ui/atoms'
 import { firstLinkOf } from '@/content/parse'
 
@@ -49,11 +50,31 @@ export function snippetOf(m: MessageView): string {
   // ("📐 Diagram: X — update Chat to view it"). Quoting that back at a 1.2 user
   // tells them to update the app they are running; name the diagram instead.
   if (m.body.kind === 'diagram') return diagramPreview(m.body.text)
+  // Same trap one version on: a poll's `body.text` is the "update Chat to vote"
+  // line written for pre-1.3 clients. Quote the question.
+  if (m.body.kind === 'poll') return pollPreview(m.body)
   if (m.body.kind === 'code') return m.body.text.split('\n')[0]?.trim() || 'code block'
   if (m.body.text.trim()) return m.body.text.replace(/\s+/g, ' ').trim()
   if (m.attachments.length > 0)
     return m.attachments.length === 1 ? m.attachments[0].name : `${m.attachments.length} files`
   return 'message'
+}
+
+/**
+ * What the row's **Copy text** puts on the clipboard.
+ *
+ * For everything with words of its own that is `body.text`, byte for byte —
+ * newlines and indentation included, which is the whole point of copying a code
+ * block. For a diagram or a poll it must not be: `body.text` there is the
+ * sentence written for clients too old to render the thing ("…— update Chat to
+ * vote"), so copying a poll pasted an instruction to update the app into
+ * whatever the person was writing. They get the same one-line preview a reply
+ * quote shows.
+ */
+export function copyTextOf(m: MessageView): string {
+  if (m.body.kind === 'diagram') return diagramPreview(m.body.text)
+  if (m.body.kind === 'poll') return pollPreview(m.body)
+  return m.body.text
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +287,11 @@ export function sysLine(sys: SysView, nameOf: (device: string) => string): strin
       return `${author} left the group`
     case 'group-deleted':
       return `${author} deleted this group`
+    // 1.3 — live boards
+    case 'board-live':
+      return `${author} opened a live board${str('title') ? `: ${str('title')}` : ''}`
+    case 'board-ended':
+      return `${author} ended the live board${str('title') ? ` ${str('title')}` : ''}`
     case 'group-removed':
       return `You were removed from 🔒 ${str('name') ?? 'a private group'}`
     default:

@@ -64,6 +64,15 @@ export class AppController {
   janitor: Janitor | null = null
   updates: UpdateService | null = null
   prs: PrService | null = null
+  /**
+   * Live-board service (1.3). Built lazily by `services/boardsIpc.ts` — it
+   * needs the window to push to — but *stopped* here, with every other service
+   * that owns timers: a board poller that outlives the session it was built for
+   * keeps reading (and writing) a share the app has already left behind. The
+   * type is structural on purpose, so this file takes no import for it.
+   */
+  boards: { stop(): Promise<void> } | null = null
+  private readonly sessionListeners = new Set<() => void>()
   private identity: DeviceIdentity | null = null
   private settings: SettingsView = DEFAULT_SETTINGS
   private boot: BootMode = { mode: 'onboarding', sharePathSuggestion: null }
@@ -80,6 +89,37 @@ export class AppController {
   setIoTierManager(manager: IoTierManager): void {
     this.ioTier = manager
     manager.onChange((tier, idleSec) => this.chat?.setIoTier(tier, idleSec))
+  }
+
+  /**
+   * Session lifecycle hook: `chat` has just appeared, or has just gone away.
+   *
+   * The file/beam services — and with them the sfblob:// protocol handler that
+   * every `<img>` in the timeline reads through — are built from
+   * `controller.chat`, which is null until a session exists. They used to find
+   * it on a 1 s poll, and that poll is a race the renderer wins: after a
+   * relaunch it paints the cached timeline the moment the ready `boot` push
+   * lands, its images ask sfblob:// before `initProtocol()` has run, and the
+   * 503 they got back latched as "file service warming up" forever. Listeners
+   * run synchronously here — before the boot push, and before the window
+   * exists at launch — with the poll left in place as a backstop.
+   */
+  onSessionChange(listener: () => void): () => void {
+    this.sessionListeners.add(listener)
+    return () => {
+      this.sessionListeners.delete(listener)
+    }
+  }
+
+  private notifySessionChange(): void {
+    for (const listener of [...this.sessionListeners]) {
+      try {
+        listener()
+      } catch {
+        // A service that fails to wire must not take the session down with it:
+        // the poll behind this hook will try again a second later.
+      }
+    }
   }
 
   getBoot(): BootMode {
@@ -171,12 +211,17 @@ export class AppController {
     this.janitor?.stop()
     this.updates?.stop()
     this.prs?.stop()
+    await this.boards?.stop().catch(() => {})
     await this.chat?.stop().catch(() => {})
+    this.boards = null
     this.chat = null
     this.session = null
     this.janitor = null
     this.updates = null
     this.prs = null
+    // Same hook, the other way round: the file/beam services stop now rather
+    // than at the next poll, so nothing is left reading the folder we just left.
+    this.notifySessionChange()
     // Team-scoped only. 'prs-seen' is about this team's pull requests and goes;
     // 'prs-token' is the user's own Azure DevOps credential and stays.
     for (const secret of [
@@ -345,6 +390,11 @@ export class AppController {
     this.session = session
     this.chat = new ChatService(session, this.getWindow, () => this.settings, () => app.getVersion())
     this.chat.setPush((msg) => this.push(msg))
+    // Everything that hangs off a live ChatService gets built right here,
+    // before the catch-up read and long before the ready `boot` push — see
+    // onSessionChange. In particular the sfblob:// handler is live before the
+    // renderer can ask it for its first image.
+    this.notifySessionChange()
     await this.chat.start()
     // A session built after the manager already settled (unlock, team change)
     // would otherwise sit on the constructor default until the next transition.
@@ -385,6 +435,7 @@ export class AppController {
     this.janitor?.stop()
     this.updates?.stop()
     this.prs?.stop()
+    await this.boards?.stop().catch(() => {})
     await this.chat?.stop().catch(() => {})
   }
 }

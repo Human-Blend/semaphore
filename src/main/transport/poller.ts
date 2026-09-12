@@ -222,7 +222,18 @@ export class Poller {
 
     // Channel + team heads → ingest the exact new event files. Only channels
     // need a discovery refresh; team conv ids are fixed and always derivable.
-    for (const [conv, heads] of Object.entries(obs.content.heads ?? {})) {
+    // `heads2` (1.3) carries the same thing for event types a 1.2 reader cannot
+    // parse (`vot`, …) — a separate field so that a burst of votes cannot push
+    // the `msg` names out of the 16-slot `heads` ring those readers still ingest
+    // from (an unparseable name in there would be skipped, not mistaken for a
+    // gap; losing the ring slot is the real cost). Here both rings mean the same
+    // thing, so they go through one loop.
+    const plainHeads = new Map<string, string[]>()
+    for (const [conv, heads] of Object.entries(obs.content.heads ?? {})) plainHeads.set(conv, [...heads])
+    for (const [conv, heads] of Object.entries(obs.content.heads2 ?? {})) {
+      plainHeads.set(conv, [...(plainHeads.get(conv) ?? []), ...heads])
+    }
+    for (const [conv, heads] of plainHeads) {
       if (!isChanConv(conv) && !isTeamConv(conv)) continue
       if (isChanConv(conv) && !s.channels.get(conv.slice(5))) await s.loadChannels()
       // A tombstoned channel is closed: don't re-read a log on its way out.
@@ -246,9 +257,12 @@ export class Poller {
     for (const [conv, section] of sealed) {
       if (section.heads.length) await this.events.ingestHeads(conv, section.heads)
       // Private-group notices in a DM (1.2) travel in their own ring, out of
-      // `heads`, so that a 1.1 peer reading the same section never meets a
-      // filename it cannot parse. Same ingestion, one field over.
+      // `heads`, so that they never take ring slots from the `msg` names a 1.1
+      // peer reading the same section ingests. Same ingestion, one field over.
       if (section.grpHeads?.length) await this.events.ingestHeads(conv, section.grpHeads)
+      // Post-1.2 types inside a sealed section (1.3) — a vote in a DM or a
+      // private group. Same reason for the separate ring, same ingestion.
+      if (section.heads2?.length) await this.events.ingestHeads(conv, section.heads2)
       this.listeners.onCursors?.(conv, deviceId, section.cursor)
       if (section.typingUntil && section.typingUntil > s.io.calibratedNow()) {
         this.listeners.onTyping?.(conv, deviceId, section.typingUntil)

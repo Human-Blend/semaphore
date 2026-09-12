@@ -96,7 +96,7 @@ export class Janitor {
     const s = this.session
     const now = s.io.calibratedNow()
     const config = await retentionFor(s)
-    const counts: Record<string, number> = { events: 0, convs: 0, blobs: 0, drops: 0, rtc: 0, screens: 0, tmp: 0, beacons: 0, claims: 0 }
+    const counts: Record<string, number> = { events: 0, convs: 0, blobs: 0, drops: 0, rtc: 0, screens: 0, boards: 0, tmp: 0, beacons: 0, claims: 0 }
 
     const olderThan = async (rel: string, ms: number): Promise<boolean> => {
       const st = await s.io.statMaybe(rel)
@@ -176,6 +176,46 @@ export class Janitor {
       const hard = await olderThan(rel, RETENTION.screensHardHours * 3_600_000)
       if (dead || hard) {
         if ((await s.io.delete(rel)) === 'deleted') counts.screens++
+      }
+    }
+
+    // Live boards (1.3): the same rule as screens, with two differences. A board
+    // directory is created by `start` before anyone has drawn anything, so an
+    // EMPTY dir is not evidence of a dead session — its own mtime is. A dir
+    // whose newest frame has gone quiet means everyone left (or crashed)
+    // without the host ending the session.
+    //
+    // And the hard limit is read off the OLDEST frame, never off the directory:
+    // a live board rewrites its directory constantly (every publish renames a
+    // file in, every writer deletes its previous one), and each of those bumps
+    // the directory's mtime — so a `statMaybe(rel)` age could never exceed a few
+    // seconds while anyone was drawing, and the hard limit could not fire at
+    // all. The oldest frame still in the dir is the share's own record of how
+    // long this session has been going; `board-live`'s `startedAt` would say it
+    // too, but the janitor reads directories, not conversation logs.
+    const deadMs = RETENTION.boardsDeadMinutes * 60_000
+    const hardMs = RETENTION.boardsHardHours * 3_600_000
+    for (const sess of await s.io.listDirs(DIR.boards)) {
+      const rel = `${DIR.boards}/${sess}`
+      const names = await s.io.list(rel)
+      if (names.length === 0) {
+        if (await olderThan(rel, deadMs)) {
+          if ((await s.io.delete(rel)) === 'deleted') counts.boards++
+        }
+        continue
+      }
+      let newest = 0
+      let oldest = Number.POSITIVE_INFINITY
+      for (const n of names) {
+        const st = await s.io.statMaybe(`${rel}/${n}`)
+        if (!st) continue
+        if (st.mtimeMs > newest) newest = st.mtimeMs
+        if (st.mtimeMs < oldest) oldest = st.mtimeMs
+      }
+      const dead = now - newest > deadMs
+      const hard = Number.isFinite(oldest) && now - oldest > hardMs
+      if (dead || hard) {
+        if ((await s.io.delete(rel)) === 'deleted') counts.boards++
       }
     }
 

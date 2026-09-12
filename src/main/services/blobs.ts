@@ -230,6 +230,45 @@ async function* fileBody(path: string, start?: number, end?: number): AsyncGener
   }
 }
 
+/**
+ * Every answer this protocol gives, readable by the page that asked.
+ *
+ * `sfblob://` is its own origin, so a `fetch()` from the app's `file://`
+ * document is a cross-origin request: without these headers the response is
+ * discarded before the caller sees it (the scheme is `corsEnabled` — see
+ * blobProtocol.ts — which is what makes the headers count rather than the
+ * request fail outright). `<img>`/`<video>` never needed this; the diagram
+ * tile, which reads a scene's bytes, did — it could not load one at all.
+ *
+ * The allow-list is `*` because the only client is this app's own renderer,
+ * and the URL already carries the blob's key: there is no secret here that
+ * the origin check would be protecting. The exposed headers are the ones a
+ * range read is useless without.
+ */
+function withCors(res: Response): Response {
+  res.headers.set('Access-Control-Allow-Origin', '*')
+  res.headers.set('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges')
+  return res
+}
+
+/**
+ * What a blob the share cannot stat actually means.
+ *
+ * 404 is a promise to the renderer: this file is *gone* — the media sweep took
+ * it — and no amount of retrying will bring it back, so the tile is free to say
+ * "cleaned up". An unreachable share (VPN down, folder unmounted, laptop that
+ * slept through the reconnect) looks exactly the same to `stat`: ENOENT, on a
+ * path whose parents are missing too. Answering 404 for that made an outage
+ * indistinguishable from an expiry, and the image never came back when the
+ * share did. So: a plain ENOENT on a share we believe in is an expiry;
+ * everything else — an unreachable share, EACCES, EIO, ETIMEDOUT — is 503,
+ * which the renderer keeps retrying.
+ */
+export function blobMissStatus(reachable: boolean, statErrCode?: string): 404 | 503 {
+  if (!reachable) return 503
+  return statErrCode === 'ENOENT' ? 404 : 503
+}
+
 type Range = { start: number; end: number } | 'unsatisfiable' | null
 
 function parseRange(header: string | null, size: number): Range {
@@ -294,6 +333,29 @@ export class BlobService {
 
   private cachePathFor(blobId: string): string {
     return join(this.cacheDir, blobId)
+  }
+
+  /**
+   * 404 or 503 for a blob that is not on the share — `blobMissStatus`, with the
+   * reachability it needs actually established.
+   *
+   * Cached health is not enough, and neither is the share root. A team folder
+   * that has gone away (unmounted, renamed, a laptop that woke up somewhere
+   * else) answers ENOENT for every path inside it exactly like a swept blob
+   * does — and nothing marks it unreachable, because a missing directory reads
+   * as an empty one to `list()` and because our own writers recreate the tree
+   * with `mkdir -p` on the next beacon. What cannot be recreated by a writer is
+   * the team's protocol file: it is written once when the team is created and
+   * never republished. Present, and this really is our folder, so a missing
+   * blob is an expiry. Absent, and we are looking at a hole where the share
+   * used to be — 503, try again later.
+   *
+   * One extra stat, only ever on the miss path.
+   */
+  private async missStatus(code: string | undefined): Promise<404 | 503> {
+    if (code !== 'ENOENT') return blobMissStatus(this.io.getHealth().reachable, code)
+    const proto = await this.io.statMaybe(DIR.protocolFile)
+    return blobMissStatus(proto !== null, code)
   }
 
   private urlFor(blobId: string, k: KnownBlob): string {
@@ -402,13 +464,14 @@ export class BlobService {
     const existing = this.jobs.get(blobId)
     if (existing) return { ...existing.snapshot }
 
-    const st = await this.io.statMaybe(this.blobRel(blobId))
+    const { stat: st, code } = await this.io.statDetailed(this.blobRel(blobId))
     if (!st) {
-      // Distinguish "janitor cleaned it" from "share is down right now".
-      const reachable = this.io.getHealth().reachable
+      // Distinguish "janitor cleaned it" from "share is down right now" — the
+      // same rule the protocol handler answers 404 vs 503 by.
+      const expired = (await this.missStatus(code)) === 404
       const state: BlobFetchState = {
         blobId,
-        state: reachable ? 'expired' : 'failed',
+        state: expired ? 'expired' : 'failed',
         bytesDone: 0,
         bytesTotal: k.size,
         url: null,
@@ -513,6 +576,22 @@ export class BlobService {
   // present, otherwise decrypts the requested range straight off the share.
 
   private handleRequest = async (req: Request): Promise<Response> => {
+    // A preflight can only reach us if a caller sends a header outside the
+    // CORS safelist (`Range` is on it, so the range reads below do not) — but
+    // answering it is three lines, and not answering it is an afternoon.
+    if (req.method === 'OPTIONS') {
+      return withCors(
+        new Response(null, {
+          status: 204,
+          headers: { 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS', 'Access-Control-Allow-Headers': 'Range' },
+        }),
+      )
+    }
+    return withCors(await this.respond(req))
+  }
+
+  /** The answer itself; `handleRequest` puts the CORS headers on whatever comes back. */
+  private respond = async (req: Request): Promise<Response> => {
     try {
       const u = new URL(req.url)
       const segs = u.pathname.split('/').filter(Boolean)
@@ -564,8 +643,13 @@ export class BlobService {
       // Not cached (or cache incomplete): decrypt the requested range directly
       // from the encrypted share file — this is what makes video scrub over SMB.
       const rel = this.blobRel(blobId)
-      const st = await this.io.statMaybe(rel)
-      if (!st) return new Response('blob expired', { status: 404 })
+      const { stat: st, code } = await this.io.statDetailed(rel)
+      if (!st) {
+        const status = await this.missStatus(code)
+        return status === 404
+          ? new Response('blob expired', { status })
+          : new Response('share unreachable', { status })
+      }
       const start = range ? range.start : 0
       const end = range ? range.end : size - 1
       const body = this.shareBody(this.io.abs(rel), known.key, this.aadFor(blobId), start, end)

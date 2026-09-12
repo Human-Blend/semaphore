@@ -30,6 +30,8 @@ const bridge: BridgeApi = {
     showInFolder: (path) => invoke('app:showInFolder', path),
     setBadge: (count) => invoke('app:setBadge', count),
     openAppsFolder: () => invoke('app:openAppsFolder'),
+    setFullScreen: (on) => invoke('app:setFullScreen', on),
+    isFullScreen: () => invoke('app:isFullScreen'),
   },
 
   onboarding: {
@@ -55,6 +57,16 @@ const bridge: BridgeApi = {
     myReads: () => invoke('chat:myReads'),
     renameChannel: (conv, name) => invoke('chat:renameChannel', conv, name),
     deleteChannel: (conv) => invoke('chat:deleteChannel', conv),
+    vote: (conv, target, choice) => invoke('chat:vote', conv, target, choice),
+    closePoll: (conv, target) => invoke('chat:closePoll', conv, target),
+  },
+
+  boards: {
+    start: (conv, title, boardId) => invoke('boards:start', conv, title, boardId),
+    join: (sessionId, conv) => invoke('boards:join', sessionId, conv),
+    write: (sessionId, conv, draft) => invoke('boards:write', sessionId, conv, draft),
+    leave: (sessionId, conv) => invoke('boards:leave', sessionId, conv),
+    end: (sessionId, conv, resultStem) => invoke('boards:end', sessionId, conv, resultStem),
   },
 
   groups: {

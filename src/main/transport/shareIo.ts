@@ -9,7 +9,7 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { FILE_EXT } from '@shared/constants'
 
 // All share access goes through this class: temp-write-then-rename publishing,
@@ -100,8 +100,31 @@ export class ShareIo {
     this.ringCount.fill(0)
   }
 
+  /**
+   * Share-relative POSIX path → absolute path under the mounted root.
+   *
+   * Every segment is checked, because several relative paths are built from
+   * ids that crossed the bridge: a live board's `sessionId` (1.3) and a screen
+   * session's (1.2) both land in a path, and `join(root, '..', '..')` walks
+   * straight out of the share. The services validate those ids too; this is
+   * the floor under all of them, so a future caller cannot reintroduce the
+   * hole by forgetting to.
+   */
   abs(rel: string): string {
-    return join(this.root, ...rel.split('/'))
+    // '' is the team root itself (ensureDir('') on first run, probe()); it
+    // has no segments to check. Anything else must be a clean relative path.
+    if (rel === '') return this.root
+    if (isAbsolute(rel)) throw new Error(`unsafe share path: ${JSON.stringify(rel)}`)
+    const parts = rel.split('/')
+    for (const p of parts) {
+      // Empty catches a leading, trailing or doubled slash; '\\' is a
+      // separator on Windows, where it would smuggle a second segment past
+      // this loop.
+      if (!p || p === '.' || p === '..' || p.includes('\\')) {
+        throw new Error(`unsafe share path: ${JSON.stringify(rel)}`)
+      }
+    }
+    return join(this.root, ...parts)
   }
 
   getHealth(): ShareHealth {
@@ -238,12 +261,24 @@ export class ShareIo {
   }
 
   async statMaybe(rel: string): Promise<{ mtimeMs: number; size: number } | null> {
+    return (await this.statDetailed(rel)).stat
+  }
+
+  /**
+   * `statMaybe` with the reason kept.
+   *
+   * A caller that has to tell "this file is gone" from "this share is not
+   * there right now" needs the errno that `statMaybe`'s null throws away — the
+   * sfblob:// handler answering 404-expired vs 503-try-again is the one that
+   * does (see `blobMissStatus`). Everything else wants the plain null.
+   */
+  async statDetailed(rel: string): Promise<{ stat: { mtimeMs: number; size: number } | null; code?: string }> {
     this.note('stat')
     try {
       const s = await stat(this.abs(rel))
-      return { mtimeMs: s.mtimeMs, size: s.size }
-    } catch {
-      return null
+      return { stat: { mtimeMs: s.mtimeMs, size: s.size } }
+    } catch (err) {
+      return { stat: null, code: (err as NodeJS.ErrnoException).code }
     }
   }
 

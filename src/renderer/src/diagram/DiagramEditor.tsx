@@ -12,8 +12,12 @@ import { DIAGRAM_DEFAULT_TITLE, cleanTitle, diagramFileStem } from '@shared/diag
 import { useStore } from '@/store'
 import { Spinner } from '@/ui/atoms'
 import { ConfirmDialog } from '@/app/ChannelMenu'
+import { IconCollapse, IconExpand } from '@/app/icons'
 import { CloseIcon, DownloadIcon } from '@/content/icons'
-import { clearDraft, draftSlotOf, readDraft, writeDraft } from './drafts'
+import { LiveCloseDialog, LiveControls, LiveEndedBanner } from './LiveChrome'
+import { clearDraft, draftRestorable, draftSlotOf, readDraft, writeDraft } from './drafts'
+import { useLiveBoard } from './useLiveBoard'
+import { fullScreenKeyLabel, isFullScreenToggleKey } from './fullscreenKey'
 import { fetchBundledLibraries, libraryPayload } from './libraries'
 import { bytesToBase64, planDiagramSend, sceneSignature } from './scene'
 import { sanitizeScene } from './sanitize'
@@ -35,6 +39,7 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
   const channels = useStore((s) => s.channels)
   const groups = useStore((s) => s.groups)
   const send = useStore((s) => s.send)
+  const fullscreen = useStore((s) => s.fullscreen)
   const close = useCallback(() => useStore.getState().openDiagramEditor(null), [])
 
   const apiRef = useRef<ExcalidrawImperativeAPI | null>(null)
@@ -48,11 +53,28 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
   /** Fingerprint of the element array as of the last real edit — see `scheduleSave`. */
   const sig = useRef('')
   const saveTimer = useRef<number | null>(null)
+  /**
+   * Did *this editor* put the window in fullscreen? Only then does closing it
+   * take the window back out — see the unmount effect below.
+   */
+  const weWentFs = useRef(false)
+  /** Set by the first toggle, so the mount-time reconcile cannot overwrite it. */
+  const fsAsked = useRef(false)
 
-  // "New diagram here" and "edit a copy of that message" are two different
-  // pieces of unsent work; they used to share one draft key per conversation,
-  // so opening the second silently overwrote the first.
+  /** Every fullscreen request the editor makes goes through here, intent included. */
+  const setFullScreen = useCallback((on: boolean) => {
+    fsAsked.current = true
+    weWentFs.current = on
+    void window.bridge.app.setFullScreen(on).catch(() => {})
+  }, [])
+
+  // "New diagram here", "edit a copy of that message" and a live board are
+  // different pieces of unsent work; they used to share one draft key per
+  // conversation, so opening the second silently overwrote the first — and a
+  // live board published it to everyone. See drafts.ts.
   const slotKey = draftSlotOf(slot)
+  /** A live board's slot: its draft is written but never reopened (see drafts.ts). */
+  const liveSlot = !draftRestorable(slot)
 
   const viewOnly = slot.mode === 'view'
   const theme = settings?.theme === 'light' ? 'light' : 'dark'
@@ -70,6 +92,17 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
     window.setTimeout(() => setNote((n) => (n === msg ? null : n)), 3200)
   }, [])
 
+  // Live mode (1.3). The hook owns the session; everything below only asks it
+  // whether there is one. `bannerOff` is the dismissal of the "host ended it"
+  // notice, not the session's state — the hook keeps that.
+  const live = useLiveBoard({ apiRef, slot, title, viewOnly, flash })
+  /** Stable across renders (the hook memoizes it), so `scheduleSave` can depend on it. */
+  const isRemoteEcho = live.isRemoteEcho
+  const [bannerOff, setBannerOff] = useState(false)
+  /** The host's three-way close, and the host's "…and end the session" after a Send. */
+  const [liveClosing, setLiveClosing] = useState(false)
+  const [endAfterSend, setEndAfterSend] = useState<{ stem: string } | null>(null)
+
   // ---------------------------------------------------------------- initial
   // Resolved once (the component is keyed on the slot, so a new diagram is a
   // new mount): this slot's autosaved draft, else the scene it was opened with.
@@ -78,8 +111,10 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
   const initialData = useMemo(() => {
     // An unsent draft for THIS slot wins over the scene the slot was opened
     // with: it is the newer version of the same work, and the close dialog
-    // promised it would come back.
-    const restored = viewOnly ? null : readDraft(slot.conv, slotKey)
+    // promised it would come back. Never for a live board, though — a joiner's
+    // scene comes from the session's frames and a host's from the diagram they
+    // clicked Collaborate on (see `draftRestorable`).
+    const restored = viewOnly || !draftRestorable(slot) ? null : readDraft(slot.conv, slotKey)
     const json = restored?.scene ?? slot.scene ?? null
     if (restored && !slot.title) setTitle(restored.title || DIAGRAM_DEFAULT_TITLE)
     const parsed = json ? safeParse(json) : null
@@ -125,12 +160,17 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         const next = sceneSignature(elements)
         if (next === sig.current) return
         sig.current = next
+        // A peer's stroke arriving on a live board is not unsent work of ours:
+        // it must neither arm the "you have unsaved work" confirm nor spend a
+        // localStorage write. Without this, somebody who only watched a board
+        // was asked about losing a drawing they never touched.
+        if (isRemoteEcho(next)) return
       }
       dirty.current = true
       if (saveTimer.current !== null) window.clearTimeout(saveTimer.current)
       saveTimer.current = window.setTimeout(saveDraftNow, SAVE_DEBOUNCE_MS)
     },
-    [saveDraftNow, viewOnly],
+    [isRemoteEcho, saveDraftNow, viewOnly],
   )
 
   useEffect(
@@ -141,6 +181,13 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
   )
 
   const tryClose = useCallback(() => {
+    // Hosting a running board is the one close that costs other people
+    // something, so it asks first — End for everyone, or leave it running.
+    // A guest just leaves (the hook's unmount gives up their frame file).
+    if (live.session?.isHost) {
+      setLiveClosing(true)
+      return
+    }
     if (viewOnly || !dirty.current) {
       close()
       return
@@ -149,7 +196,7 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
     // work was kept even when the draft was too big for localStorage to hold —
     // which is exactly the case where the person needed to be told.
     setClosing({ kept: saveDraftNow() })
-  }, [close, saveDraftNow, viewOnly])
+  }, [close, live.session, saveDraftNow, viewOnly])
 
   // Esc closes the editor's own chrome — but NOT when the canvas has it.
   //
@@ -159,8 +206,21 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
   // down instead (behind a confirm, on top of unsent work). So: the confirm
   // first, then the export menu, then — only if the event did not come from
   // inside `.excalidraw` — the editor itself.
+  //
+  // F11 / ⌃⌘F (1.3) does NOT follow that rule: the canvas is where the pointer
+  // is for the whole time anybody wants to go fullscreen, and Excalidraw claims
+  // ⌃⌘F for its own element search, so bailing on `.excalidraw` targets meant
+  // the chord opened a search panel on macOS and F11 did nothing at all. This
+  // listener is on the window in the capture phase, so stopping the event here
+  // is what keeps it away from Excalidraw's own handler.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
+      if (isFullScreenToggleKey(e, window.bridge.platform)) {
+        e.stopPropagation()
+        e.preventDefault()
+        setFullScreen(!fullscreen)
+        return
+      }
       if (e.key !== 'Escape') return
       if (closing) {
         setClosing(null)
@@ -168,20 +228,73 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         e.preventDefault()
         return
       }
+      // The live dialogs run their own Escape (they have three answers, not
+      // two) — this handler must not also read it as "close the editor".
+      if (liveClosing || endAfterSend) return
       if (exportOpen) {
         setExportOpen(false)
         e.stopPropagation()
         return
       }
       const target = e.target as Element | null
-      if (target?.closest?.('.excalidraw')) return // Excalidraw's Escape, not ours
+      if (target?.closest?.('.excalidraw')) {
+        // Inside the canvas Escape is Excalidraw's — it leaves a text element,
+        // drops a selection, closes a panel. The one exception is fullscreen:
+        // there the canvas fills the screen, so Escape from it is the only way
+        // out that a person will look for, and swallowing it there was leaving
+        // people with no window chrome and no way back. Still Excalidraw's
+        // while it is mid-text-edit or holding a dialog open — those have
+        // something of their own to dismiss.
+        if (!fullscreen) return
+        const st = apiRef.current?.getAppState()
+        if (st?.editingTextElement || st?.openDialog) return
+      }
       e.stopPropagation()
       e.preventDefault()
+      // Esc leaves fullscreen first — a second Esc then closes the editor, same
+      // two-step as a confirm dialog swallowing the first Esc above.
+      if (fullscreen) {
+        setFullScreen(false)
+        return
+      }
       tryClose()
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [closing, exportOpen, tryClose])
+  }, [closing, endAfterSend, exportOpen, fullscreen, liveClosing, setFullScreen, tryClose])
+
+  // Closing the editor — however it happens (the header's Close button, a
+  // successful Send, the close-confirm dialog) — leaves OS fullscreen behind
+  // too: nobody wants the ordinary chat UI pinned edge-to-edge with the window
+  // chrome gone once the thing that asked for fullscreen is no longer up.
+  // Driven by unmount rather than by patching every close path, so it still
+  // holds for whatever live-session leave/end flow lands on top of `close`
+  // later.
+  //
+  // What it follows is this editor's *intent* (`weWentFs`), not the store's
+  // `fullscreen` flag, for two reasons. The flag is a push from the main
+  // process and arrives a beat after the request, so closing the editor during
+  // the transition left the window fullscreen forever; and it is equally true
+  // of a window the person had put fullscreen themselves before ever opening a
+  // diagram, which closing the editor then yanked out from under them.
+  useEffect(
+    () => () => {
+      if (weWentFs.current) void window.bridge.app.setFullScreen(false).catch(() => {})
+    },
+    [],
+  )
+
+  // Was the window already fullscreen when this editor opened? Then it is not
+  // ours to undo. Asked of the window itself rather than of the store, whose
+  // flag only exists once a transition has been pushed.
+  useEffect(() => {
+    void window.bridge.app
+      .isFullScreen()
+      .then((on) => {
+        if (on && !fsAsked.current) weWentFs.current = false
+      })
+      .catch(() => {})
+  }, [])
 
   // ----------------------------------------------------------------- send
   const doSend = useCallback(async () => {
@@ -210,9 +323,18 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         { json, png, w: bounds.w, h: bounds.h, elements: elements.length },
         { replyTo: slot.replyTo },
       )
-      await send(slot.conv, plan.draft)
+      const sent = await send(slot.conv, plan.draft)
       clearDraft(slot.conv, slotKey)
       dirty.current = false
+      // While a board is live, Send is a snapshot of where the drawing has got
+      // to — not the end of it. The editor stays up and the frames keep
+      // flowing; the host is then asked whether that snapshot was the finish.
+      if (live.session) {
+        setBusy(null)
+        if (live.session.isHost) setEndAfterSend({ stem: sent.id })
+        else flash(`Sent to ${convLabel} — the board is still live`)
+        return
+      }
       close()
     } catch (err) {
       const msg = String(err)
@@ -225,7 +347,7 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
       )
       setBusy(null)
     }
-  }, [busy, close, flash, send, slot.conv, slot.replyTo, slotKey, title])
+  }, [busy, close, convLabel, flash, live.session, send, slot.conv, slot.replyTo, slotKey, title])
 
   // --------------------------------------------------------------- export
   const doExport = useCallback(
@@ -343,19 +465,24 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
     >
       <header
         style={{
-          height: 52,
+          // Full screen (1.3): the header collapses to a slim 36px strip —
+          // title, the Live pill slot, the fullscreen toggle, Send, Close —
+          // and the canvas below gets the rest of the window.
+          height: fullscreen ? 36 : 52,
           flexShrink: 0,
           display: 'flex',
           alignItems: 'center',
           gap: 8,
-          padding: '0 12px 0 16px',
+          padding: fullscreen ? '0 8px' : '0 12px 0 16px',
           borderBottom: '1px solid var(--border-subtle)',
           background: 'var(--bg-panel)',
         }}
       >
-        <span aria-hidden style={{ fontSize: 15 }}>
-          📐
-        </span>
+        {!fullscreen && (
+          <span aria-hidden style={{ fontSize: 15 }}>
+            📐
+          </span>
+        )}
         <input
           value={title}
           readOnly={viewOnly}
@@ -378,69 +505,103 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
             outline: 'none',
           }}
         />
+        {/* Live boards (1.3): "Start live session" until there is one, then
+            the Live pill with everyone drawing, and the host's End. Kept in
+            its own module so this header stays one line. */}
+        <span className="sem-live-pill-slot" style={{ display: 'inline-flex', minWidth: 0 }}>
+          <LiveControls live={live} viewOnly={viewOnly} suppressStart={live.ended && !bannerOff} />
+        </span>
         <span style={{ flex: 1 }} />
 
-        {note && <span style={{ fontSize: 12, color: 'var(--warning)', whiteSpace: 'nowrap' }}>{note}</span>}
-
-        <div style={{ position: 'relative' }}>
-          <button
-            onClick={() => setExportOpen((v) => !v)}
-            aria-haspopup="menu"
-            aria-expanded={exportOpen}
-            title="Export this diagram to a file"
-            style={chromeBtn}
+        {/* The slim fullscreen header shows it too: these notices are the only
+            word anybody gets about a frame that was refused or a send that
+            queued, and in fullscreen there is nowhere else for them to go. */}
+        {note && (
+          <span
+            style={{
+              fontSize: 12,
+              color: 'var(--warning)',
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
           >
-            <DownloadIcon size={13} />
-            Export ▾
-          </button>
-          {exportOpen && (
-            <>
-              <div style={{ position: 'fixed', inset: 0, zIndex: 1 }} onMouseDown={() => setExportOpen(false)} />
-              <div
-                role="menu"
-                className="sem-popover"
-                style={{
-                  position: 'absolute',
-                  top: '100%',
-                  right: 0,
-                  marginTop: 6,
-                  zIndex: 2,
-                  minWidth: 190,
-                  padding: 4,
-                  background: 'var(--bg-raised)',
-                  border: '1px solid var(--border-subtle)',
-                  borderRadius: 'var(--r-md)',
-                  boxShadow: 'var(--elev-3)',
-                }}
-              >
-                {(
-                  [
-                    ['png', 'PNG image'],
-                    ['svg', 'SVG (vector)'],
-                    ['excalidraw', `Scene (${DIAGRAM.ext})`],
-                  ] as const
-                ).map(([kind, label]) => (
-                  <button
-                    key={kind}
-                    role="menuitem"
-                    onClick={() => void doExport(kind)}
-                    style={menuItem}
-                    onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-hover, var(--bg-panel))')}
-                    onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
+            {note}
+          </span>
+        )}
 
-        {!viewOnly && (
+        {!fullscreen && (
+          <div style={{ position: 'relative' }}>
+            <button
+              onClick={() => setExportOpen((v) => !v)}
+              aria-haspopup="menu"
+              aria-expanded={exportOpen}
+              title="Export this diagram to a file"
+              style={chromeBtn}
+            >
+              <DownloadIcon size={13} />
+              Export ▾
+            </button>
+            {exportOpen && (
+              <>
+                <div style={{ position: 'fixed', inset: 0, zIndex: 1 }} onMouseDown={() => setExportOpen(false)} />
+                <div
+                  role="menu"
+                  className="sem-popover"
+                  style={{
+                    position: 'absolute',
+                    top: '100%',
+                    right: 0,
+                    marginTop: 6,
+                    zIndex: 2,
+                    minWidth: 190,
+                    padding: 4,
+                    background: 'var(--bg-raised)',
+                    border: '1px solid var(--border-subtle)',
+                    borderRadius: 'var(--r-md)',
+                    boxShadow: 'var(--elev-3)',
+                  }}
+                >
+                  {(
+                    [
+                      ['png', 'PNG image'],
+                      ['svg', 'SVG (vector)'],
+                      ['excalidraw', `Scene (${DIAGRAM.ext})`],
+                    ] as const
+                  ).map(([kind, label]) => (
+                    <button
+                      key={kind}
+                      role="menuitem"
+                      onClick={() => void doExport(kind)}
+                      style={menuItem}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-hover, var(--bg-panel))')}
+                      onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {!fullscreen && !viewOnly && (
           <button onClick={() => void doImport()} title="Open a .excalidraw file (or an image with a scene)" style={chromeBtn}>
             Import…
           </button>
         )}
+
+        <button
+          onClick={() => setFullScreen(!fullscreen)}
+          aria-pressed={fullscreen}
+          aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}
+          title={fullScreenKeyLabel(window.bridge.platform)}
+          style={{ ...chromeBtn, padding: '0 8px' }}
+        >
+          {fullscreen ? <IconCollapse size={14} /> : <IconExpand size={14} />}
+        </button>
 
         {!viewOnly && (
           <button
@@ -467,13 +628,23 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         </button>
       </header>
 
+      {live.ended && !bannerOff && <LiveEndedBanner onDismiss={() => setBannerOff(true)} />}
+
       <div style={{ flex: 1, minHeight: 0, position: 'relative' }} className="sem-diagram-host">
         <Excalidraw
           excalidrawAPI={(api) => {
             apiRef.current = api
           }}
           initialData={initialData}
-          onChange={(elements) => scheduleSave(elements)}
+          onChange={(elements) => {
+            scheduleSave(elements)
+            // Live boards (1.3): the same call decides whether anything worth
+            // sharing changed. It re-reads the scene rather than using these
+            // elements — see the echo guard in useLiveBoard.
+            live.onSceneChange()
+          }}
+          onPointerUpdate={live.onPointerUpdate}
+          isCollaborating={live.session !== null}
           theme={theme}
           viewModeEnabled={viewOnly}
           name={title}
@@ -497,20 +668,72 @@ export default function DiagramEditor({ slot }: { slot: DiagramEditorState }) {
         // Above the editor's own 1100 (it lives inside this overlay's stacking
         // context, so this only has to beat Excalidraw's internal layers).
         <ConfirmDialog
-          title="Close this diagram?"
+          title={liveSlot ? 'Close this board?' : 'Close this diagram?'}
           message={
-            closing.kept
-              ? 'Your unsent work is kept as a draft — opening the diagram from this conversation again brings it straight back.'
-              : 'This drawing could not be saved as a draft (it is too large, or the local store is full), so closing it now loses the unsent work.'
+            // A live board's draft is never reopened (see drafts.ts), so this
+            // must not promise that it is: what was drawn while the board was
+            // live is already with everyone who was on it, and the copy in this
+            // window is not coming back.
+            liveSlot
+              ? 'Anything you drew while the board was live is already with everybody who was on it. This window’s copy is not reopened later — send it to the conversation if you want it kept.'
+              : closing.kept
+                ? 'Your unsent work is kept as a draft — opening the diagram from this conversation again brings it straight back.'
+                : 'This drawing could not be saved as a draft (it is too large, or the local store is full), so closing it now loses the unsent work.'
           }
-          confirmLabel={closing.kept ? 'Close' : 'Close and lose it'}
-          tone={closing.kept ? 'primary' : 'danger'}
+          confirmLabel={liveSlot || closing.kept ? 'Close' : 'Close and lose it'}
+          tone={liveSlot || closing.kept ? 'primary' : 'danger'}
           zIndex={1200}
           onConfirm={() => {
             setClosing(null)
             close()
           }}
           onClose={() => setClosing(null)}
+        />
+      )}
+
+      {liveClosing && (
+        <LiveCloseDialog
+          participants={live.participants.length}
+          busy={live.busy !== null}
+          onEnd={() => {
+            setLiveClosing(false)
+            saveDraftNow()
+            // Closed only once the board really ended: a refused `end` leaves
+            // the session running, and walking out of the editor on the
+            // strength of a request that failed is how a host ends up believing
+            // they shut down a board that everyone else is still drawing on.
+            void live.end().then((ended) => {
+              if (ended) close()
+            })
+          }}
+          onLeave={() => {
+            // The hook's unmount is what gives up this device's frame file, so
+            // "keep it running" is simply a close.
+            setLiveClosing(false)
+            saveDraftNow()
+            close()
+          }}
+          onCancel={() => setLiveClosing(false)}
+        />
+      )}
+
+      {endAfterSend && (
+        <ConfirmDialog
+          title={`Sent to ${convLabel}`}
+          message="That snapshot is now in the conversation. The live board is still running — end it for everyone, or keep drawing."
+          confirmLabel="End the session"
+          tone="primary"
+          zIndex={1200}
+          onConfirm={() => {
+            // `board-ended` carries the snapshot's event id, so the notice can
+            // point at the version the board finished on.
+            const stem = endAfterSend.stem
+            setEndAfterSend(null)
+            void live.end(stem).then((ended) => {
+              if (ended) close()
+            })
+          }}
+          onClose={() => setEndAfterSend(null)}
         />
       )}
     </div>

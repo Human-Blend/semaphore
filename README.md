@@ -36,8 +36,17 @@ the only thing every machine can reach is an SMB share.
   AirDrop-style, with accept/decline.
 - **Diagrams** — a FigJam-style whiteboard built into the composer
   (Excalidraw): sketch a diagram and send it inline, export to PNG/SVG/
-  `.excalidraw`, or drop a file in to import and keep editing. Works fully
-  offline, bundled shape libraries included.
+  `.excalidraw`, or drop a file in to import and keep editing. Opens full
+  screen (F11, or ⌃⌘F on macOS) for serious work. Works fully offline,
+  bundled shape libraries included.
+- **Live boards** — turn any diagram into a real-time session anyone in the
+  conversation can join and draw in together, carried entirely by the shared
+  folder (no server, ~1–2 s latency) at roughly 7 share operations a second
+  per person while a session runs, and zero once it's closed.
+- **Polls & quick decisions** — ask a question with 2–10 options (multiple
+  choice, and anonymous-in-the-UI if you like), or use the Yes/No/Abstain
+  preset for a clean "Decided: Yes (4–1)" once it closes. Every vote is still
+  a signed event on the share; anonymous only hides names in the app.
 - **Link previews** (Apple-Messages style), **code blocks** with syntax
   highlighting + copy button (22 languages, selectable from a dropdown,
   TypeScript by default), **reactions, pins, edits, mentions**.

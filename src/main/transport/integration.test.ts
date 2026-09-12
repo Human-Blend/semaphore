@@ -1,32 +1,39 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { GroupView } from '@shared/bridge'
+import type { GroupView, PushMessage } from '@shared/bridge'
 import type {
   BeaconContent,
+  BoardFrame,
   CalPayload,
   CalendarEntry,
   ConvId,
   GroupInviteData,
   GrpPayload,
   MsgPayload,
+  PollBody,
   SysPayload,
+  VotPayload,
 } from '@shared/types'
 import { DIR, DST, KID, RETENTION, TEAM_CONV } from '@shared/constants'
 import { materializeCalendar } from '@shared/calendar'
+import { pollFallbackText } from '@shared/poll'
 import { beaconFileName, dayShard, isChanConv, seqToBase36 } from '@shared/ids'
 import { materialize } from '@shared/merge'
-import { buildAad, encryptRecord, recordKid } from '../crypto/envelope'
+import { buildAad, decryptRecord, encryptRecord, recordKid } from '../crypto/envelope'
 import { generateIdentity, signRecord, type DeviceIdentity } from '../crypto/identity'
+import { BoardService } from '../services/boards'
 import { fixedChannelId, foldChannelSys } from '../services/channels'
+import type { IoTier } from '../services/ioTier'
 import { GroupPartialError, GroupService } from '../services/groups'
 import { Janitor } from '../services/janitor'
 import type { SecretStore } from '../store/secretStore'
 import { BeaconWriter, BeaconReader } from './beacon'
 import { createOrJoinTeam } from './bootstrap'
 import { EventStore } from './events'
+import { Poller } from './poller'
 import { Roster } from './roster'
 import { Session } from './session'
 import { ShareIo } from './shareIo'
@@ -625,9 +632,10 @@ describe('private groups over a shared folder', () => {
     const seen = (await bob.reader.poll()).find((o) => o.content.device === alice.identity.deviceId)!
     const token = dmBetween(bob, alice).slice(3)
     const section = seen.dmSections.get(token)!
-    // `heads` is the field a 1.1 client reads and feeds to its own ingest. A
-    // name it cannot parse reads as a missing head there, and costs it a full
-    // day-directory walk of this DM on every beacon we publish afterwards.
+    // `heads` is the field a 1.1 client reads and feeds to its own ingest, and
+    // it holds 16 names: a `.grp.e1` in there is skipped by that client (its
+    // ingest drops a name it cannot parse before the gap check), but it would be
+    // sitting in a slot this DM's real `msg` heads need. Own ring, own budget.
     expect(section.heads.some((h) => h.endsWith('.grp.e1'))).toBe(false)
     expect(section.grpHeads?.some((h) => h.endsWith('.grp.e1'))).toBe(true)
 
@@ -1217,4 +1225,556 @@ describe('private groups over a shared folder', () => {
       expect(materialize(events.getEvents(target)).messages.map((m) => m.body.text)).toContain('after bob went away')
     }, 90_000)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Polls over the share (1.3). The protocol question here is not the tally — it
+// is the beacon. `heads` is a 16-name ring per conversation, and votes are the
+// one event type that arrives in a burst: a poll with a dozen voters would push
+// every `msg` filename out of the ring before a 1.2 peer next polls, and that
+// peer — which ingests from `heads` and skips the names it cannot parse, gap
+// logic untouched — would stop hearing about real messages there and wait for
+// its next bounded day scan instead. `heads2` is a field it has never heard of:
+// its own budget for votes, and nothing at all for that reader to do.
+
+describe('poll votes over a shared folder', () => {
+  const root = mkdtempSync(join(tmpdir(), 'semaphore-polls-'))
+  const pass = 'correct horse battery staple'
+  let alice: Client
+  let bob: Client
+
+  /** Exactly the filename pattern a 1.2 client compiles — no `vot` in it. */
+  const EVENT_RE_1_2 = /^(\d{13})-(\d{4})-([0-9a-f]{8})\.(msg|edt|del|rct|pin|sys|prv|cal|prs|grp)\.e1$/
+
+  const poll: PollBody = {
+    question: 'Ship on Friday?',
+    options: [
+      { id: 'yes', text: 'Yes' },
+      { id: 'no', text: 'No' },
+      { id: 'abstain', text: 'Abstain' },
+    ],
+    multi: false,
+    anonymous: false,
+    decision: true,
+  }
+
+  async function sendPoll(client: Client, conv: ConvId): Promise<string> {
+    const ev = await client.events.publish(conv, 'msg', {
+      t: 'msg',
+      conv,
+      author: { device: client.identity.deviceId, name: client.session.displayName },
+      senderSeq: client.session.nextSenderSeq(conv),
+      sentWall: Date.now(),
+      body: { kind: 'poll', text: pollFallbackText(poll.question), poll },
+    } satisfies MsgPayload)
+    client.writer.noteOwnEvent(conv, `${ev.id}.msg.e1`)
+    return ev.id
+  }
+
+  async function vote(client: Client, conv: ConvId, target: string, choice: string[]): Promise<string> {
+    const ev = await client.events.publish(conv, 'vot', { t: 'vot', conv, target, choice } satisfies VotPayload)
+    client.writer.noteOwnEvent(conv, `${ev.id}.vot.e1`)
+    return ev.id
+  }
+
+  beforeAll(async () => {
+    alice = await makeClient(root, pass, 'Alice')
+    bob = await makeClient(root, pass, 'Bob')
+    for (const c of [alice, bob]) {
+      await c.session.roster.refresh()
+      c.session.refreshDms()
+    }
+  }, 90_000)
+
+  it('rides heads2 in a channel: the poller ingests it with no directory scan', async () => {
+    const ch = await alice.session.createChannel('poll-heads')
+    const conv: ConvId = `chan:${ch.channelId}`
+    const target = await sendPoll(alice, conv)
+    await alice.writer.bump('event')
+
+    // Bob is level with the poll itself before the vote, so nothing below can
+    // be explained away by a catch-up he owed anyway.
+    await bob.session.loadChannels()
+    await bob.events.catchUp(conv)
+    expect(bob.events.has(conv, target)).toBe(true)
+
+    const voteId = await vote(alice, conv, target, ['yes'])
+    await alice.writer.bump('event')
+
+    const obs = (await bob.reader.poll()).find((o) => o.content.device === alice.identity.deviceId)!
+    expect(obs.verified).toBe(true)
+    expect(obs.content.heads[conv].some((h) => h.endsWith('.vot.e1'))).toBe(false)
+    expect(obs.content.heads[conv].every((h) => EVENT_RE_1_2.test(h))).toBe(true)
+    expect(obs.content.heads2?.[conv]).toContain(`${voteId}.vot.e1`)
+
+    // The read side, end to end: one beacon observation, no sweep, and the
+    // vote is in Bob's log and on his copy of the poll. The point of `heads2` is
+    // that this costs a readdir of beacon/ and one file read — so the directory
+    // scan `ingestHeads` falls back to on a gap must not happen at all.
+    const catchUp = vi.spyOn(bob.events, 'catchUp')
+    const poller = new Poller(bob.session, bob.events)
+    ;(poller as unknown as { lastSweepAt: number }).lastSweepAt = Date.now()
+    await poller.tick()
+    expect(catchUp).not.toHaveBeenCalled()
+    catchUp.mockRestore()
+    expect(bob.events.has(conv, voteId)).toBe(true)
+    expect(materialize(bob.events.getEvents(conv)).messages.find((m) => m.id === target)?.votes).toEqual({
+      [alice.identity.deviceId]: ['yes'],
+    })
+  }, 90_000)
+
+  it('rides heads2 inside the sealed DM section too', async () => {
+    const conv = dmBetween(alice, bob)
+    const target = await sendPoll(alice, conv)
+    const voteId = await vote(alice, conv, target, ['no'])
+    await alice.writer.bump('event')
+
+    const obs = (await bob.reader.poll()).find((o) => o.content.device === alice.identity.deviceId)!
+    const section = obs.dmSections.get(dmBetween(bob, alice).slice(3))!
+    // `heads` is the field a 1.1/1.2 peer reads out of *their own* DM section.
+    expect(section.heads.some((h) => h.endsWith('.vot.e1'))).toBe(false)
+    expect(section.heads.every((h) => EVENT_RE_1_2.test(h))).toBe(true)
+    expect(section.heads2).toContain(`${voteId}.vot.e1`)
+
+    await bob.events.ingestHeads(conv, [...section.heads, ...(section.heads2 ?? [])])
+    expect(bob.events.has(conv, voteId)).toBe(true)
+    expect(materialize(bob.events.getEvents(conv)).messages.find((m) => m.id === target)?.votes).toEqual({
+      [alice.identity.deviceId]: ['no'],
+    })
+  }, 90_000)
+
+  it('never lets a vote into the heads ring an older client reads', async () => {
+    const conv = dmBetween(alice, bob)
+    const sealed = (alice.writer as unknown as { sealedSections: Map<ConvId, { heads: string[] }> }).sealedSections
+    const before = [...(sealed.get(conv)?.heads ?? [])]
+
+    // A message moves the ring a 1.2 peer reads; a vote on it does not.
+    const target = await sendPoll(alice, conv)
+    expect(sealed.get(conv)!.heads).toEqual([...before, `${target}.msg.e1`])
+    const afterMsg = [...sealed.get(conv)!.heads]
+    await vote(alice, conv, target, ['yes'])
+    expect(sealed.get(conv)!.heads).toEqual(afterMsg)
+
+    // And the whole beacon, as an older reader parses it: every name it finds
+    // in `heads` — plain and sealed — still matches the pattern it compiles.
+    await alice.writer.bump('event')
+    const obs = (await bob.reader.poll()).find((o) => o.content.device === alice.identity.deviceId)!
+    expect(obs.verified).toBe(true)
+    for (const names of Object.values(obs.content.heads ?? {})) {
+      expect(names.every((h) => EVENT_RE_1_2.test(h))).toBe(true)
+    }
+    for (const section of obs.dmSections.values()) {
+      expect(section.heads.every((h) => EVENT_RE_1_2.test(h))).toBe(true)
+    }
+    // The unknown field itself is the thing an older reader shrugs at — the
+    // 1.2 suite pins that shape from the other direction ("reads an unknown
+    // field without flinching"); here it is ours, and it is populated.
+    expect(Object.keys(obs.content.heads2 ?? {}).length).toBeGreaterThan(0)
+  }, 90_000)
+
+  it('a head name a reader cannot parse costs it no catch-up at all', async () => {
+    // What a 1.2 client actually does with a `.vot.e1` name in `heads`: nothing.
+    // `ingestHeads` skips a filename that does not parse — `if (!parsed)
+    // continue`, *before* the gap branch — and 1.2's copy of that method has the
+    // same shape, so such a name costs it no day scan and no read. Pinned here
+    // with the current reader and a type *it* cannot parse, which takes exactly
+    // the path a `.vot.e1` takes one version back. (The reason votes ride
+    // `heads2` is the 16-slot ring, not this — see the preamble.)
+    const conv = dmBetween(alice, bob)
+    const future = `${String(Date.now()).padStart(13, '0')}-0001-${alice.identity.deviceId.slice(0, 8)}.zzz.e1`
+    const catchUp = vi.spyOn(bob.events, 'catchUp')
+    expect(await bob.events.ingestHeads(conv, [future])).toBe(false)
+    expect(catchUp).not.toHaveBeenCalled()
+
+    // And a `.vot.e1` the reader *can* parse: one read the first time, and the
+    // second pass finds the stem in the log and returns — still no scan.
+    const target = await sendPoll(alice, conv)
+    const voteId = await vote(alice, conv, target, ['yes'])
+    expect(await bob.events.ingestHeads(conv, [`${voteId}.vot.e1`])).toBe(true)
+    expect(await bob.events.ingestHeads(conv, [`${voteId}.vot.e1`])).toBe(false)
+    expect(catchUp).not.toHaveBeenCalled()
+    catchUp.mockRestore()
+  }, 90_000)
+})
+
+// ---------------------------------------------------------------------------
+// Live boards (1.3): a real-time diagram session carried by the folder, one
+// file per participant under boards/<sessionId>/. What matters here is what
+// two real clients see of each other — delivery exactly once in seq order, the
+// single file a writer ever owns, and every way a frame can be a lie.
+
+describe('live boards over a shared folder', () => {
+  const root = mkdtempSync(join(tmpdir(), 'semaphore-boards-'))
+  const pass = 'correct horse battery staple'
+  let alice: Client
+  let bob: Client
+  let carol: Client
+  let aliceBoards: BoardService
+  let bobBoards: BoardService
+  const alicePushes: PushMessage[] = []
+  const bobPushes: PushMessage[] = []
+  // The tier stays 'paused' so the background poll loop never races a
+  // hand-driven pollOnce; the cadence itself is tested in boards.test.ts.
+  const tier = { value: 'paused' as IoTier }
+  let conv: ConvId
+
+  const boardsFor = (c: Client, pushes: PushMessage[]): BoardService =>
+    new BoardService(
+      c.session,
+      { events: c.events, noteOwnEvent: (cv, f) => c.writer.noteOwnEvent(cv, f), tier: () => tier.value },
+      (m) => pushes.push(m),
+    )
+
+  const scene = (ids: string[]): { elements: unknown[] } => ({
+    elements: ids.map((id, i) => ({ id, type: 'rectangle', version: i + 1, versionNonce: i + 7, isDeleted: false })),
+  })
+
+  const framesOf = (pushes: PushMessage[], sessionId: string): BoardFrame[] =>
+    pushes.flatMap((p) => (p.kind === 'board-frames' && p.sessionId === sessionId ? p.frames : []))
+
+  const endedFor = (pushes: PushMessage[], sessionId: string): number =>
+    pushes.filter((p) => p.kind === 'board-ended' && p.sessionId === sessionId).length
+
+  const filesIn = (sessionId: string): string[] => {
+    const dir = join(root, DIR.boards, sessionId)
+    return existsSync(dir) ? readdirSync(dir).filter((n) => !n.endsWith('.partial')) : []
+  }
+
+  /**
+   * Write a frame file by hand, so a test can lie in exactly one way: sign it
+   * with a device the roster never heard of, park it in someone else's slot, or
+   * claim a `device` the signature does not back.
+   */
+  async function plantFrame(
+    writer: Client,
+    sessionId: string,
+    target: ConvId,
+    opts: { identity: DeviceIdentity; slotDevice: string; frameDevice: string; seq: number; frameSeq?: number },
+  ): Promise<void> {
+    const info = writer.session.convInfo(target)!
+    const fileName = beaconFileName(opts.slotDevice, opts.seq)
+    const rel = `${DIR.boards}/${sessionId}/${fileName}`
+    const frame = {
+      sessionId,
+      device: opts.frameDevice,
+      name: 'Mallory',
+      seq: opts.frameSeq ?? opts.seq,
+      at: Date.now(),
+      elements: [{ id: `planted-${opts.seq}`, type: 'rectangle', version: 1, versionNonce: 1 }],
+    }
+    const signed = signRecord(opts.identity, DST.record, frame)
+    const aad = buildAad('board', rel, fileName)
+    await writer.io.publish(
+      rel,
+      encryptRecord(info.key, KID.board(sessionId, info.kid), Buffer.from(JSON.stringify(signed)), aad),
+    )
+  }
+
+  /** Junk in someone's slot: a file nothing can decrypt, at a seq of our choosing. */
+  async function plantJunk(writer: Client, sessionId: string, slotDevice: string, seq: number): Promise<void> {
+    const fileName = beaconFileName(slotDevice, seq)
+    await writer.io.publish(`${DIR.boards}/${sessionId}/${fileName}`, randomBytes(256))
+  }
+
+  beforeAll(async () => {
+    alice = await makeClient(root, pass, 'Alice')
+    bob = await makeClient(root, pass, 'Bob')
+    carol = await makeClient(root, pass, 'Carol')
+    for (const c of [alice, bob, carol]) {
+      await c.session.roster.refresh()
+      c.session.refreshDms()
+    }
+    const ch = await alice.session.createChannel('boards')
+    conv = `chan:${ch.channelId}`
+    await bob.session.loadChannels()
+    await carol.session.loadChannels()
+    aliceBoards = boardsFor(alice, alicePushes)
+    bobBoards = boardsFor(bob, bobPushes)
+  }, 120_000)
+
+  afterAll(async () => {
+    await aliceBoards?.stop()
+    await bobBoards?.stop()
+  })
+
+  beforeEach(() => {
+    alicePushes.length = 0
+    bobPushes.length = 0
+  })
+
+  it('delivers each frame exactly once, in seq order, from one file per writer', async () => {
+    const { sessionId } = await aliceBoards.start(conv, 'Sprint plan')
+    await aliceBoards.write(sessionId, conv, scene(['a', 'b']))
+    await aliceBoards.flushWrites()
+
+    // Bob learns the session exists the ordinary way: a sys event in the log.
+    await bob.events.catchUp(conv)
+    expect(bobBoards.info(conv, sessionId)?.host).toBe(alice.identity.deviceId)
+
+    const joined = await bobBoards.join(sessionId, conv)
+    expect(joined.frames).toHaveLength(1)
+    expect(joined.frames[0].device).toBe(alice.identity.deviceId)
+    expect(joined.frames[0].name).toBe('Alice')
+    expect(joined.frames[0].elements).toHaveLength(2)
+    // Joining read the whole session; polling again has nothing to say.
+    await bobBoards.pollOnce(sessionId)
+    expect(framesOf(bobPushes, sessionId)).toHaveLength(0)
+
+    await aliceBoards.write(sessionId, conv, scene(['a', 'b', 'c']))
+    await aliceBoards.flushWrites()
+    // One file each: Alice's previous seq went with the rename, and Bob has one
+    // because joining publishes a frame of its own (that is what puts a watcher
+    // in everyone else's pointer list).
+    expect(filesIn(sessionId).sort()).toEqual(
+      [beaconFileName(alice.identity.deviceId, 1), beaconFileName(bob.identity.deviceId, 0)].sort(),
+    )
+
+    await bobBoards.pollOnce(sessionId)
+    const delivered = framesOf(bobPushes, sessionId)
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0].seq).toBe(1)
+    expect(delivered[0].elements).toHaveLength(3)
+    // Exactly once: the same seq is never delivered a second time.
+    await bobBoards.pollOnce(sessionId)
+    await bobBoards.pollOnce(sessionId)
+    expect(framesOf(bobPushes, sessionId)).toHaveLength(1)
+
+    // Both drawing: one file each, and neither ever reads its own back. Bob's
+    // seq continues from his join frame rather than starting over.
+    await bobBoards.write(sessionId, conv, scene(['d']))
+    await bobBoards.flushWrites()
+    expect(filesIn(sessionId).sort()).toEqual(
+      [beaconFileName(alice.identity.deviceId, 1), beaconFileName(bob.identity.deviceId, 1)].sort(),
+    )
+    const aliceJoin = await aliceBoards.join(sessionId, conv)
+    expect(aliceJoin.frames.map((f) => f.device)).toEqual([bob.identity.deviceId])
+
+    await aliceBoards.leave(sessionId, conv)
+    await bobBoards.leave(sessionId, conv)
+  }, 120_000)
+
+  it('keeps a DM board readable by the pair and opaque to everyone else', async () => {
+    const dm = dmBetween(alice, bob)
+    const { sessionId } = await aliceBoards.start(dm, 'Private sketch')
+    await aliceBoards.write(sessionId, dm, scene(['secret']))
+    await aliceBoards.flushWrites()
+
+    const fileName = beaconFileName(alice.identity.deviceId, 0)
+    const rel = `${DIR.boards}/${sessionId}/${fileName}`
+    const raw = readFileSync(join(root, DIR.boards, sessionId, fileName))
+    // The conversation's own kid rides in the frame's: for a DM that is the pair
+    // token, for a private group the epoch (which is how a reader that has not
+    // been handed the new key yet knows to wait for it rather than drop frames).
+    expect(recordKid(raw)).toBe(`board/${sessionId}/${alice.session.convInfo(dm)!.kid}`)
+    expect(recordKid(raw).startsWith(`board/${sessionId}/dm/`)).toBe(true)
+
+    // Carol is a fully paid-up member of the team — and still holds nothing
+    // that opens this frame: the DM key is the only thing that does.
+    expect(carol.session.convInfo(dm)).toBeNull()
+    const aad = buildAad('board', rel, fileName)
+    for (const key of [carol.session.keys.kMeta, carol.session.keys.kPres, carol.session.keys.tmk]) {
+      expect(() => decryptRecord(raw, key, aad)).toThrow()
+    }
+
+    // The other half of the pair reads it without ceremony.
+    await bob.events.catchUp(dm)
+    const joined = await bobBoards.join(sessionId, dm)
+    expect(joined.frames).toHaveLength(1)
+    expect((joined.frames[0].elements[0] as { id: string }).id).toBe('secret')
+
+    await bobBoards.leave(sessionId, dm)
+    await aliceBoards.leave(sessionId, dm)
+  }, 120_000)
+
+  it('drops a frame nobody signed for and one whose device is a forgery', async () => {
+    const { sessionId } = await aliceBoards.start(conv, 'Forgeries')
+    await aliceBoards.write(sessionId, conv, scene(['a']))
+    await aliceBoards.flushWrites()
+    await bob.events.catchUp(conv)
+    await bobBoards.join(sessionId, conv)
+    bobPushes.length = 0
+
+    // A stranger's signature: the team key let them write the file, the roster
+    // is what refuses to call it anyone's frame.
+    const stranger = generateIdentity().identity
+    await plantFrame(alice, sessionId, conv, {
+      identity: stranger,
+      slotDevice: stranger.deviceId,
+      frameDevice: stranger.deviceId,
+      seq: 0,
+    })
+    // Carol's own signature, in Carol's own slot, claiming to be Alice: the
+    // `device` field is what the renderer colours and labels by, so a frame
+    // whose signer does not match it is not delivered at all.
+    await plantFrame(carol, sessionId, conv, {
+      identity: carol.identity,
+      slotDevice: carol.identity.deviceId,
+      frameDevice: alice.identity.deviceId,
+      seq: 0,
+    })
+    await bobBoards.pollOnce(sessionId)
+    expect(framesOf(bobPushes, sessionId)).toHaveLength(0)
+
+    // And an honest frame from the same device still arrives right after —
+    // the refusal moved the cursor past the bad file rather than sticking.
+    await plantFrame(carol, sessionId, conv, {
+      identity: carol.identity,
+      slotDevice: carol.identity.deviceId,
+      frameDevice: carol.identity.deviceId,
+      seq: 1,
+    })
+    await bobBoards.pollOnce(sessionId)
+    const delivered = framesOf(bobPushes, sessionId)
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0].device).toBe(carol.identity.deviceId)
+
+    // A frame whose own seq disagrees with the slot it is sitting in: the
+    // reader's cursor moves by the file name, so delivering this would hand the
+    // renderer a frame under a number it never claimed.
+    bobPushes.length = 0
+    await plantFrame(carol, sessionId, conv, {
+      identity: carol.identity,
+      slotDevice: carol.identity.deviceId,
+      frameDevice: carol.identity.deviceId,
+      seq: 2,
+      frameSeq: 99,
+    })
+    await bobBoards.pollOnce(sessionId)
+    expect(framesOf(bobPushes, sessionId)).toHaveLength(0)
+
+    await bobBoards.leave(sessionId, conv)
+    await aliceBoards.leave(sessionId, conv)
+  }, 120_000)
+
+  it('a junk file at a high seq does not mute the device whose slot it is in', async () => {
+    const { sessionId } = await aliceBoards.start(conv, 'Junk')
+    await aliceBoards.write(sessionId, conv, scene(['a']))
+    await aliceBoards.flushWrites()
+    await bob.events.catchUp(conv)
+    await bobBoards.join(sessionId, conv)
+    bobPushes.length = 0
+
+    // Anyone in the team can write a file into the directory — only the
+    // conversation key decides what can be *read*. One unreadable file at a seq
+    // far above anything real used to silence that participant for the rest of
+    // the session: it was the only candidate the reader looked at, and the
+    // cursor advanced past it even though the frame was refused.
+    await plantJunk(bob, sessionId, alice.identity.deviceId, 500)
+    await aliceBoards.write(sessionId, conv, scene(['a', 'b']))
+    await aliceBoards.flushWrites()
+    await bobBoards.pollOnce(sessionId)
+    // The junk is the newest file in Alice's slot; her real frame is under it,
+    // and is what gets delivered.
+    const first = framesOf(bobPushes, sessionId)
+    expect(first).toHaveLength(1)
+    expect(first[0].device).toBe(alice.identity.deviceId)
+    expect(first[0].seq).toBe(1)
+    expect(first[0].elements).toHaveLength(2)
+
+    // And she keeps being heard: every later frame is delivered too, with the
+    // junk costing exactly one read, once.
+    bobPushes.length = 0
+    await aliceBoards.write(sessionId, conv, scene(['a', 'b', 'c']))
+    await aliceBoards.flushWrites()
+    await bobBoards.pollOnce(sessionId)
+    const second = framesOf(bobPushes, sessionId)
+    expect(second).toHaveLength(1)
+    expect(second[0].seq).toBe(2)
+    expect(second[0].elements).toHaveLength(3)
+
+    await bobBoards.leave(sessionId, conv)
+    await aliceBoards.leave(sessionId, conv)
+  }, 120_000)
+
+  it('keeps a private-group board opaque to a non-member, and readable across a rekey', async () => {
+    // Carol is in the group to begin with, and is removed mid-session: that is
+    // what rotates the key while a board is running.
+    const view = await alice.groups.create('Board crew', [bob.identity.deviceId, carol.identity.deviceId])
+    const gconv = view.conv
+    await syncInvites(bob, alice)
+    await syncInvites(carol, alice)
+
+    const { sessionId } = await aliceBoards.start(gconv, 'Group sketch')
+    await aliceBoards.write(sessionId, gconv, scene(['g1']))
+    await aliceBoards.flushWrites()
+
+    const fileName = beaconFileName(alice.identity.deviceId, 0)
+    const raw = readFileSync(join(root, DIR.boards, sessionId, fileName))
+    expect(recordKid(raw)).toBe(`board/${sessionId}/${alice.session.convInfo(gconv)!.kid}`)
+
+    await bob.events.catchUp(gconv)
+    const joined = await bobBoards.join(sessionId, gconv)
+    expect(joined.frames).toHaveLength(1)
+    expect((joined.frames[0].elements[0] as { id: string }).id).toBe('g1')
+
+    // Removing Carol rotates to epoch 2. Alice's next frame is written under the
+    // new key; Bob has not been handed it yet (his rekey DM is still sitting in
+    // the log), so the frame is PARKED, not refused — a refusal would be
+    // permanent and would cost him every frame for the rest of the session.
+    await alice.groups.removeMember(gconv, carol.identity.deviceId)
+    expect(alice.groups.views().find((g) => g.conv === gconv)?.epoch).toBe(2)
+    bobPushes.length = 0
+    await aliceBoards.write(sessionId, gconv, scene(['g1', 'g2']))
+    await aliceBoards.flushWrites()
+    await bobBoards.pollOnce(sessionId)
+    expect(framesOf(bobPushes, sessionId)).toHaveLength(0)
+
+    // The rekey arrives, and the same file — untouched on the share — is read on
+    // the next poll.
+    await syncInvites(bob, alice)
+    expect(bob.groups.views().find((g) => g.conv === gconv)?.epoch).toBe(2)
+    await bobBoards.pollOnce(sessionId)
+    const after = framesOf(bobPushes, sessionId)
+    expect(after).toHaveLength(1)
+    expect(after[0].elements).toHaveLength(2)
+
+    // Carol was a member a moment ago and still holds the epoch-1 key: the
+    // frames written since the rotation are not hers to read, and the group is
+    // gone from her client entirely.
+    await carol.events.catchUp(dmBetween(carol, alice))
+    await carol.groups.settle()
+    expect(carol.session.convInfo(gconv)).toBeNull()
+    expect(carol.groups.views().find((g) => g.conv === gconv)).toBeUndefined()
+
+    await bobBoards.leave(sessionId, gconv)
+    await aliceBoards.end(sessionId, gconv)
+  }, 120_000)
+
+  it('ends for everyone when the host says so, and refuses when anyone else does', async () => {
+    const { sessionId } = await aliceBoards.start(conv, 'Retro')
+    await aliceBoards.write(sessionId, conv, scene(['a']))
+    await aliceBoards.flushWrites()
+    await bob.events.catchUp(conv)
+    await bobBoards.join(sessionId, conv)
+
+    await expect(bobBoards.end(sessionId, conv)).rejects.toThrow('not-host')
+    expect(existsSync(join(root, DIR.boards, sessionId))).toBe(true)
+
+    await aliceBoards.end(sessionId, conv)
+    expect(existsSync(join(root, DIR.boards, sessionId))).toBe(false)
+
+    // Bob hears it through the log, stops polling, and says so exactly once.
+    await bob.events.catchUp(conv)
+    expect(endedFor(bobPushes, sessionId)).toBe(1)
+    await bobBoards.pollOnce(sessionId)
+    expect(endedFor(bobPushes, sessionId)).toBe(1)
+  }, 120_000)
+
+  it('ends a joined session when the directory disappears under it', async () => {
+    const { sessionId } = await aliceBoards.start(conv, 'Ghost')
+    await aliceBoards.write(sessionId, conv, scene(['a']))
+    await aliceBoards.flushWrites()
+    await bob.events.catchUp(conv)
+    await bobBoards.join(sessionId, conv)
+    bobPushes.length = 0
+
+    // No `board-ended` reaches Bob at all — the janitor swept a dead session,
+    // or the host's machine went away with it.
+    aliceBoards.stop()
+    await alice.io.delete(`${DIR.boards}/${sessionId}`)
+    await bobBoards.pollOnce(sessionId)
+    expect(endedFor(bobPushes, sessionId)).toBe(1)
+    await bobBoards.pollOnce(sessionId)
+    expect(endedFor(bobPushes, sessionId)).toBe(1)
+  }, 120_000)
 })

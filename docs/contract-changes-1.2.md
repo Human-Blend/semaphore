@@ -151,10 +151,19 @@ without a trace. Nothing was reshaped:
   cannot repeat when 1.3 adds a kind. Pinned by `renderer/src/chat/sysLine.test.ts`.
 - `DmBeaconSection` += `grpHeads?: string[]` (ring of 4). `noteOwnEvent` must
   **not** put a `.grp.e1` name in `heads`: the DM peer may be a 1.1 client, it
-  *can* open that section (it is their DM), and a filename it cannot parse reads
-  there as a missing head — costing it a full `catchUp` of the DM on every
-  beacon we publish. An unknown field costs it nothing. 1.2 readers ingest
-  `grpHeads` in `processObservation`.
+  *can* open that section (it is their DM), and a filename it cannot parse costs
+  it nothing by itself — `ingestHeads` skips a name it cannot parse before the
+  gap check, in 1.1 exactly as in 1.2, so it never reads as a missing head. The
+  real cost is the ring: `heads` holds a fixed number of names per conversation,
+  and a burst of invites/rekeys would evict the `msg` filenames a 1.1 reader
+  actually ingests from it, costing it a full `catchUp` day scan to find real
+  messages instead of reading them off the beacon. A second field is free — an
+  unknown field costs a 1.1 reader nothing at all — and gives group notices
+  their own budget instead of spending the DM's. 1.2 readers ingest `grpHeads`
+  in `processObservation`. **Corrected 2026-09-12:** this entry originally gave
+  the reason as the unparsed name itself costing a `catchUp`; 1.3's review round
+  found the same mis-statement repeated for `heads2` and traced it back to here
+  — see `docs/contract-changes-1.3.md`.
 
 Reviewer check: `redactEventForRenderer` in `shared/prs.ts` blanks `key`/`key1`
 on a `grp` payload (the renderer only ever needs the name) — this was the other

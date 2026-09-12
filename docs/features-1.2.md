@@ -344,10 +344,17 @@ the group's own — and specifically not in that section's plain `heads` array.
 `DmBeaconSection.grpHeads` (a 4-entry ring, mirroring `heads`) is where
 `noteOwnEvent` puts a freshly-published `.grp.e1` filename instead, because the DM
 peer may still be on 1.1: they *can* open that section (it's their own DM), and a
-filename their client can't parse would otherwise read there as a missing head —
-costing them a full `catchUp` of the DM on every beacon this device publishes.
-Landing in a field they've never heard of costs them nothing. A 1.2 reader ingests
-`grpHeads` in `Poller.processObservation` exactly like any other head list.
+filename their client can't parse is not itself the cost — `ingestHeads` skips a
+name it cannot parse before the gap check, in 1.1 as in 1.2, so it never reads as
+a missing head. The real cost is the ring: `heads` holds a fixed number of
+filenames per conversation, and a burst of invites or rekeys landing there would
+evict the `msg` filenames a 1.1 reader actually ingests from it, sending that
+reader back to a full `catchUp` day scan to find real messages instead of reading
+them off the beacon. A separate field costs a 1.1 reader nothing, because an
+unknown field is one it never looks at, ring or no ring. (Corrected during 1.3's
+review round, which found the same reasoning mis-stated for `heads2` — see
+`docs/contract-changes-1.3.md`.) A 1.2 reader ingests `grpHeads` in
+`Poller.processObservation` exactly like any other head list.
 
 **Notifications.** Groups notify like DMs (always, unlike channels' @mention-only
 default), with the title `"${who} in 🔒 ${groupName}"`.

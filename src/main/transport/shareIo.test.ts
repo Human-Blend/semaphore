@@ -39,7 +39,8 @@ describe('share I/O counter', () => {
     await s.read('d/f.e1')
     await s.readMaybe('d/f.e1')
     await s.list('d')
-    await s.listDirs('')
+    // 'd', not '': the root is not a share-relative path, and abs() refuses one.
+    await s.listDirs('d')
     await s.statMaybe('d/f.e1')
     await s.delete('d/f.e1')
     await s.probe()
@@ -109,5 +110,39 @@ describe('share I/O counter', () => {
     expect(s.stats()).toMatchObject({ total: 0, lastMinute: 0, byOp: {} })
     await s.publish('b.e1', buf('x'))
     expect(s.stats().total).toBe(1)
+  })
+})
+
+// Several share-relative paths are built from ids that crossed the bridge — a
+// live board's sessionId (1.3) and a screen session's (1.2) are both path
+// segments. The services validate them, and this is the floor under all of them
+// so a future caller cannot reintroduce the hole by forgetting to.
+describe('share paths', () => {
+  it('refuses a path that could leave the share root', async () => {
+    const s = io()
+    for (const bad of [
+      '..',
+      'boards/../../etc/passwd',
+      'boards/..',
+      'screens/./frames',
+      'boards//frame',
+      'boards/sess/',
+      '/etc/passwd',
+      'boards\\..\\..\\secret',
+    ]) {
+      expect(() => s.abs(bad)).toThrow('unsafe share path')
+    }
+    // And the ordinary shapes still resolve, including the dot-prefixed health
+    // probe name onboarding writes at the root.
+    expect(s.abs('boards/0123456789abcdef/ab12cd34.00000000')).toContain('boards')
+    expect(s.abs('.health-deadbeef')).toContain('.health-deadbeef')
+    // The empty path is the team root itself (ensureDir('') on first run).
+    expect(s.abs('')).toBe(s.abs('boards').replace(/[\\/]boards$/, ''))
+    // Every primitive goes through it, so a traversal cannot be smuggled in via
+    // one of them either.
+    await expect(s.publish('../escaped.e1', buf('x'))).rejects.toThrow('unsafe share path')
+    await expect(s.read('../escaped.e1')).rejects.toThrow('unsafe share path')
+    await expect(s.list('boards/..')).rejects.toThrow('unsafe share path')
+    await expect(s.delete('..')).rejects.toThrow('unsafe share path')
   })
 })

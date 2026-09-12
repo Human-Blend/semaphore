@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { BLOB_SCENE_RETRY_ATTEMPTS } from '@/content/blobRetry'
 import type { Attachment } from '@shared/types'
 import { DIAGRAM } from '@shared/constants'
 import { bytesIncludeMarker, fetchBlobScene, sceneSignature } from './scene'
@@ -43,6 +44,51 @@ describe('fetchBlobScene', () => {
   it('reports a failed fetch of a ready blob as null', async () => {
     stubBridge('ready', async () => ({ ok: false, status: 404, text: async () => 'nope' }))
     await expect(fetchBlobScene(att())).resolves.toBeNull()
+  })
+
+  it('retries a 503 instead of claiming "cleaned up", and fails honestly at the end', async () => {
+    // 503 is the sfblob handler's "not now" (share away, or the blob service
+    // still wiring after a relaunch). Saying null here told people a drawing
+    // had been deleted every time the VPN dropped.
+    vi.useFakeTimers()
+    try {
+      const { fetchBlob } = stubBridge('ready', async () => ({
+        ok: false,
+        status: 503,
+        text: async () => 'share unreachable',
+      }))
+      const outcome = fetchBlobScene(att()).then(
+        (v) => `resolved ${v}`,
+        (e: Error) => e.message,
+      )
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(await outcome).toMatch(/503/)
+      expect(fetchBlob).toHaveBeenCalledTimes(BLOB_SCENE_RETRY_ATTEMPTS)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('comes back on its own when the share does — no reload, no re-open', async () => {
+    vi.useFakeTimers()
+    try {
+      let call = 0
+      stubBridge('ready', async () => {
+        call += 1
+        return call === 1
+          ? { ok: false, status: 503, text: async () => 'share unreachable' }
+          : { ok: true, text: async () => '{"type":"excalidraw","back":true}' }
+      })
+      const outcome = fetchBlobScene(att())
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(await outcome).toBe('{"type":"excalidraw","back":true}')
+      // The second attempt must not be answerable from the page's cache.
+      const urls = (globalThis.fetch as unknown as { mock: { calls: string[][] } }).mock.calls.map((c) => c[0])
+      expect(urls[0]).not.toContain('retry=')
+      expect(urls[1]).toContain('retry=1')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('is null for a diagram message that carries no attachment at all', async () => {

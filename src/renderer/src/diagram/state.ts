@@ -23,4 +23,12 @@ export interface DiagramEditorState {
   autoImport?: boolean
   /** Load this already-in-hand file on mount (a drag-and-drop). `base64` of the raw bytes. */
   importFile?: { name: string; base64: string }
+  /**
+   * Live board (1.3): open straight into a session instead of a local drawing.
+   * `start` hosts a new one seeded with `scene` (the tile's **Collaborate**);
+   * `join` attaches to an existing one (a `board-live` sys row's **Join**).
+   * Absent = the ordinary local editor, which can still start a session from
+   * its header.
+   */
+  live?: { kind: 'start'; boardId?: string } | { kind: 'join'; sessionId: string; host?: string }
 }

@@ -11,10 +11,14 @@ import { join } from 'node:path'
 //
 //   sfgif://pack/<id>.gif
 
-export function registerGifScheme(): void {
-  protocol.registerSchemesAsPrivileged([
-    { scheme: 'sfgif', privileges: { standard: true, supportFetchAPI: true, stream: true } },
-  ])
+/**
+ * This scheme's privileges. Registered together with sfblob's in the app's one
+ * `registerSchemesAsPrivileged` call — see blobSchemePrivileges for why there
+ * can only be one.
+ */
+export const gifSchemePrivileges: Electron.CustomScheme = {
+  scheme: 'sfgif',
+  privileges: { standard: true, supportFetchAPI: true, stream: true },
 }
 
 export function packDir(): string {

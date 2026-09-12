@@ -12,9 +12,14 @@ import { discardStaged, isStagedPath, stagingRoot, sweepStaging } from './stagin
 
 // File/blob/beam IPC slice. Services can only exist once a session is live
 // (controller.chat is null until then), and chat.send() consults the
-// attachment uploader directly — so wiring happens the moment chat appears
-// (cheap 1s poll), not merely on the first files:* invoke. Re-onboarding
-// replaces the ChatService instance; the poll re-wires against the new one.
+// attachment uploader directly — so wiring happens the moment chat appears,
+// not merely on the first files:* invoke. Re-onboarding replaces the
+// ChatService instance; the same hook re-wires against the new one.
+//
+// The wiring is driven by controller.onSessionChange (synchronous, inside
+// startSession — so BlobService.initProtocol() has run before the renderer can
+// be told the app is ready) with the old 1 s poll kept behind it as a backstop
+// for any session that ever appears without firing the hook.
 
 interface FileServices {
   blobs: BlobService
@@ -78,6 +83,10 @@ export function registerFileIpc(controller: AppController, getWindow: () => Brow
   }
 
   wire()
+  // Synchronous with the session starting/stopping; the poll is the backstop.
+  controller.onSessionChange(() => {
+    wire()
+  })
   setInterval(wire, 1000)
 
   // Blobs

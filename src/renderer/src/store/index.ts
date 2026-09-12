@@ -17,6 +17,7 @@ import type { ConvId, PresenceView, PrsStatus, PrView, VerifiedEvent } from '@sh
 import { TEAM_CONV } from '@shared/constants'
 import { toast } from '@/app/toasts'
 import type { DiagramEditorState } from '@/diagram/state'
+import { endBoardIn, foldBoardEvents, type LiveBoardMap } from '@/diagram/live'
 import { findGroupRemovedEvent, resolveActiveConvVanish } from './convVanish'
 
 // Central renderer state. Raw events per conversation live here; components
@@ -40,6 +41,16 @@ interface ChatStore {
    */
   channelsSeq: number
   groupsSeq: number
+  /**
+   * Bumped every time the team folder goes away (the `boot` → 'onboarding'
+   * push), which is the moment every cached log stops being true. `ensureEvents`
+   * captures it before its read and drops the answer if it moved — otherwise a
+   * `chat.events` call issued for the *old* folder lands afterwards and re-seeds
+   * `events`, `eventsLoaded` and `liveBoards` with a conversation that is no
+   * longer reachable (complete with Join buttons for boards on a share we left).
+   * Same guard `channelsSeq`/`groupsSeq` have had since 1.2.
+   */
+  teamSeq: number
   presence: PresenceView[]
   events: Record<string, VerifiedEvent[]> // conv -> raw events (sorted on insert)
   eventsLoaded: Record<string, boolean>
@@ -57,6 +68,14 @@ interface ChatStore {
   lightbox: { conv: ConvId; eventId: string; blobId: string } | null
   /** The full-window diagram editor (1.2); null when it is closed — nothing is loaded until it isn't. */
   diagramEditor: DiagramEditorState | null
+  /** OS fullscreen for the main window (1.3), mirrored from the `fullscreen` push. */
+  fullscreen: boolean
+  /**
+   * Live boards (1.3), keyed by session id: folded from the `board-live` /
+   * `board-ended` sys events of every conversation whose log is loaded. This
+   * is what puts a **Join** button on a sys row and takes it away again.
+   */
+  liveBoards: LiveBoardMap
   /** Tracked Azure DevOps pull requests (pushed by the main-side PR service). */
   prs: PrView[]
   prsStatus: PrsStatus | null
@@ -70,13 +89,37 @@ interface ChatStore {
   /** Navigate to the PR group and open (or close) its settings dialog. */
   setPrsPrefsOpen(open: boolean): void
   ensureEvents(conv: ConvId): Promise<void>
-  send(conv: ConvId, draft: SendDraft): Promise<void>
+  /** Resolves with the new event's id — a live board's `end` records the snapshot it finished on. */
+  send(conv: ConvId, draft: SendDraft): Promise<{ id: string }>
   markRead(conv: ConvId, stem: string): void
   unreadCount(conv: ConvId): number
   openLightbox(v: { conv: ConvId; eventId: string; blobId: string } | null): void
   /** Open (or, with null, close) the diagram editor overlay. */
   openDiagramEditor(v: DiagramEditorState | null): void
+  /** A live board is over — the host ended it, or a join found no directory. */
+  markBoardEnded(sessionId: string): void
   refreshSettings(): Promise<void>
+}
+
+/**
+ * Live-board frame deliveries bypass the store's state and go straight to the
+ * open editor.
+ *
+ * They arrive up to once a second, carry a whole scene each, and exactly one
+ * component ever wants them; putting them through zustand would re-render the
+ * app shell for every stroke somebody else draws, and a listener that had to
+ * re-subscribe (new session id) would drop the frames in between. The
+ * registry above — which sessions exist — *is* ordinary state.
+ */
+type BoardPush = Extract<PushMessage, { kind: 'board-frames' } | { kind: 'board-ended' }>
+
+const boardListeners = new Set<(msg: BoardPush) => void>()
+
+export function onBoardPush(fn: (msg: BoardPush) => void): () => void {
+  boardListeners.add(fn)
+  return () => {
+    boardListeners.delete(fn)
+  }
 }
 
 function insertEvent(list: VerifiedEvent[], ev: VerifiedEvent): VerifiedEvent[] {
@@ -132,6 +175,7 @@ export const useStore = create<ChatStore>((set, get) => ({
   groups: [],
   channelsSeq: 0,
   groupsSeq: 0,
+  teamSeq: 0,
   presence: [],
   events: {},
   eventsLoaded: {},
@@ -148,6 +192,8 @@ export const useStore = create<ChatStore>((set, get) => ({
   update: null,
   lightbox: null,
   diagramEditor: null,
+  fullscreen: false,
+  liveBoards: {},
   prs: [],
   prsStatus: null,
   prsPrefsOpen: false,
@@ -168,6 +214,7 @@ export const useStore = create<ChatStore>((set, get) => ({
             // effect keyed on the unseen count never gets to write the 0.
             void window.bridge.app.setBadge(0).catch(() => {})
             set({
+              teamSeq: s.teamSeq + 1,
               channels: [],
               groups: [],
               presence: [],
@@ -183,6 +230,7 @@ export const useStore = create<ChatStore>((set, get) => ({
               update: null,
               lightbox: null,
               diagramEditor: null,
+              liveBoards: {},
               outboxQueued: 0,
               prs: [],
               prsStatus: null,
@@ -190,8 +238,23 @@ export const useStore = create<ChatStore>((set, get) => ({
             })
           }
           break
-        case 'event':
-          set({ events: { ...s.events, [msg.conv]: insertEvent(s.events[msg.conv] ?? [], msg.event) } })
+        case 'event': {
+          const liveBoards = foldBoardEvents(s.liveBoards, [msg.event])
+          set({
+            events: { ...s.events, [msg.conv]: insertEvent(s.events[msg.conv] ?? [], msg.event) },
+            ...(liveBoards === s.liveBoards ? {} : { liveBoards }),
+          })
+          break
+        }
+        // Live boards (1.3): frames go straight to the open editor (see
+        // onBoardPush); only the end of a session is state anybody else cares
+        // about.
+        case 'board-frames':
+          for (const fn of boardListeners) fn(msg)
+          break
+        case 'board-ended':
+          for (const fn of boardListeners) fn(msg)
+          set({ liveBoards: endBoardIn(s.liveBoards, msg.sessionId) })
           break
         case 'channels': {
           const prevChannels = s.channels
@@ -219,7 +282,16 @@ export const useStore = create<ChatStore>((set, get) => ({
           break
         }
         case 'health':
-          set({ health: msg.health })
+          // `offsetMs` is only present when main has calibrated against the
+          // folder, and the push that says "unreachable" carries none — so the
+          // last known offset is kept rather than thrown away, because an
+          // unreachable share does not make the clocks agree again.
+          set({
+            health:
+              msg.health.offsetMs === undefined && s.health.offsetMs !== undefined
+                ? { ...msg.health, offsetMs: s.health.offsetMs }
+                : msg.health,
+          })
           break
         case 'outbox':
           set({ outboxQueued: msg.queued })
@@ -241,6 +313,9 @@ export const useStore = create<ChatStore>((set, get) => ({
           break
         case 'prs-open':
           get().setActiveConv(TEAM_CONV.prs)
+          break
+        case 'fullscreen':
+          set({ fullscreen: msg.on })
           break
         case 'skew-warning':
           break
@@ -319,18 +394,27 @@ export const useStore = create<ChatStore>((set, get) => ({
 
   async ensureEvents(conv) {
     if (get().eventsLoaded[conv]) return
+    // `loadTeam` fires one of these per conversation and none of them is
+    // cancellable, so a folder switch mid-flight has to be detected on the way
+    // back: see `teamSeq`.
+    const teamSeqAtStart = get().teamSeq
     const list = await window.bridge.chat.events(conv)
+    if (get().teamSeq !== teamSeqAtStart) return
     list.sort((a, b) => (a.id < b.id ? -1 : 1))
     set((s) => ({
       events: { ...s.events, [conv]: list },
       eventsLoaded: { ...s.eventsLoaded, [conv]: true },
+      // A session announced while this client was away is only discoverable
+      // here: the catch-up read is the first time its `board-live` is seen.
+      liveBoards: foldBoardEvents(s.liveBoards, list),
     }))
     const cursors = await window.bridge.chat.cursors(conv)
+    if (get().teamSeq !== teamSeqAtStart) return
     set((s) => ({ cursors: { ...s.cursors, [conv]: cursors } }))
   },
 
   async send(conv, draft) {
-    await window.bridge.chat.send(conv, draft)
+    return window.bridge.chat.send(conv, draft)
   },
 
   markRead(conv, stem) {
@@ -354,6 +438,10 @@ export const useStore = create<ChatStore>((set, get) => ({
 
   openDiagramEditor(v) {
     set({ diagramEditor: v })
+  },
+
+  markBoardEnded(sessionId) {
+    set((s) => ({ liveBoards: endBoardIn(s.liveBoards, sessionId) }))
   },
 
   async refreshSettings() {

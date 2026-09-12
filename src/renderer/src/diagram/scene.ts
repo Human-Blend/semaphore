@@ -10,6 +10,7 @@ import type { Attachment, DiagramBody } from '@shared/types'
 import { DIAGRAM, EVENT } from '@shared/constants'
 import { cleanTitle, diagramFileStem, diagramFitsInline } from '@shared/diagram'
 import { blobUrl } from '@/content/parse'
+import { BLOB_SCENE_RETRY_ATTEMPTS, blobRetryUrl, decideBlobRetry } from '@/content/blobRetry'
 import { encodeScene } from './codec'
 
 /** Instant-preview thumb: progressively cheaper until it fits the event budget. */
@@ -229,16 +230,36 @@ export async function sniffDroppedDiagram(file: File): Promise<{ name: string; b
  * media sweep has taken it, which the tile shows as the standard "cleaned up"
  * state — the one case where a diagram legitimately has no drawing left.
  *
+ * The same 404-vs-503 rule the image tiles follow, for the same reason: a
+ * share that is unreachable — or a blob service that has not finished wiring
+ * after a relaunch — answers 503, and reporting that as an expiry told people
+ * their drawing had been deleted every time the VPN dropped. So a 503 is
+ * retried on the shared backoff (a shorter budget than a tile's: somebody is
+ * waiting for this one), and only running out of attempts throws, which the
+ * tile shows as "failed" and a later mount retries.
+ *
  * Lives here rather than in the tile so it can be tested at all: the tile is
  * .tsx and vitest here is node-only.
  */
 export async function fetchBlobScene(att: Attachment | undefined): Promise<string | null> {
   if (!att) return null
-  const state = await window.bridge.files.fetchBlob(att.blobId, att.key, att.name, att.size)
-  if (state.state === 'expired') return null
-  const res = await fetch(blobUrl(att))
-  if (!res.ok) return null
-  return res.text()
+  let failures = 0
+  for (;;) {
+    const state = await window.bridge.files.fetchBlob(att.blobId, att.key, att.name, att.size)
+    if (state.state === 'expired') return null
+    // Distinct per attempt, or the page answers the retry out of its own cache.
+    const res = await fetch(blobRetryUrl(blobUrl(att), failures))
+    if (res.ok) return res.text()
+    failures += 1
+    const decision = decideBlobRetry({
+      failures,
+      status: res.status,
+      maxAttempts: BLOB_SCENE_RETRY_ATTEMPTS,
+    })
+    if (decision.action === 'expired') return null
+    if (decision.action !== 'retry') throw new Error(`blob unavailable (${res.status})`)
+    await new Promise((resolve) => setTimeout(resolve, decision.delayMs))
+  }
 }
 
 // ---------------------------------------------------------------------------

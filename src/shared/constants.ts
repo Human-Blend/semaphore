@@ -27,6 +27,8 @@ export const DIR = {
   // Private groups (1.2): one opaque dir per group, `<token>/events/<day>/…`
   // like a channel but with no metadata file — the invite carries it.
   groups: 'groups',
+  // Live boards (1.3): boards/<sessionId>/<deviceId8>.<seq> — transient, janitor-swept.
+  boards: 'boards',
   blobs: 'blobs',
   blobsTmp: 'blobs/tmp',
   drops: 'drops',
@@ -171,6 +173,9 @@ export const RETENTION = {
   janitorClaimHours: 24,
   /** A deleted channel/group dir is removed by the janitor this long after its tombstone (1.2). */
   deletedConvGraceDays: 3,
+  /** Live board dirs (1.3): swept when the newest frame is this old, and always after the hard limit. */
+  boardsDeadMinutes: 10,
+  boardsHardHours: 24,
 } as const
 
 export const JANITOR = {
@@ -229,6 +234,14 @@ export const KID = {
   dm: (pairToken: string) => `dm/${pairToken}`,
   /** Private group (1.2): the epoch is in the kid so a reader knows which key a record wants. */
   grp: (groupToken: string, epoch: number) => `grp/${groupToken}/e${epoch}`,
+  /**
+   * Live board frame (1.3), encrypted under the conversation key. The
+   * conversation's own kid rides along, because for a private group that kid
+   * names the *epoch*: a reader that just missed a rekey has to know which key
+   * a frame wants before it can decide between "park this and retry" and
+   * "refuse it" (boards.ts `keyForFrame`).
+   */
+  board: (sessionId: string, convKid: string) => `board/${sessionId}/${convKid}`,
   blob: (blobIdHex: string) => `blob/${blobIdHex}`,
   seal: (deviceId: string) => `seal/${deviceId.slice(0, 8)}`,
   local: (purpose: string) => `local/${purpose}`,
@@ -243,6 +256,38 @@ export const FILE_EXT = {
 } as const
 
 /** Diagrams (1.2). */
+/** Live boards (1.3): real-time diagram sessions over the folder. */
+export const BOARD = {
+  /** Writer coalescing: at most one frame per second, and only when something changed. */
+  writeMinMs: 1000,
+  /** Pointer-only frames are rarer still. */
+  pointerMinMs: 2000,
+  /** A frame even when nothing changed, so others keep you in the pointer list. */
+  keepaliveMs: 10_000,
+  /** Reader cadence while the live editor is open. */
+  pollFocusedMs: 1000,
+  pollBlurredMs: 3000,
+  /** A participant silent this long drops out of the pointer list. */
+  staleMs: 30_000,
+  /** Frames above this are refused (files first, then the frame). */
+  maxFrameBytes: 2 * 1024 * 1024,
+  /**
+   * Elements above this are refused outright (1.3): a scene this big is a
+   * runaway, and the *sender* has to hear about it. Receivers clamp too, so
+   * without this the cap was silent — the writer kept publishing frames that
+   * every peer quietly truncated.
+   */
+  maxElements: 5000,
+} as const
+
+/** Polls (1.3). */
+export const POLL_LIMITS = {
+  minOptions: 2,
+  maxOptions: 10,
+  maxQuestionChars: 300,
+  maxOptionChars: 100,
+} as const
+
 export const DIAGRAM = {
   /** Compressed scene bytes above this go to the blob store instead of inline. */
   maxInlineBytes: 120 * 1024,

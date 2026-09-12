@@ -58,11 +58,15 @@ then a departing member means a new team folder) · message-content search ·
 screen-share audio · blob dedup ·
 DM forward-secrecy prekeys · day-bundle compaction for multi-month cold starts
 · beam transfers over RTCDataChannel (currently folder-only) · online GIF
-search (needs a Giphy/Tenor key; the bundled pack is the offline path) · live
-co-editing of diagrams (1.2's "edit a copy → send" is the discussion loop; a
-real shared canvas would also fight the share-I/O-budget work) · a member who
-*leaves* a group keeps a working current key (only a removal by the owner
-rotates — see `GroupService.leave`).
+search (needs a Giphy/Tenor key; the bundled pack is the offline path) · a
+member who *leaves* a group keeps a working current key (only a removal by the
+owner rotates — see `GroupService.leave`) · P2P fast path for live boards
+(RTCDataChannel instead of the folder relay that ships in 1.3 — the folder
+gives ~1–2 s latency, which is fine for a whiteboard today) · per-person,
+not per-device, poll votes (1.3 counts one vote per device — a roster record
+*is* a device, and nothing on the share binds two devices to one human; a
+"one vote per person" poll needs an identity layer Chat deliberately doesn't
+have).
 
 ## GIF pack
 
@@ -134,8 +138,15 @@ device drops the group locally. `grp` is a fourth event type carrying the
 invite/rekey/removed notices that ride a DM log: they used to be `sys` events,
 and a shipped 1.1 client renders an unknown sys kind as a *blank row* in that
 DM (its `sysLine` has no default), while a `.grp.e1` filename it cannot parse
-is skipped in silence. Same reason `noteOwnEvent` keeps those filenames out of
-the DM beacon section's `heads` and in `grpHeads`. A record from a retired epoch,
+is skipped in silence. `noteOwnEvent` also keeps those filenames out of the DM
+beacon section's `heads` and in their own `grpHeads` ring — not because an
+unparseable name costs a 1.1 reader anything by itself (`ingestHeads` skips a
+name it can't parse before the gap check, so it never reads as a missing head),
+but because `heads` holds only `BEACON.headsRingSize` names per conversation,
+and a burst of invites/rekeys would evict the real `msg` filenames a 1.1 reader
+ingests from it, sending it to a full day-scan `catchUp` instead of the cheap
+beacon path. A second, unknown-to-1.1 field costs it nothing. Same argument one
+version later for 1.3's `heads2` (below). A record from a retired epoch,
 written by someone no longer in the fold, after the point that epoch was
 retired, is refused (`GroupService.staleWriteCut`, called from
 `transport/events.ts`'s decrypt path) — history from before the rotation
@@ -262,3 +273,102 @@ the case where permission reads granted but every screen thumbnail is
 suspiciously uniform (`allScreensLookBlank` in
 `src/renderer/src/screenshare/manager.ts`), which reads the same as no grant
 at all and shows the same explainer.
+
+## Polls (1.3)
+
+`MsgBody.kind += 'poll'` (`PollBody`); a vote is its own event type, `vot`
+(`.vot.e1`), never folded into `sys`. Invariants an agent must keep:
+
+- **One vote per device, not per person.** `MessageView.votes` is keyed by
+  deviceId — a roster record *is* a device, and nothing on the share binds two
+  devices to one human. LWW by event id, exactly like a reaction; `[]` retracts.
+- **`vot` (and every event type introduced after 1.2) rides `heads2`, never
+  `heads`.** `heads` holds a fixed ring (`BEACON.headsRingSize`, 16) of
+  filenames a 1.2 reader actually ingests from; votes arrive in bursts (one
+  poll, a dozen voters) and would evict real `msg` heads from that ring before
+  an older reader next polls. `heads2` (and the sealed-section equivalent) is a
+  field a 1.2 reader has never heard of, so it costs that reader nothing — not
+  because the filename itself would be unparseable-and-therefore-costly
+  (`ingestHeads` skips an unparseable name before the gap check either way and
+  that alone costs nothing), but because losing a ring slot does. Same rule
+  `grpHeads` has followed since 1.2 (see the corrected note above) — a future
+  event type gets this by default via an explicit allow-list of the types a
+  1.2 filename regex can parse (`HEADS_1_2_TYPES` in `beacon.ts`), not by
+  someone remembering to add a case.
+- **Closing is the author's own `edt`** carrying `poll.closedAt`, and `edt` is
+  keyed by target *and* author in `merge.ts` — only the message's own author's
+  edit is ever applied, so a stranger's later `edt` cannot shadow it and
+  silently re-open a closed poll.
+- **`closesAt` is share-calibrated ms.** The renderer only knows the author's
+  wall clock; `ChatService.send` restates the chosen interval on the share
+  clock (`calibrateClosesAt`) before publishing. Never trust a renderer-sent
+  `closesAt` as-is.
+- **A closed poll's result is final.** A vote (including a retraction) whose
+  HLC lands more than a 5 s grace past the close (`closedAt`, or `closesAt` if
+  earlier) is not counted, even if it verifies fine — see `VOTE_GRACE_MS` in
+  `shared/merge.ts`.
+- `validatePollDraft` rejects duplicate options (normalized: trimmed,
+  whitespace-collapsed, case-insensitive) — main re-validates renderer input,
+  never trusts it.
+- `anonymous` hides voter names in the UI only; every vote is still a signed,
+  fully readable event on the share — the dialog says so, don't build a mode
+  that actually hides it cheaper by skipping the signature.
+
+## Live boards (1.3)
+
+A real-time diagram session carried by the shared folder, not the event log:
+`boards/<sessionId>/<deviceId8>.<seq base36>`. Invariants an agent must keep:
+
+- **One writer per file, ever, and the seq rides in the filename.** The writer
+  deletes its own previous file right after the rename; nobody else ever
+  writes or deletes another device's file.
+- **A session id is `deviceId8` (8 hex) + 4 random bytes = 16 hex, and the
+  first 8 characters bind it to its host's device** (`SESSION_ID_RE` in
+  `boards.ts`). A `board-live` (or `board-ended`) whose id doesn't start with
+  its *signer's* own device id is refused outright — nobody can claim a seat
+  in someone else's session id space. The host is whoever **signed**
+  `board-live`, never `data.host` (a field any member could write); only that
+  device's `board-ended` counts.
+- **Never advance a reader's per-device seq cursor on anything but a verified,
+  self-consistent frame.** `collect`/`readFrame` in `boards.ts` walk a
+  device's candidate files newest-seq-first and only `verdict: 'ok'` moves the
+  cursor — `'gone'` (mid-poll delete) and `'pending'` (a group rekey not yet
+  held) leave it alone for a retry, and `'refused'` is remembered per file so
+  it costs one read, not one per poll, but still never moves the cursor. A
+  junk file planted at a high seq must not mute the rest of that device's
+  session.
+- **`ShareIo.abs()` rejects `..`, `.`, empty segments, and any backslash in
+  every path segment** — the floor under every bridge-supplied id that becomes
+  part of a share path (a board session id, a screen-share session id).
+  Validate the id's own shape at the IPC boundary too (`assertBoardSessionId`)
+  — `abs()` is the last line of defense, not the only one.
+- A frame's `kid` carries the *conversation's* kid (`KID.board(sessionId,
+  convKid)`), because for a private group that names the epoch — a reader that
+  hasn't been handed a rekey yet has to be able to tell "park and retry" from
+  "this is junk," and only the kid says which.
+- `start` refuses a `team:` conversation (no members to collaborate with, and
+  the janitor never sweeps `team/`) and a second session this device is still
+  live in (reading or writing) in the same conversation.
+- Janitor: a session directory is dead when its **newest** frame's mtime is
+  past `RETENTION.boardsDeadMinutes`, and hard-removed once its **oldest**
+  frame's mtime is past `RETENTION.boardsHardHours` — read the oldest/newest
+  frame, never the directory's own mtime, which every publish and delete
+  bumps constantly while anyone is drawing.
+
+## Fullscreen editor (1.3)
+
+`app.setFullScreen`/`isFullScreen` — real OS fullscreen, not a CSS overlay —
+toggled from the diagram editor's header by F11 (Windows/Linux) or ⌃⌘F
+(macOS, which reserves F11 for Show Desktop); `isFullScreenToggleKey` in
+`diagram/fullscreenKey.ts` is the pure chord check, tested without mounting
+Excalidraw. The header collapses to a 36 px strip in fullscreen. Esc leaves
+fullscreen first — a second Esc then closes the editor, the same two-step
+already used for the close-confirm dialog swallowing the first Esc — except
+inside `.excalidraw` while it's mid-text-edit or holding its own dialog open,
+which still owns Esc for itself. Whether closing the editor takes the window
+back out of fullscreen follows the editor's own *intent* ref (`weWentFs` in
+`DiagramEditor.tsx`), never the store's `fullscreen` flag: the flag is a push
+from main that lands a beat after the request (so closing mid-transition would
+otherwise misjudge it), and it's equally true of a window the user had already
+put fullscreen before ever opening a diagram — that one isn't the editor's to
+undo either.

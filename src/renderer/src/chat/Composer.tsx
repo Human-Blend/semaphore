@@ -7,6 +7,7 @@ import { useStore, selfOf } from '@/store'
 import { Avatar, DeviceChip, IconButton } from '@/ui/atoms'
 import { GifPicker } from '@/content/GifPicker'
 import { DiagramButton } from '@/diagram/DiagramButton'
+import { PollButton } from '@/poll/PollButton'
 import { CODE_LANGUAGES, readStoredLang, writeStoredLang } from '@/content/languages'
 import { detectEntities, firstUrlOf, looksLikeCode, snippetOf, withTimeout } from './util'
 import { ClockIcon, CloseIcon, CodeIcon, GifIcon, SendIcon } from './icons'
@@ -627,6 +628,7 @@ export function Composer({ conv, label, replyTarget, onClearReply, onEditLast, a
           </div>
         )}
         <DiagramButton conv={conv} />
+        <PollButton conv={conv} label={label} />
         <IconButton label="Send a GIF" active={gifOpen} onClick={() => setGifOpen((v) => !v)}>
           <GifIcon size={17} />
         </IconButton>

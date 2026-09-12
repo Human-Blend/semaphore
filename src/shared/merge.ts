@@ -12,6 +12,7 @@ import type {
   RctPayload,
   SysPayload,
   VerifiedEvent,
+  VotPayload,
 } from './types'
 
 // Reader-side merge of the append-only event log into renderable messages.
@@ -44,6 +45,8 @@ export interface MessageView {
   pinned: boolean
   verified: boolean
   reactions: ReactionView[]
+  /** kind:'poll' (1.3): latest verified vote per device (option ids). */
+  votes?: Record<string, string[]>
 }
 
 export interface SysView {
@@ -66,17 +69,54 @@ function hlcOf(stem: string): number {
   return Number(stem.slice(0, 13))
 }
 
+/**
+ * How long after a poll's `closedAt` a vote is still counted (1.3). Covers a
+ * vote that was already published when the author pressed Close; anything later
+ * is a vote on a decision that has been announced, and is ignored.
+ */
+const VOTE_GRACE_MS = 5_000
+
+/**
+ * When a poll stopped taking votes, on the share clock, or null while it is
+ * still open. Deliberately not `isPollClosed` from `./poll`: that one answers
+ * "is it closed *now*" for a tile, and this one needs the instant itself.
+ */
+function closeTimeOf(poll: { closedAt?: number; closesAt?: number } | undefined): number | null {
+  const ends = [poll?.closedAt, poll?.closesAt].filter(
+    (t): t is number => typeof t === 'number' && Number.isFinite(t) && t > 0,
+  )
+  return ends.length ? Math.min(...ends) : null
+}
+
 export function materialize(events: VerifiedEvent[], admins: string[] = []): MaterializedLog {
   const sorted = [...events].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
 
   const messages = new Map<string, MessageView>()
   const sys: SysView[] = []
   // Mutation accumulators keyed by target — applied last-writer-wins by event id.
-  const edits = new Map<string, { id: string; by: string; body: MsgBody }>()
+  // Edits are keyed by target *and author*: only the message's own author can
+  // edit it, and keeping one slot per target let anyone on the share shadow the
+  // author's latest edit by writing a later `edt` of their own — the apply step
+  // then found a stranger's event, refused it, and silently dropped the real
+  // edit with it. For a poll that meant a single unauthorized event re-opened a
+  // closed poll (the `closedAt` body is an author `edt`, 1.3).
+  const edits = new Map<string, Map<string, { id: string; body: MsgBody }>>()
   const dels = new Map<string, { id: string; by: string }>()
   const pins = new Map<string, { id: string; op: 'pin' | 'unpin' }>()
   const prvs = new Map<string, { id: string; preview: LinkPreview }>()
   const reactions = new Map<string, Map<string, { id: string; op: 'add' | 'remove' }>>() // target -> "emoji|device" -> latest
+  // Poll votes (1.3): target -> device -> that device's votes. One vote per
+  // *device*, last writer wins by event id; an empty choice is how a voter takes
+  // it back.
+  //
+  // Per device, not per person: someone running Chat on a laptop and a desktop
+  // counts twice, and neither client can tell that the two are one human (a
+  // roster record is a device, and nothing binds devices to people). The team
+  // treats device = person, which is also how reactions and read receipts have
+  // always counted. The whole history per device is kept rather than just the
+  // latest, because "what did this device have standing *before* the poll
+  // closed" is a question the closing edit asks after the fact — see below.
+  const votes = new Map<string, Map<string, { id: string; choice: string[] }[]>>()
 
   const seqSeen = new Map<string, number[]>() // device -> senderSeqs
 
@@ -110,7 +150,10 @@ export function materialize(events: VerifiedEvent[], admins: string[] = []): Mat
       }
       case 'edt': {
         const e = p as EdtPayload
-        edits.set(e.target, { id: ev.id, by: ev.author, body: e.body })
+        let m = edits.get(e.target)
+        if (!m) edits.set(e.target, (m = new Map()))
+        const prev = m.get(ev.author)
+        if (!prev || prev.id <= ev.id) m.set(ev.author, { id: ev.id, body: e.body })
         break
       }
       case 'del': {
@@ -123,6 +166,18 @@ export function materialize(events: VerifiedEvent[], admins: string[] = []): Mat
         let m = reactions.get(r.target)
         if (!m) reactions.set(r.target, (m = new Map()))
         m.set(`${r.emoji}|${ev.author}`, { id: ev.id, op: r.op })
+        break
+      }
+      // A poll vote (1.3). It is not a message, it is not a sys row, and it
+      // carries no read-cursor weight: it only ever moves the numbers on the
+      // poll tile of the message it targets.
+      case 'vot': {
+        const v = p as VotPayload
+        let m = votes.get(v.target)
+        if (!m) votes.set(v.target, (m = new Map()))
+        const list = m.get(ev.author) ?? []
+        list.push({ id: ev.id, choice: Array.isArray(v.choice) ? v.choice : [] })
+        m.set(ev.author, list)
         break
       }
       case 'pin': {
@@ -160,13 +215,16 @@ export function materialize(events: VerifiedEvent[], admins: string[] = []): Mat
     }
   }
 
-  // Apply mutations
-  for (const [target, e] of edits) {
+  // Apply mutations. An `edt` only ever counts from the message's own author,
+  // so the one to apply is that author's latest — anyone else's is not a losing
+  // edit, it is no edit at all, and it must not be able to hide theirs.
+  for (const [target, byAuthor] of edits) {
     const m = messages.get(target)
-    if (m && e.by === m.authorDevice) {
-      m.body = e.body
-      m.edited = true
-    }
+    if (!m) continue
+    const mine = byAuthor.get(m.authorDevice)
+    if (!mine) continue
+    m.body = mine.body
+    m.edited = true
   }
   for (const [target, d] of dels) {
     const m = messages.get(target)
@@ -198,6 +256,41 @@ export function materialize(events: VerifiedEvent[], admins: string[] = []): Mat
       byEmoji.set(emoji, arr)
     }
     m.reactions = [...byEmoji.entries()].map(([emoji, devices]) => ({ emoji, devices }))
+  }
+  // Poll votes: only onto a poll message that is still there. An empty choice
+  // is a retraction, so it leaves no entry at all rather than an empty one —
+  // "who voted" and "what they picked" stay the same question.
+  //
+  // A closed poll's result is final (1.3). `closedAt` is share-clock ms and an
+  // event's stem starts with its HLC ms, so anything a device wrote after the
+  // close is simply not part of the answer — including a retraction, which would
+  // otherwise let a voter walk back a decision that had already been announced.
+  // The vote that stood at closing time is the one that counts, so this reaches
+  // back past the ignored events for it. The grace window is for votes that were
+  // already in flight when the author pressed Close (a publish plus a beacon hop
+  // is well under a second; 5 s is generous and still far from "an hour later").
+  for (const [target, map] of votes) {
+    const m = messages.get(target)
+    if (!m || m.deleted || m.body.kind !== 'poll') continue
+    // Both ways a poll closes count, and the earlier one wins when a poll has
+    // both: the author's `closedAt`, and the deadline it was published with
+    // (`closesAt`, which needs no event — `chat.vote` refuses on either).
+    const closedAt = closeTimeOf(m.body.poll)
+    const deadline = closedAt === null ? null : closedAt + VOTE_GRACE_MS
+    const out: Record<string, string[]> = {}
+    for (const [device, list] of map) {
+      // Highest event id among the votes that landed in time: plain id-order
+      // LWW, exactly like a reaction. A device whose clock runs behind its own
+      // earlier vote therefore writes an event that never lands — the stem is
+      // the only ordering anyone on the share can agree on.
+      let latest: { id: string; choice: string[] } | null = null
+      for (const v of list) {
+        if (deadline !== null && hlcOf(v.id) > deadline) continue
+        if (!latest || latest.id <= v.id) latest = v
+      }
+      if (latest && latest.choice.length > 0) out[device] = latest.choice
+    }
+    m.votes = out
   }
 
   // senderSeq gap detection: within the retention window, holes in a device's

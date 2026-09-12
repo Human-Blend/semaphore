@@ -29,6 +29,31 @@ const CALIBRATE_EVERY_MS = 5 * 60_000
  */
 const GRP_HEADS_RING = 4
 
+/**
+ * Event types a 1.2 client's filename regex can parse. Anything else (1.3's
+ * `vot`, and whatever comes after it) goes in `heads2` instead of `heads`.
+ *
+ * Not because the name itself would hurt an older reader: `ingestHeads` skips a
+ * filename it cannot parse (`if (!parsed) continue`) *before* the gap check, in
+ * 1.2 exactly as here, so a `.vot.e1` in `heads` would cost it no catch-up and
+ * no read. The reason is the ring: `heads` holds `BEACON.headsRingSize` (16)
+ * names per conversation, and votes are the one event type that arrives in a
+ * burst — a poll with a dozen voters would push every `msg` filename out of the
+ * ring before an older reader next polls. It would then learn nothing about the
+ * new messages from the beacon and wait for its next bounded day scan to find
+ * them, which is the cheap path we built `heads` to avoid. Their own field gives
+ * votes their own budget, and costs an older reader nothing at all: an unknown
+ * top-level field is not a name it has to make sense of, it is one it never sees.
+ */
+const HEADS_1_2_TYPES = new Set(['msg', 'edt', 'del', 'rct', 'pin', 'sys', 'prv', 'cal', 'prs', 'grp'])
+
+/**
+ * How many new-type filenames a conversation advertises in `heads2`. Votes are
+ * the only thing riding it today and they arrive in small bursts (one per
+ * person, once); the blanket sweep picks up anything that falls off the end.
+ */
+const HEADS2_RING = 8
+
 // The beacon: one single-writer file per device whose SEQUENCE lives in the
 // filename, so one readdir of beacon/ per poll tick reveals every device's
 // latest state with zero stat calls. Contents carry presence, typing, heads
@@ -55,6 +80,8 @@ export class BeaconWriter {
   presence: BeaconContent['presence'] = { state: 'online', status: '', idleSec: 0 }
   typing: BeaconContent['typing'] | undefined
   private heads = new Map<ConvId, string[]>() // channels + team convs (sealed convs live below)
+  /** Post-1.2 event types (`vot`, …) for those same conversations — see HEADS_1_2_TYPES. */
+  private heads2 = new Map<ConvId, string[]>()
   private cursors = new Map<ConvId, { read: string; ingested: string }>()
   /**
    * Heads/cursor/typing for every conversation whose existence is private: DMs
@@ -160,18 +187,32 @@ export class BeaconWriter {
   }
 
   noteOwnEvent(conv: ConvId, fileName: string): void {
+    const type = parseEventFileName(fileName)?.type
+    // 1.3: a type older readers cannot parse rides its own ring, plain or
+    // sealed, so that a burst of votes cannot evict the `msg` heads those
+    // readers do use (see HEADS_1_2_TYPES). Same trick as `grpHeads` below,
+    // generalized — that one stays as it is, because a 1.2 peer already knows
+    // to look in it for invites.
+    const newType = !!type && !HEADS_1_2_TYPES.has(type)
     // Only DMs and private groups need a sealed section (who talks to whom, and
     // who is in which group, is private); channels and team convs advertise
     // heads in the plain section.
     if (this.isSealed(conv)) {
       const section = this.sectionFor(conv)
+      if (newType) {
+        const ring = section.heads2 ?? []
+        ring.push(fileName)
+        while (ring.length > HEADS2_RING) ring.shift()
+        section.heads2 = ring
+      }
       // A `grp` notice (invite, rekey, "you were removed") rides its own ring.
       // The DM peer on the other end may be a 1.1 client, and it *can* open this
-      // section — it is their DM. A `.grp.e1` name in `heads` doesn't parse
-      // there, so it reads as a missing head and costs them a full catch-up of
-      // the DM on every beacon we publish afterwards. An unknown field costs
-      // them nothing.
-      if (parseEventFileName(fileName)?.type === 'grp') {
+      // section — it is their DM. A `.grp.e1` name there is a name it cannot
+      // parse: harmless in itself (its `ingestHeads` skips it before the gap
+      // check), but it would be occupying one of the 16 slots the DM's real
+      // `msg` heads need, and a rekey storm would clear the lot. Their own ring,
+      // their own budget; an unknown field costs that peer nothing.
+      else if (type === 'grp') {
         const ring = section.grpHeads ?? []
         ring.push(fileName)
         while (ring.length > GRP_HEADS_RING) ring.shift()
@@ -181,10 +222,12 @@ export class BeaconWriter {
         while (section.heads.length > BEACON.headsRingSize) section.heads.shift()
       }
     } else {
-      const ring = this.heads.get(conv) ?? []
+      const rings = newType ? this.heads2 : this.heads
+      const limit = newType ? HEADS2_RING : BEACON.headsRingSize
+      const ring = rings.get(conv) ?? []
       ring.push(fileName)
-      while (ring.length > BEACON.headsRingSize) ring.shift()
-      this.heads.set(conv, ring)
+      while (ring.length > limit) ring.shift()
+      rings.set(conv, ring)
     }
     void this.bump('event')
   }
@@ -324,6 +367,10 @@ export class BeaconWriter {
       presence: this.presence,
       typing: this.typing && this.typing.until > s.io.calibratedNow() ? this.typing : undefined,
       heads: Object.fromEntries(this.heads),
+      // 1.3: heads of event types a 1.2 reader cannot parse. Absent unless we
+      // actually wrote one, so a team that never uses polls publishes exactly
+      // the beacon 1.2 published.
+      heads2: this.heads2.size ? Object.fromEntries(this.heads2) : undefined,
       cursors: Object.fromEntries(this.cursors),
       dmSealed: Object.keys(dmSealed).length ? dmSealed : undefined,
       // 1.2: same shape, group keys. 1.1 readers ignore the field.

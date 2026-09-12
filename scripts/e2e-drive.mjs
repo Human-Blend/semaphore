@@ -545,6 +545,85 @@ async function main() {
       gotCode ? `lang=${gotCode.payload.body.lang}` : 'timed out',
     )
 
+    // ---- Poll with a quick decision (1.3): vote, close, both directions ----
+    // The whole point of the `vot` event type is that it travels on its own
+    // ring (`heads2`), so this exercises the reader path end to end: Bob never
+    // scans a directory for the vote, and Alice never scans for the close.
+    const pollDraft = {
+      kind: 'poll',
+      text: 'Ship on Friday?',
+      poll: {
+        question: 'Ship on Friday?',
+        options: [
+          { id: 'yes', text: 'Yes' },
+          { id: 'no', text: 'No' },
+          { id: 'abstain', text: 'Abstain' },
+        ],
+        multi: false,
+        anonymous: false,
+        decision: true,
+      },
+    }
+    const sentPoll = await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(conv)}, ${JSON.stringify(pollDraft)})`,
+    )
+    check('alice sends a quick-decision poll', !!sentPoll?.id, sentPoll ? sentPoll.id : 'no id')
+
+    const gotPoll = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'msg' && e.id === sentPoll?.id)
+    }, 20000)
+    check(
+      "bob's poll message carries the PollBody and the pre-1.3 fallback line",
+      gotPoll?.payload?.body?.kind === 'poll' &&
+        gotPoll?.payload?.body?.poll?.options?.length === 3 &&
+        /update Chat to vote/.test(gotPoll?.payload?.body?.text ?? ''),
+      gotPoll ? `kind=${gotPoll.payload.body.kind} text=${gotPoll.payload.body.text}` : 'timed out',
+    )
+
+    const voteErr = await bob.eval(
+      `window.bridge.chat.vote(${JSON.stringify(conv)}, ${JSON.stringify(sentPoll?.id)}, ['yes']).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('bob votes Yes via chat.vote', voteErr === '', voteErr)
+    const badVote = await bob.eval(
+      `window.bridge.chat.vote(${JSON.stringify(conv)}, ${JSON.stringify(sentPoll?.id)}, ['yes','no']).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('a second pick on a single-choice poll is refused', /single-choice/.test(badVote ?? ''), badVote)
+
+    const gotVote = await until(async () => {
+      const evs = await alice.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'vot' && e.payload?.target === sentPoll?.id)
+    }, 25000)
+    check(
+      "alice's chat.events shows bob's vote (verified, via heads2)",
+      !!gotVote && gotVote.verified === true && JSON.stringify(gotVote.payload?.choice) === '["yes"]',
+      gotVote ? `choice=${JSON.stringify(gotVote.payload.choice)} verified=${gotVote.verified}` : 'timed out',
+    )
+
+    const closeByBob = await bob.eval(
+      `window.bridge.chat.closePoll(${JSON.stringify(conv)}, ${JSON.stringify(sentPoll?.id)}).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('only the author may close a poll', /not-poll-author/.test(closeByBob ?? ''), closeByBob)
+
+    const closeErr = await alice.eval(
+      `window.bridge.chat.closePoll(${JSON.stringify(conv)}, ${JSON.stringify(sentPoll?.id)}).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('alice closes her poll', closeErr === '', closeErr)
+
+    const gotClose = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find((e) => e.type === 'edt' && e.payload?.target === sentPoll?.id && e.payload?.body?.poll?.closedAt)
+    }, 25000)
+    check(
+      "bob's copy of the poll is closed (closedAt from alice's edt)",
+      !!gotClose && gotClose.payload.body.poll.closedAt > 0,
+      gotClose ? `closedAt=${gotClose.payload.body.poll.closedAt}` : 'timed out',
+    )
+    const lateVote = await bob.eval(
+      `window.bridge.chat.vote(${JSON.stringify(conv)}, ${JSON.stringify(sentPoll?.id)}, ['no']).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('a closed poll takes no more votes', /poll-closed/.test(lateVote ?? ''), lateVote)
+
     // ---- Delete a channel: gone on bob, sending into it rejects on alice ---
     const deleteErr = await alice.eval(
       `window.bridge.chat.deleteChannel(${JSON.stringify(designCh?.conv)}).then(() => '', (x) => String(x && x.message || x))`,
@@ -702,6 +781,452 @@ async function main() {
       return tileState === 'svg' ? tileState : undefined
     }, 25000)
     soft('bob renders the diagram tile as a locally drawn SVG', tileSeen === 'svg', tileState)
+
+    // ---- A diagram too big to ride inline: the scene travels as a blob -----
+    //
+    // Over DIAGRAM.maxInlineBytes the sender stages the scene and sends it as a
+    // `.excalidraw` attachment instead (scene.ts: planDiagramSend), and the
+    // reader pulls it back over sfblob:// with *fetch* rather than painting it
+    // in an <img>. That makes it the one consumer subject to CORS on the custom
+    // scheme — it could not load a single scene until the protocol started
+    // answering with Access-Control-Allow-Origin.
+    const DIAGRAM_MAX_INLINE = 120 * 1024 // DIAGRAM.maxInlineBytes
+
+    /** A scene whose labels deflate badly, so "too big" needs hundreds of elements, not millions. */
+    const mkBigScene = (count) => {
+      let seed = 0x2f6e2b1
+      const rnd = () => {
+        seed = (seed * 1103515245 + 12345) % 0x7fffffff
+        return seed / 0x7fffffff
+      }
+      const label = () => Array.from({ length: 24 }, () => Math.floor(rnd() * 36 ** 6).toString(36)).join(' ')
+      return JSON.stringify({
+        type: 'excalidraw',
+        version: 2,
+        source: 'e2e',
+        elements: Array.from({ length: count }, (_, i) => {
+          const text = label()
+          return {
+            id: `e2e-big-${i}`,
+            type: 'text',
+            x: 40 + (i % 20) * 180,
+            y: 40 + Math.floor(i / 20) * 28,
+            width: 170,
+            height: 24,
+            angle: 0,
+            strokeColor: '#1e1e1e',
+            backgroundColor: 'transparent',
+            fillStyle: 'solid',
+            strokeWidth: 1,
+            strokeStyle: 'solid',
+            roughness: 1,
+            opacity: 100,
+            groupIds: [],
+            frameId: null,
+            roundness: null,
+            seed: 7000 + i,
+            version: 1,
+            versionNonce: 1,
+            isDeleted: false,
+            boundElements: null,
+            updated: 1,
+            link: null,
+            locked: false,
+            text,
+            originalText: text,
+            fontSize: 16,
+            fontFamily: 5,
+            textAlign: 'left',
+            verticalAlign: 'top',
+            containerId: null,
+            lineHeight: 1.25,
+          }
+        }),
+        appState: { viewBackgroundColor: '#ffffff' },
+        files: {},
+      })
+    }
+
+    // Grow until the *compressed* scene is comfortably over the ceiling — the
+    // same number planDiagramSend measures (base64 of deflate-raw).
+    let bigCount = 600
+    let bigScene = mkBigScene(bigCount)
+    let bigCompressed = deflateRawSync(Buffer.from(bigScene, 'utf8')).toString('base64')
+    while (bigCompressed.length < DIAGRAM_MAX_INLINE * 1.15 && bigCount < 3000) {
+      bigCount += 200
+      bigScene = mkBigScene(bigCount)
+      bigCompressed = deflateRawSync(Buffer.from(bigScene, 'utf8')).toString('base64')
+    }
+    check(
+      'the oversized scene really is too big to send inline',
+      bigCompressed.length > DIAGRAM_MAX_INLINE,
+      `${bigCount} text elements · ${bigCompressed.length}B compressed > ${DIAGRAM_MAX_INLINE}B ceiling`,
+    )
+
+    const bigStaged = await alice.eval(
+      `window.bridge.files.stageBytes('Capacity plan.excalidraw', ${JSON.stringify(Buffer.from(bigScene, 'utf8').toString('base64'))})`,
+    )
+    const bigBody = { fmt: 'excalidraw', w: 3640, h: 40 + Math.ceil(bigCount / 20) * 28, elements: bigCount, thumb: diagramThumb }
+    const bigDraft = {
+      text: 'Capacity plan',
+      kind: 'diagram',
+      diagram: bigBody,
+      attachments: [{ path: bigStaged?.path, thumb: diagramThumb, w: bigBody.w, h: bigBody.h }],
+    }
+    const bigErr = await alice.eval(
+      `window.bridge.chat.send(${JSON.stringify(conv)}, ${JSON.stringify(bigDraft)}).then(() => '', (x) => String(x && x.message || x))`,
+    )
+    check('alice sends it as a staged .excalidraw attachment', bigErr === '', bigErr || bigStaged?.path || '')
+
+    const bigMsg = await until(async () => {
+      const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+      return evs?.find(
+        (e) => e.type === 'msg' && e.payload?.body?.kind === 'diagram' && e.payload?.attachments?.length,
+      )
+    }, 30000)
+    const bigAtt = bigMsg?.payload?.attachments?.[0]
+    check(
+      'bob receives it as a .excalidraw attachment with no inline scene',
+      !!bigAtt && bigAtt.name.endsWith('.excalidraw') && !bigMsg?.payload?.body?.diagram?.data,
+      bigAtt
+        ? `${bigAtt.name} ${bigAtt.size}B · inline data ${bigMsg?.payload?.body?.diagram?.data ? 'PRESENT' : 'absent'}`
+        : 'timed out',
+    )
+
+    if (bigAtt) {
+      // The read the tile does, done explicitly: fetch() on an sfblob:// URL.
+      // Before the scheme was corsEnabled (and the handler started answering
+      // with Access-Control-Allow-Origin) this threw "Failed to fetch" — with
+      // no status, so a share outage was indistinguishable from an expiry.
+      const read = await bob.eval(
+        `(async () => {
+          const a = ${JSON.stringify(bigAtt)}
+          const url = 'sfblob://blob/' + a.blobId + '?key=' + encodeURIComponent(a.key) + '&name=' + encodeURIComponent(a.name) + '&size=' + a.size
+          try {
+            await window.bridge.files.fetchBlob(a.blobId, a.key, a.name, a.size)
+            const res = await fetch(url)
+            const text = await res.text()
+            const ranged = await fetch(url + '&probe=range', { headers: { Range: 'bytes=0-15' } })
+            return {
+              status: res.status,
+              bytes: text.length,
+              head: text.slice(0, 24),
+              rangeStatus: ranged.status,
+              // Readable only because the handler exposes it to the page.
+              contentRange: ranged.headers.get('Content-Range'),
+            }
+          } catch (err) {
+            return { error: String(err && err.message || err) }
+          }
+        })()`,
+      )
+      check(
+        'bob reads the scene back over sfblob:// with fetch (CORS on the custom scheme)',
+        read?.status === 200 && read?.bytes === bigScene.length,
+        read?.error ?? `${read?.bytes}B of ${bigScene.length}B · ${read?.head ?? ''}`,
+      )
+      check(
+        'a ranged read still works, with Content-Range exposed to the page',
+        read?.rangeStatus === 206 && read?.contentRange === `bytes 0-15/${bigAtt.size}`,
+        read?.contentRange ?? String(read?.rangeStatus ?? read?.error ?? ''),
+      )
+    }
+
+    // And the tile itself, end to end: thumb -> fetched scene -> local SVG.
+    let bigTile = 'no tile'
+    const bigTileSeen = await until(async () => {
+      bigTile = await bob.eval(
+        `(() => {
+          const el = document.querySelector('button[aria-label^="Open the diagram Capacity plan"]')
+          if (!el) return 'no tile'
+          if (el.querySelector('svg')) return 'svg'
+          if (el.textContent.includes('cleaned up')) return 'expired'
+          if (el.querySelector('img')) return 'thumb'
+          return 'placeholder'
+        })()`,
+      )
+      return bigTile === 'svg' ? bigTile : undefined
+    }, 45000)
+    soft('bob renders the blob-backed diagram tile as a locally drawn SVG', bigTileSeen === 'svg', bigTile)
+
+    // ---- Live boards (1.3): a session over the folder, both directions -----
+    //
+    // Driven over the bridge rather than through Excalidraw: what has to hold
+    // is the session protocol (one file per participant, seq in the name, the
+    // previous one deleted, frames delivered once, host-only end, dir removed),
+    // not the canvas. The renderer's reconcile/echo half is covered by
+    // live.test.ts, which can run without a window at all.
+    const boardEl = (id, x) => ({
+      id,
+      type: 'rectangle',
+      x,
+      y: 80,
+      width: 120,
+      height: 60,
+      angle: 0,
+      strokeColor: '#1e1e1e',
+      backgroundColor: 'transparent',
+      fillStyle: 'solid',
+      strokeWidth: 2,
+      strokeStyle: 'solid',
+      roughness: 1,
+      opacity: 100,
+      groupIds: [],
+      frameId: null,
+      roundness: { type: 3 },
+      seed: 7,
+      version: 2,
+      versionNonce: 11,
+      isDeleted: false,
+      boundElements: null,
+      updated: 1,
+      link: null,
+      locked: false,
+      index: `a${id}`,
+    })
+    const collector =
+      `(() => { window.__boards = { frames: [], ended: [] }; window.bridge.onPush((m) => {` +
+      ` if (m.kind === 'board-frames') window.__boards.frames.push(...m.frames);` +
+      ` if (m.kind === 'board-ended') window.__boards.ended.push(m.sessionId) }); return true })()`
+    await alice.eval(collector)
+    await bob.eval(collector)
+
+    const started = await alice.eval(
+      `window.bridge.boards.start(${JSON.stringify(conv)}, 'Sprint plan live').then((r) => r, (x) => ({ error: String(x && x.message || x) }))`,
+    )
+    const sid = started?.sessionId
+    check(
+      'alice starts a live board (boards.start returns a session id)',
+      typeof sid === 'string' && /^[0-9a-f]{16}$/.test(sid),
+      started?.error ?? String(sid),
+    )
+
+    if (typeof sid === 'string' && /^[0-9a-f]{16}$/.test(sid)) {
+      const liveSys = await until(async () => {
+        const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+        return evs?.find((e) => e.type === 'sys' && e.payload?.kind === 'board-live' && e.payload?.data?.sessionId === sid)
+      }, 25000)
+      check(
+        "bob's log carries the board-live sys event (this is what puts Join on the row)",
+        !!liveSys && liveSys.verified === true && liveSys.payload.data.title === 'Sprint plan live',
+        liveSys ? `host=${String(liveSys.payload.data.host).slice(0, 8)} title=${liveSys.payload.data.title}` : 'timed out',
+      )
+
+      // The host joins its own session: `join` is what starts the poller.
+      const joinA = await alice.eval(
+        `window.bridge.boards.join(${JSON.stringify(sid)}, ${JSON.stringify(conv)}).then((r) => r, (x) => ({ error: String(x && x.message || x) }))`,
+      )
+      check('alice joins her own session (the poller only starts on join)', !joinA?.error, joinA?.error ?? 'joined')
+
+      const twoEls = [boardEl('b-alice-1', 40), boardEl('b-alice-2', 200)]
+      const writeErr = await alice.eval(
+        `window.bridge.boards.write(${JSON.stringify(sid)}, ${JSON.stringify(conv)}, ${JSON.stringify({
+          elements: twoEls,
+          pointer: { x: -120.5, y: 64.25, tool: 'pointer' },
+          selectedIds: ['b-alice-2'],
+        })}).then(() => '', (x) => String(x && x.message || x))`,
+      )
+      check('alice writes a two-element frame', writeErr === '', writeErr || '2 elements')
+
+      // Bob joins: `join` returns every frame currently in the dir, and anything
+      // written while the coalescer was still holding alice's draft arrives as a
+      // push straight after.
+      const joinB = await until(async () => {
+        const r = await bob.eval(
+          `window.bridge.boards.join(${JSON.stringify(sid)}, ${JSON.stringify(conv)}).then((r) => r, (x) => ({ error: String(x && x.message || x) }))`,
+        )
+        if (r?.error) return undefined
+        if (r?.frames?.some((f) => f.elements?.length === 2)) return r
+        const pushed = await bob.eval(`window.__boards`)
+        return pushed?.frames?.some((f) => f.elements?.length === 2) ? { frames: pushed.frames } : undefined
+      }, 30000)
+      const aliceFrame = joinB?.frames?.find((f) => f.elements?.length === 2)
+      check(
+        "bob's join returns alice's frame, signed by her device, with her scene coordinates intact",
+        !!aliceFrame &&
+          aliceFrame.device === selfA.self.deviceId &&
+          aliceFrame.elements.map((e) => e.id).join(',') === 'b-alice-1,b-alice-2' &&
+          aliceFrame.pointer?.x === -120.5 &&
+          aliceFrame.selectedIds?.[0] === 'b-alice-2',
+        aliceFrame ? `seq=${aliceFrame.seq} name=${aliceFrame.name} els=${aliceFrame.elements.length}` : 'timed out',
+      )
+
+      // Bob draws on it: the whole element list travels, alice's two included —
+      // which is what makes per-element last-writer-wins reconcile cleanly.
+      const threeEls = [...twoEls, boardEl('b-bob-3', 360)]
+      const writeBErr = await bob.eval(
+        `window.bridge.boards.write(${JSON.stringify(sid)}, ${JSON.stringify(conv)}, ${JSON.stringify({
+          elements: threeEls,
+          pointer: { x: 380, y: 100, tool: 'pointer' },
+        })}).then(() => '', (x) => String(x && x.message || x))`,
+      )
+      check('bob adds a third element and writes his own frame', writeBErr === '', writeBErr || '3 elements')
+
+      const gotBob = await until(async () => {
+        const st = await alice.eval(`window.__boards`)
+        return st?.frames?.find((f) => f.device === selfB.self.deviceId && f.elements?.some((e) => e.id === 'b-bob-3'))
+      }, 30000)
+      check(
+        "alice gets a board-frames push carrying bob's element",
+        !!gotBob && gotBob.elements.length === 3,
+        gotBob ? `from ${gotBob.device.slice(0, 8)} seq=${gotBob.seq} els=${gotBob.elements.length}` : 'timed out',
+      )
+
+      // One file per participant, ever: each write renames a new seq into place
+      // and deletes the writer's previous file, so a readdir is the whole state.
+      const boardFiles = await until(async () => {
+        try {
+          const fs = readdirSync(join(SHARE, 'Chat', 'boards', sid))
+          return fs.length >= 2 ? fs : undefined
+        } catch {
+          return undefined
+        }
+      }, 20000)
+      const prefixes = new Set((boardFiles ?? []).map((f) => f.split('.')[0]))
+      check(
+        'boards/<sid>/ holds exactly one file per writer (the previous seq is deleted)',
+        !!boardFiles && boardFiles.length === prefixes.size && prefixes.size === 2,
+        (boardFiles ?? []).join(' ') || 'timed out',
+      )
+
+      const bobEndErr = await bob.eval(
+        `window.bridge.boards.end(${JSON.stringify(sid)}, ${JSON.stringify(conv)}).then(() => '', (x) => String(x && x.message || x))`,
+      )
+      check('boards.end from a non-host is refused', bobEndErr !== '', bobEndErr || 'no error thrown')
+
+      const endErr = await alice.eval(
+        `window.bridge.boards.end(${JSON.stringify(sid)}, ${JSON.stringify(conv)}).then(() => '', (x) => String(x && x.message || x))`,
+      )
+      check('alice (the host) ends the live board', endErr === '', endErr)
+
+      const endedOnBob = await until(async () => {
+        const st = await bob.eval(`window.__boards`)
+        if (st?.ended?.includes(sid)) return 'push'
+        const evs = await bob.eval(`window.bridge.chat.events(${JSON.stringify(conv)})`)
+        return evs?.some((e) => e.type === 'sys' && e.payload?.kind === 'board-ended' && e.payload?.data?.sessionId === sid)
+          ? 'event'
+          : undefined
+      }, 30000)
+      check(
+        "bob's editor is told the board ended (board-ended push or sys event)",
+        !!endedOnBob,
+        endedOnBob || 'timed out',
+      )
+
+      const dirGone = await until(async () => {
+        try {
+          readdirSync(join(SHARE, 'Chat', 'boards', sid))
+          return undefined
+        } catch {
+          return 'gone'
+        }
+      }, 20000)
+      check('the boards/<sid>/ directory is removed when the host ends it', dirGone === 'gone', dirGone ?? 'still there')
+    }
+
+    // The renderer half, driven through the real UI: the diagram tile's
+    // **Collaborate** hosts a board seeded with that scene, the header shows
+    // the Live pill, this device's frame lands in the folder, and **End
+    // session** takes the whole directory away again. Best-effort like the
+    // tile render above — it depends on the 1 MB editor chunk loading and on a
+    // compositor being willing to paint, neither of which is the protocol.
+    const boardsBefore = (() => {
+      try {
+        return readdirSync(join(SHARE, 'Chat', 'boards'))
+      } catch {
+        return []
+      }
+    })()
+    const collabClicked = await bob.eval(
+      `(() => { const el = document.querySelector('button[title^="Open this as a live board"]'); if (!el) return false; el.click(); return true })()`,
+    )
+    soft("bob's diagram tile offers Collaborate", collabClicked === true, collabClicked === true ? 'clicked' : 'no button')
+    if (collabClicked === true) {
+      const pill = await until(
+        async () =>
+          await bob.eval(
+            `(() => { const el = document.querySelector('[role="status"][aria-label^="Live board"]'); return el ? el.getAttribute('aria-label') : undefined })()`,
+          ),
+        40000,
+      )
+      soft('the editor opens in live mode and shows the Live pill', !!pill, pill || 'timed out')
+
+      const uiSid = await until(async () => {
+        try {
+          const now = readdirSync(join(SHARE, 'Chat', 'boards')).filter((d) => !boardsBefore.includes(d))
+          const fresh = now.find((d) => readdirSync(join(SHARE, 'Chat', 'boards', d)).length > 0)
+          return fresh
+        } catch {
+          return undefined
+        }
+      }, 30000)
+      soft("the editor's own frame reaches boards/<sid>/", !!uiSid, uiSid || 'timed out')
+
+      // …and the inbound half, in the real editor: alice joins bob's session
+      // over the bridge and writes a frame. The pill's own label is the proof
+      // it landed — it is rendered from the collaborator map that
+      // `digestFrames` → `reconcileElements` → `updateScene` produces, so a
+      // throw anywhere along that path leaves it reading "0 other
+      // participants".
+      if (uiSid) {
+        await alice.eval(
+          `window.bridge.boards.join(${JSON.stringify(uiSid)}, ${JSON.stringify(conv)}).catch(() => {})`,
+        )
+        await alice.eval(
+          `window.bridge.boards.write(${JSON.stringify(uiSid)}, ${JSON.stringify(conv)}, ${JSON.stringify({
+            elements: [boardEl('b-ui-1', 520)],
+            pointer: { x: 540, y: 96, tool: 'pointer' },
+          })}).catch(() => {})`,
+        )
+        const withPeer = await until(
+          async () =>
+            await bob.eval(
+              `(() => { const el = document.querySelector('[role="status"][aria-label^="Live board"]');` +
+                ` const l = el && el.getAttribute('aria-label');` +
+                ` return l && l.includes('drawing with') ? l : undefined })()`,
+            ),
+          40000,
+        )
+        soft(
+          "the editor reconciles a peer's frame and shows them in the Live pill",
+          !!withPeer,
+          withPeer || 'still alone — the inbound path did not run',
+        )
+        await alice.eval(
+          `window.bridge.boards.leave(${JSON.stringify(uiSid)}, ${JSON.stringify(conv)}).catch(() => {})`,
+        )
+      }
+
+      const endClicked = await bob.eval(
+        `(() => { const el = document.querySelector('button[title^="End the live board for everyone"]'); if (!el) return false; el.click(); return true })()`,
+      )
+      soft('the host can end the session from the header', endClicked === true)
+      if (uiSid) {
+        const uiGone = await until(async () => {
+          try {
+            readdirSync(join(SHARE, 'Chat', 'boards', uiSid))
+            return undefined
+          } catch {
+            return 'gone'
+          }
+        }, 25000)
+        soft('ending from the header removes the session directory', uiGone === 'gone', uiGone ?? 'still there')
+      }
+    }
+    // Whatever happened above, leave bob looking at the chat again: the rest of
+    // the run (and the final screenshot) expects the ordinary pane.
+    await bob.eval(
+      `(() => { const c = document.querySelector('button[aria-label="Close the diagram editor"]'); if (c) c.click(); return true })()`,
+    )
+    await sleep(400)
+    await bob.eval(
+      `(() => { const b = document.querySelectorAll('[role="alertdialog"] button'); if (b.length) b[b.length - 1].click(); return true })()`,
+    )
+    await sleep(400)
+    soft(
+      'the diagram editor is closed again',
+      (await bob.eval(`document.querySelector('.sem-diagram-host') === null`)) === true,
+    )
 
     // ---- Beams: alice beams a file directly to bob; auto-flow via bridge ----
     // Persistent collector attached BEFORE the send so no push is missed.

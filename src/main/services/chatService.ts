@@ -13,21 +13,36 @@ import type {
   ConvId,
   Cursor,
   EventPayload,
+  MsgBody,
   MsgPayload,
+  PollBody,
   PresenceView,
   PrsPayload,
   SysPayload,
   VerifiedEvent,
+  VotPayload,
 } from '@shared/types'
 import type { AttachDraft } from '@shared/bridge'
 import { DIAGRAM, DIR, TEAM_CONV } from '@shared/constants'
 import { diagramFallbackText, diagramFitsInline, diagramPreview } from '@shared/diagram'
+import { materialize } from '@shared/merge'
+import type { MessageView } from '@shared/merge'
+import {
+  calibrateClosesAt,
+  checkChoice,
+  isPollClosed,
+  normalizePollBody,
+  pollFallbackText,
+  pollNotifySnippet,
+  validatePollDraft,
+} from '@shared/poll'
 import { isChanConv, isDmConv, isGrpConv, isTeamConv } from '@shared/ids'
 import { EventStore } from '../transport/events'
 import { BeaconWriter } from '../transport/beacon'
 import { Poller } from '../transport/poller'
 import type { IoTier } from './ioTier'
 import type { Session } from '../transport/session'
+import { boardLiveIsFresh, boardLiveNotifyLine } from './boards'
 import { fixedChannelId, foldChannelSys, normalizeChannelName } from './channels'
 import { GroupService } from './groups'
 import { notifyLineFor } from './notifyLine'
@@ -121,7 +136,14 @@ export class ChatService {
         this.push({ kind: 'cursors', conv, deviceId, cursor })
       },
       onHealthChange: (reachable) => {
-        this.push({ kind: 'health', health: { reachable, latencyMs: s.io.getHealth().latencyMs } })
+        // offsetMs (1.3): the renderer decides "is this poll closed" on the
+        // share clock, which only main knows. Rides the health push because
+        // that is the one thing already telling the renderer about the folder.
+        const offsetMs = s.io.getClockOffsetMs()
+        this.push({
+          kind: 'health',
+          health: { reachable, latencyMs: s.io.getHealth().latencyMs, ...(offsetMs === null ? {} : { offsetMs }) },
+        })
         if (reachable) void this.flushOutbox()
       },
       onNewDevice: () => {
@@ -329,6 +351,20 @@ export class ChatService {
       }
     }
 
+    // A poll (1.3). The renderer's dialog validates too, but renderer input is
+    // untrusted: the limits, the option ids and the deadline are all settled
+    // here, on the one clock every reader compares against.
+    let poll: PollBody | undefined
+    if (draft.kind === 'poll') {
+      const problem = validatePollDraft(draft.poll)
+      if (problem) throw new Error(problem)
+      poll = normalizePollBody(draft.poll!)
+      poll.closesAt = calibrateClosesAt(poll.closesAt, Date.now(), s.io.calibratedNow())
+      if (poll.closesAt === undefined) delete poll.closesAt
+      // Closing is the author's own `edt`; a draft never arrives closed.
+      delete poll.closedAt
+    }
+
     let attachments: Attachment[] | undefined
     if (draft.attachments?.length) {
       if (!this.attachmentUploader) throw new Error('files-not-ready')
@@ -344,11 +380,14 @@ export class ChatService {
         kind: draft.kind,
         // `draft.text` is the diagram's title; the body text is what a 1.1.x
         // client prints in its place, so it has to name the diagram itself.
-        text: diagram ? diagramFallbackText(draft.text) : draft.text,
+        // A poll works the same way one version on: pre-1.3 clients cannot vote
+        // (their filename regex drops the `.vot.e1` files), so the line says so.
+        text: diagram ? diagramFallbackText(draft.text) : poll ? pollFallbackText(poll.question) : draft.text,
         lang: draft.lang,
         packId: draft.packId,
         entities: draft.entities,
         diagram,
+        poll,
       },
       replyTo: draft.replyTo,
       attachments,
@@ -429,6 +468,54 @@ export class ChatService {
   }
 
   // -------------------------------------------------------------------------
+  // Polls (1.3)
+
+  /**
+   * The poll as it stands *now* — materialized, so the author's closing `edt`
+   * counts. Reading the `msg` event alone would let a vote land in a poll that
+   * was closed an hour ago.
+   */
+  private pollMessage(conv: ConvId, target: string): MessageView & { body: { poll: PollBody } } {
+    const m = materialize(this.events.getEvents(conv)).messages.find((x) => x.id === target)
+    if (!m || m.deleted) throw new Error('unknown-poll')
+    if (m.body.kind !== 'poll' || !m.body.poll) throw new Error('not-a-poll')
+    return m as MessageView & { body: { poll: PollBody } }
+  }
+
+  /**
+   * Vote, change a vote, or take it back (`[]`). One `vot` event per press:
+   * the latest one this device wrote wins everywhere, so there is nothing to
+   * delete and nothing that can half-apply.
+   */
+  async vote(conv: ConvId, target: string, choice: string[]): Promise<void> {
+    const poll = this.pollMessage(conv, target).body.poll
+    if (isPollClosed(poll, this.session.io.calibratedNow())) throw new Error('poll-closed')
+    const checked = checkChoice(poll, choice)
+    if ('error' in checked) throw new Error(checked.error)
+    const payload: VotPayload = { t: 'vot', conv, target, choice: checked.choice }
+    const ev = await this.events.publish(conv, 'vot', payload)
+    // Into `heads2`, never `heads` — votes are the one event type that arrives
+    // in a burst, and `heads` is a 16-name ring every older reader still ingests
+    // its `msg` names from (see beacon.ts: an unparseable name costs them
+    // nothing, an evicted `msg` head costs them the cheap path).
+    this.beacon.noteOwnEvent(conv, `${ev.id}.vot.e1`)
+  }
+
+  /**
+   * Close a poll for everyone: the author republishes the body with `closedAt`
+   * through the ordinary edit path, so every reader — including one that was
+   * offline for it — gets the closed poll by the rules it already has (an `edt`
+   * only counts from the message's own author).
+   */
+  async closePoll(conv: ConvId, target: string): Promise<void> {
+    const m = this.pollMessage(conv, target)
+    if (m.authorDevice !== this.session.deviceId) throw new Error('not-poll-author')
+    if (m.body.poll.closedAt) return // already closed — idempotent
+    const body: MsgBody = { ...m.body, poll: { ...m.body.poll, closedAt: this.session.io.calibratedNow() } }
+    await this.mutate(conv, 'edt', { t: 'edt', conv, target, body })
+  }
+
+  // -------------------------------------------------------------------------
 
   // Own read watermarks, persisted: they drive peers' receipts and this
   // device's unread badges, neither of which should reset on relaunch.
@@ -469,6 +556,9 @@ export class ChatService {
   private maybeNotify(conv: ConvId, event: VerifiedEvent): void {
     // Calendar edits never toast; PR alerts are the PR service's job.
     if (isTeamConv(conv)) return
+    // Live boards (1.3) are the one sys event worth a toast: a session can only
+    // be joined while it is running, so it cannot wait to be scrolled past.
+    if (event.type === 'sys') return this.maybeNotifyBoardLive(conv, event)
     if (event.type !== 'msg' || !event.verified) return
     const win = this.getWindow()
     if (win?.isFocused()) return // in-app treatment only
@@ -506,13 +596,60 @@ export class ChatService {
           ? 'sent a GIF'
           : p.body.kind === 'diagram'
             ? diagramPreview(p.body.text)
-            : p.body.text.slice(0, 140),
+            : // 1.3: "Ana in #general" / "started a poll: Ship on Friday?" —
+              // same reason as the diagram line, one version on.
+              p.body.kind === 'poll'
+              ? pollNotifySnippet(p.body)
+              : p.body.text.slice(0, 140),
     })
     const n = new Notification({ title, body, silent: false })
     n.on('click', () => {
       win?.show()
       win?.focus()
       this.push({ kind: 'typing', conv, deviceId: '', until: 0 }) // no-op nudge; renderer routes via focus event
+    })
+    n.show()
+  }
+
+  /**
+   * "Ana opened a live board: Sprint plan" (1.3). A board is an invitation
+   * rather than a mention, so the "mentions only" channel setting keeps quiet
+   * instead of guessing; DMs and private groups always toast, like a message.
+   * The wording itself is pure and unit-tested in boards.ts.
+   */
+  private maybeNotifyBoardLive(conv: ConvId, event: VerifiedEvent): void {
+    const p = event.payload as SysPayload
+    if (p.kind !== 'board-live' || !event.verified) return
+    if (event.author === this.session.deviceId) return // our own session
+    // Only a session that could still be running: a board is an invitation to
+    // join something live, and catching up a log that was not read since Friday
+    // (or a conversation opened for the first time) must not toast sessions the
+    // janitor swept days ago. `RETENTION.boardsDeadMinutes` is exactly how long
+    // a board outlives its last frame, so it is the window for the toast too.
+    if (!boardLiveIsFresh(Number(p.data.startedAt), this.session.io.calibratedNow())) return
+    const win = this.getWindow()
+    if (win?.isFocused()) return // in-app treatment only
+    const settings = this.getSettings()
+    const isGrp = isGrpConv(conv)
+    const isDm = isDmConv(conv) || isGrp
+    if (!isDm && settings.notifyChannels !== 'all') return
+    if (!Notification.isSupported()) return
+    const who = this.session.roster.get(event.author)?.record.displayName ?? 'Someone'
+    const where = isGrp
+      ? `🔒 ${this.groups.nameOf(conv) ?? 'private group'}`
+      : isDmConv(conv)
+        ? 'Direct message'
+        : `#${this.session.channels.get(conv.slice(5))?.name ?? 'channel'}`
+    const line = boardLiveNotifyLine({
+      who,
+      where,
+      title: typeof p.data.title === 'string' ? p.data.title : '',
+      previews: settings.notifyPreviews,
+    })
+    const n = new Notification({ title: line.title, body: line.body, silent: false })
+    n.on('click', () => {
+      win?.show()
+      win?.focus()
     })
     n.show()
   }

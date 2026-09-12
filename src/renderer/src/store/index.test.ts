@@ -217,3 +217,108 @@ describe('store: prs prefs flag', () => {
     expect(h.store.getState().prsPrefsOpen).toBe(true)
   })
 })
+
+describe('store: fullscreen push', () => {
+  it('mirrors the main window’s OS fullscreen state', async () => {
+    const h = await harness()
+    expect(h.store.getState().fullscreen).toBe(false)
+
+    // The flag is only ever set from this push: main owns the window state, and
+    // the editor's own toggle asks for it rather than assuming it happened (the
+    // OS can refuse, and a user can leave fullscreen from the green button or
+    // Mission Control, where nothing in the renderer is involved at all).
+    h.push({ kind: 'fullscreen', on: true })
+    expect(h.store.getState().fullscreen).toBe(true)
+
+    h.push({ kind: 'fullscreen', on: false })
+    expect(h.store.getState().fullscreen).toBe(false)
+  })
+})
+
+// --- ensureEvents and a folder switch mid-read (1.3) ---
+// Every log is read across an await and none of those reads is cancellable, so
+// the answer can come back after the team folder it was asked of is gone. The
+// guard is `teamSeq`, the same shape channelsSeq/groupsSeq have had since 1.2.
+
+describe('store: ensureEvents', () => {
+  async function deferredHarness(): Promise<{
+    push(msg: PushMessage): void
+    release(list: VerifiedEvent[]): void
+    store: typeof import('./index').useStore
+  }> {
+    let handler: ((msg: PushMessage) => void) | null = null
+    let release: (list: VerifiedEvent[]) => void = () => {}
+    const events = new Promise<VerifiedEvent[]>((res) => {
+      release = res
+    })
+    const bridge = {
+      onPush: (fn: (msg: PushMessage) => void) => {
+        handler = fn
+      },
+      app: { getBoot: async () => ({ mode: 'onboarding' as const }), setBadge: async () => {} },
+      settings: { get: async () => null },
+      chat: { events: () => events, cursors: async () => ({}) },
+    }
+    ;(globalThis as unknown as { window: unknown }).window = { bridge }
+    const { useStore } = await import('./index')
+    await useStore.getState().init()
+    return { push: (msg) => handler?.(msg), release, store: useStore }
+  }
+
+  it('drops a read that lands after the team folder changed', async () => {
+    const h = await deferredHarness()
+    const boardLive: VerifiedEvent = {
+      id: '1700000000009-0001-aaaaaaaa',
+      type: 'sys',
+      payload: {
+        t: 'sys',
+        conv: 'chan:gone' as ConvId,
+        kind: 'board-live',
+        data: { sessionId: 'ghost', title: 'Old board', startedAt: 1 },
+      },
+      author: 'owner01',
+      verified: true,
+      receivedAt: 0,
+    }
+
+    const inFlight = h.store.getState().ensureEvents('chan:gone' as ConvId)
+    // The folder goes while the read is in flight: this clears every cached log.
+    h.push({ kind: 'boot', boot: { mode: 'onboarding' } } as PushMessage)
+    h.release([boardLive])
+    await inFlight
+
+    // Nothing from the share we left — not the events, not the "loaded" flag,
+    // and above all not a Join button for a board in a folder we cannot reach.
+    expect(h.store.getState().events['chan:gone']).toBeUndefined()
+    expect(h.store.getState().eventsLoaded['chan:gone']).toBeUndefined()
+    expect(h.store.getState().liveBoards.ghost).toBeUndefined()
+  })
+
+  it('keeps the read when the folder stayed put', async () => {
+    const h = await deferredHarness()
+    const inFlight = h.store.getState().ensureEvents('chan:here' as ConvId)
+    h.release([])
+    await inFlight
+    expect(h.store.getState().eventsLoaded['chan:here']).toBe(true)
+  })
+})
+
+describe('store: health push', () => {
+  it('keeps the last known share-clock offset when a push arrives without one', async () => {
+    const h = await harness()
+    h.store.setState({ health: { reachable: true, latencyMs: null } })
+
+    // Main calibrated against the folder: polls now close on share time.
+    h.push({ kind: 'health', health: { reachable: true, latencyMs: 12, offsetMs: 90_000 } } as PushMessage)
+    expect(h.store.getState().health.offsetMs).toBe(90_000)
+
+    // The share going away does not make the two clocks agree again, and the
+    // offline push carries no offset — so the last one stands.
+    h.push({ kind: 'health', health: { reachable: false, latencyMs: null } } as PushMessage)
+    expect(h.store.getState().health).toMatchObject({ reachable: false, offsetMs: 90_000 })
+
+    // A fresh measurement replaces it, including back to zero.
+    h.push({ kind: 'health', health: { reachable: true, latencyMs: 8, offsetMs: 0 } } as PushMessage)
+    expect(h.store.getState().health.offsetMs).toBe(0)
+  })
+})

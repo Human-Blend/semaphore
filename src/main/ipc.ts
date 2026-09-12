@@ -5,6 +5,7 @@ import { DIR } from '@shared/constants'
 import { redactEventForRenderer, redactPushForRenderer } from '@shared/prs'
 import { AppController, detectDevice } from './appController'
 import { fetchLinkPreview } from './services/linkPreview'
+import { registerBoardsIpc } from './services/boardsIpc'
 import { registerCalendarIpc } from './services/calendarIpc'
 import { registerFileIpc } from './services/filesIpc'
 import { registerPrsIpc } from './services/prsIpc'
@@ -82,6 +83,25 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   ipcMain.handle('chat:renameChannel', (_e, conv: ConvId, name: string) => chat().renameChannel(conv, name))
   ipcMain.handle('chat:deleteChannel', (_e, conv: ConvId) => chat().deleteChannel(conv))
 
+  // 1.3: every stub registered here has been replaced by its owning service,
+  // so there is no `not-implemented` fallback left to hand the renderer.
+  // Polls (1.3). Both re-validate everything the renderer checked: the option
+  // ids against the poll, `multi`, whether it is closed, and — for the close —
+  // that the caller is the poll's own author.
+  ipcMain.handle('chat:vote', (_e, conv: ConvId, target: string, choice: string[]) =>
+    chat().vote(conv, target, choice),
+  )
+  ipcMain.handle('chat:closePoll', (_e, conv: ConvId, target: string) => chat().closePoll(conv, target))
+  // boards:start/join/write/leave/end are live — registerBoardsIpc below.
+  // Whole-window diagram editor (1.3): a real OS fullscreen toggle. The
+  // enter-full-screen/leave-full-screen listeners that push the resulting
+  // state back to the renderer are wired in main/index.ts, next to the
+  // window's other focus/blur/show wiring.
+  ipcMain.handle('app:setFullScreen', (_e, on: boolean) => {
+    getWindow()?.setFullScreen(on)
+  })
+  ipcMain.handle('app:isFullScreen', () => getWindow()?.isFullScreen() ?? false)
+
   // Private groups (1.2). Reading is the ordinary event path; these are the
   // membership/key operations.
   ipcMain.handle('groups:list', () => chat().groups.views())
@@ -136,6 +156,7 @@ export function registerIpc(controller: AppController, getWindow: () => BrowserW
   // File/blob/beam, screen-share and team-log slices register their own handlers.
   registerFileIpc(controller, getWindow)
   registerScreenIpc(controller, getWindow)
+  registerBoardsIpc(controller, getWindow)
   registerCalendarIpc(controller, getWindow)
   registerPrsIpc(controller, getWindow)
 }

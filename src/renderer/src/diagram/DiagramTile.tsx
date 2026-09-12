@@ -104,6 +104,10 @@ export function DiagramTile({ view }: { view: MessageView }) {
     if (!d) return
     void openDiagram(view, 'edit')
   }
+  const collaborate = (): void => {
+    if (!d) return
+    void openDiagram(view, 'live')
+  }
 
   if (kind === 'broken' || !d) {
     return (
@@ -170,6 +174,13 @@ export function DiagramTile({ view }: { view: MessageView }) {
         )}
         <button onClick={editCopy} style={linkBtn} title="Open a copy you can change, and send it back as a reply">
           Edit a copy
+        </button>
+        <button
+          onClick={collaborate}
+          style={linkBtn}
+          title="Open this as a live board — everyone in the conversation can join and draw on it with you"
+        >
+          Collaborate
         </button>
         <TileExport view={view} title={title} onError={() => setPhase('failed')} />
       </div>
@@ -238,9 +249,10 @@ function CleanedUp() {
 /**
  * Open the editor on an existing diagram. 'view' is read-only (Export still
  * works); 'edit' opens a copy whose Send lands as a reply — the discussion
- * loop, without live co-editing.
+ * loop, without live co-editing; 'live' (1.3) hosts a live board seeded with
+ * this scene and its title, which is the co-editing loop.
  */
-async function openDiagram(view: MessageView, mode: 'view' | 'edit'): Promise<void> {
+async function openDiagram(view: MessageView, mode: 'view' | 'edit' | 'live'): Promise<void> {
   const d = view.body.diagram
   if (!d) return
   const title = diagramTitleOf(view.body.text)
@@ -255,6 +267,12 @@ async function openDiagram(view: MessageView, mode: 'view' | 'edit'): Promise<vo
     scene = null
   }
   if (scene === null) return
+  if (mode === 'live') {
+    // `boardId` is this message's id, so the session says what it grew out of.
+    const { collaborateOn } = await import('./collab')
+    collaborateOn({ conv: view.conv, title, scene, boardId: view.id })
+    return
+  }
   useStore.getState().openDiagramEditor({
     conv: view.conv,
     mode,

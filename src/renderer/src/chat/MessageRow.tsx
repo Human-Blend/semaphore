@@ -4,7 +4,7 @@ import type { ConvId } from '@shared/types'
 import type { MessageView } from '@shared/merge'
 import { Avatar, DeviceChip, formatTime } from '@/ui/atoms'
 import { MessageBody } from '@/content/RichContent'
-import { formatFullDate, snippetOf, type ChipData } from './util'
+import { copyTextOf, formatFullDate, snippetOf, type ChipData } from './util'
 import { ReplyIcon, PencilIcon, TrashIcon, CopyIcon, PinIcon, SmilePlusIcon } from './icons'
 
 // One flat, full-width message row (spec §3.2): 36px avatar gutter, no
@@ -268,7 +268,7 @@ export const MessageRow = memo(function MessageRow({
             <ReplyIcon size={15} />
           </ToolBtn>
           {m.body.text !== '' && (
-            <ToolBtn label="Copy text" onClick={() => void window.bridge.app.copyText(m.body.text).catch(() => {})}>
+            <ToolBtn label="Copy text" onClick={() => void window.bridge.app.copyText(copyTextOf(m)).catch(() => {})}>
               <CopyIcon size={15} />
             </ToolBtn>
           )}

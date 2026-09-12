@@ -6,6 +6,8 @@ import { isDmConv } from '@shared/ids'
 import type { MaterializedLog, MessageView, SysView } from '@shared/merge'
 import { useStore } from '@/store'
 import { formatDayDivider, formatTime } from '@/ui/atoms'
+import { openLiveBoard } from '@/diagram/collab'
+import { boardJoinAction, type LiveBoardEntry } from '@/diagram/live'
 import { MessageRow } from './MessageRow'
 import { dayKeyOf, sysLine, type ChipData } from './util'
 
@@ -114,6 +116,8 @@ export function MessageList({
   // DM receipt under my newest message: Sent (on the share) → Delivered (the
   // peer's client picked it up) → Read (they had it on screen).
   const cursors = useStore((s) => s.cursors[conv])
+  /** Which live boards are still running — the Join button's whole condition. */
+  const liveBoards = useStore((s) => s.liveBoards)
   const receiptFor = useMemo(() => {
     if (!isDmConv(conv)) return null
     let mineNewest: MessageView | null = null
@@ -172,7 +176,7 @@ export function MessageList({
         case 'unread':
           return <UnreadDivider />
         case 'sys':
-          return <SysRow line={sysLine(it.s, nameOf)} />
+          return <SysRow line={sysLine(it.s, nameOf)} action={boardJoinAction(it.s, liveBoards)} />
         case 'msg':
           return (
             <MessageRow
@@ -193,7 +197,7 @@ export function MessageList({
           )
       }
     },
-    [conv, selfId, chipOf, nameOf, getMessage, onReply, onEditStart, onEditDone, editingId, receiptFor],
+    [conv, selfId, chipOf, nameOf, getMessage, liveBoards, onReply, onEditStart, onEditDone, editingId, receiptFor],
   )
 
   if (!loaded && items.length === 0) return <SkeletonRows />
@@ -292,9 +296,52 @@ function UnreadDivider() {
   )
 }
 
-function SysRow({ line }: { line: string }) {
+/**
+ * A system notice. Since 1.3 it can carry one action — the **Join** button on
+ * a `board-live` row, for as long as that session is still running (the
+ * decision is `boardJoinAction`, which the store's live-board registry feeds).
+ * Rows without one look exactly as they always did.
+ */
+function SysRow({ line, action }: { line: string; action?: { label: string; entry: LiveBoardEntry } | null }) {
   return (
-    <div style={{ textAlign: 'center', padding: '4px 24px', fontSize: 12, color: 'var(--text-3)' }}>{line}</div>
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 8,
+        textAlign: 'center',
+        padding: '4px 24px',
+        fontSize: 12,
+        color: 'var(--text-3)',
+      }}
+    >
+      <span>{line}</span>
+      {action && (
+        <button
+          onClick={() => openLiveBoard(action.entry)}
+          // "Join" on its own is every Join button in the log: the name has to
+          // say which board, since a screen reader reads the button without the
+          // sentence it sits next to.
+          aria-label={`${action.label} the live board${action.entry.title ? `: ${action.entry.title}` : ''}`}
+          title={`Join the live board${action.entry.title ? ` ${action.entry.title}` : ''}`}
+          style={{
+            height: 20,
+            padding: '0 9px',
+            borderRadius: 999,
+            border: '1px solid color-mix(in srgb, var(--success) 55%, transparent)',
+            background: 'color-mix(in srgb, var(--success) 14%, transparent)',
+            color: 'var(--text-1)',
+            fontSize: 11.5,
+            fontWeight: 600,
+            fontFamily: 'var(--font-ui)',
+            cursor: 'pointer',
+          }}
+        >
+          {action.label}
+        </button>
+      )}
+    </div>
   )
 }
 

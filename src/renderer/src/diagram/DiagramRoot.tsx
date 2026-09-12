@@ -20,10 +20,18 @@ const Editor = lazy(() => import('./DiagramEditor'))
 export function DiagramRoot() {
   const slot = useStore((s) => s.diagramEditor)
   if (!slot) return null
+  // Which board this is: the session for a join, the seed diagram for a start.
+  const liveId = slot.live ? (slot.live.kind === 'join' ? slot.live.sessionId : (slot.live.boardId ?? '')) : ''
   return (
     <Suspense fallback={<EditorLoading />}>
-      {/* Keyed so switching conversations/diagrams remounts with fresh initial data. */}
-      <Editor key={`${slot.conv}:${slot.replyTo ?? ''}:${slot.mode}`} slot={slot} />
+      {/* Keyed so switching conversations/diagrams remounts with fresh initial
+          data — and, since 1.3, so that joining a different live session is a
+          new editor rather than a second session inside the old one. The start
+          case needs its `boardId` in the key for the same reason: Collaborate on
+          a second diagram has the same conv/mode/kind as the first, so without
+          it React kept the mounted editor (and its scene, and its session) and
+          the click did nothing at all. */}
+      <Editor key={`${slot.conv}:${slot.replyTo ?? ''}:${slot.mode}:${slot.live?.kind ?? ''}:${liveId}`} slot={slot} />
     </Suspense>
   )
 }

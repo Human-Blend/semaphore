@@ -1,12 +1,13 @@
-import { app, BrowserWindow, dialog, powerMonitor, shell } from 'electron'
+import { app, BrowserWindow, dialog, powerMonitor, protocol, shell } from 'electron'
 import { basename, dirname, join } from 'node:path'
 import { existsSync, renameSync, rmSync } from 'node:fs'
+import type { PushMessage } from '@shared/bridge'
 import { AppController } from './appController'
 import { registerIpc } from './ipc'
 import { lockNavigation } from './navGuard'
 import { IoTierManager } from './services/ioTier'
-import { registerBlobProtocol, registerBlobScheme } from './services/blobProtocol'
-import { registerGifProtocol, registerGifScheme } from './services/gifProtocol'
+import { blobSchemePrivileges, registerBlobProtocol } from './services/blobProtocol'
+import { gifSchemePrivileges, registerGifProtocol } from './services/gifProtocol'
 
 // mDNS candidate obfuscation would replace host-candidate IPs with .local names
 // that corporate LANs can't resolve, killing every P2P connection. Must be set
@@ -42,8 +43,9 @@ if (profile && !app.isPackaged) {
 // electron-builder.yml and be set before any notification.
 app.setAppUserModelId('com.semaphore.teamchat')
 
-registerBlobScheme()
-registerGifScheme()
+// Exactly one call, before ready, carrying every custom scheme: Electron lets
+// this happen once, and a second call replaces what the first registered.
+protocol.registerSchemesAsPrivileged([blobSchemePrivileges, gifSchemePrivileges])
 
 const gotLock = app.requestSingleInstanceLock({ profile: profile ?? '' })
 if (!gotLock) {
@@ -191,10 +193,30 @@ function createWindow(): void {
   mainWindow.on('restore', () => ioTier.setVisible(true))
   mainWindow.on('hide', () => ioTier.setVisible(false))
   mainWindow.on('minimize', () => ioTier.setVisible(false))
+  // Whole-window diagram editor (1.3): app:setFullScreen (ipc.ts) drives the
+  // OS state from the renderer's toggle; these are the other direction, so
+  // the editor's header reflects reality even if fullscreen is left some
+  // other way (a system gesture, the traffic-light green button on macOS).
+  mainWindow.on('enter-full-screen', () => {
+    const msg: PushMessage = { kind: 'fullscreen', on: true }
+    mainWindow?.webContents.send('push', msg)
+  })
+  mainWindow.on('leave-full-screen', () => {
+    const msg: PushMessage = { kind: 'fullscreen', on: false }
+    mainWindow?.webContents.send('push', msg)
+  })
   mainWindow.on('closed', () => {
     mainWindow = null
     ioTier.setVisible(false)
     ioTier.setFocused(false)
+    // A live board is a window-shaped thing: its poller and its keepalive exist
+    // to serve an open editor. With the window gone there is nobody to push
+    // frames to, so stop every session and leave it — which deletes this
+    // device's frame files, so peers drop us from the pointer list now instead
+    // of waiting out BOARD.staleMs. On macOS the process stays alive here, so
+    // without this the timers would keep writing into the session for as long
+    // as the app ran in the background.
+    void controller.boards?.stop()
   })
 
   // Any external navigation opens in the OS browser, never inside the app —

@@ -47,7 +47,7 @@ export interface DevicePin {
 // client has no default in `sysLine()`, so a sys row it doesn't know renders as
 // a blank line in the DM timeline. A `.grp.e1` filename doesn't parse on 1.1 at
 // all, so the file is ignored in silence — the same trick 'cal'/'prs' use.
-export type EventType = 'msg' | 'edt' | 'del' | 'rct' | 'pin' | 'sys' | 'prv' | 'cal' | 'prs' | 'grp'
+export type EventType = 'msg' | 'edt' | 'del' | 'rct' | 'pin' | 'sys' | 'prv' | 'cal' | 'prs' | 'grp' | 'vot'
 
 export interface EventId {
   hlcMs: number
@@ -112,14 +112,43 @@ export interface DiagramBody {
   elements: number
 }
 
+/**
+ * A poll (1.3). Votes are `vot` events targeting the poll message (LWW per
+ * voter, empty choice = retract). The author closes it with an `edt` carrying
+ * `closedAt`; readers also treat `closesAt <= now` as closed. `anonymous`
+ * hides names in the UI only — every vote is still a signed event on the share.
+ */
+export interface PollBody {
+  question: string
+  options: { id: string; text: string }[] // 2–10, ids unique within the poll
+  multi: boolean
+  anonymous: boolean
+  /** Share-calibrated ms; absent = open until the author closes it. */
+  closesAt?: number
+  /** "Quick decision" preset: Yes/No/Abstain, shows "Decided: …" when closed. */
+  decision?: boolean
+  /** Set by the author's closing `edt`. */
+  closedAt?: number
+}
+
 export interface MsgBody {
-  kind: 'text' | 'code' | 'gif' | 'diagram'
+  kind: 'text' | 'code' | 'gif' | 'diagram' | 'poll'
   text: string
   lang?: string | null // kind:'code'
   packId?: string // kind:'gif' from the bundled pack — zero share I/O
   entities?: BodyEntity[]
   /** kind:'diagram' — `text` carries a fallback line for pre-1.2 clients. */
   diagram?: DiagramBody
+  /** kind:'poll' (1.3) — `text` carries a fallback line for pre-1.3 clients. */
+  poll?: PollBody
+}
+
+/** A vote on a poll message (1.3). The latest verified `vot` per device wins. */
+export interface VotPayload {
+  t: 'vot'
+  conv: ConvId
+  target: string // the poll message's event stem
+  choice: string[] // option ids; [] retracts
 }
 
 export interface MsgPayload {
@@ -196,7 +225,36 @@ export interface SysPayload {
     | 'group-left' // data: {} — the author left
     | 'group-deleted' // data: {}
     | 'group-removed' // data: { groupId, epoch } — "you were removed", a `grp` event (1.2)
+    // Live boards (1.3): a real-time diagram session over boards/<sessionId>/.
+    | 'board-live' // data: { sessionId, boardId, title, host, startedAt }
+    | 'board-ended' // data: { sessionId, boardId, resultStem? } — host only
   data: Record<string, unknown>
+}
+
+/**
+ * One participant's frame in a live board session (1.3): the writer's full
+ * element list (Excalidraw keeps `isDeleted` tombstones, so full lists
+ * reconcile cleanly), files it introduced since its last frame, its pointer
+ * and selection. Signed, then encrypted under the conversation key with
+ * `KID.board(sessionId, convInfo.kid)` — the conversation's kid rides along so
+ * a reader knows which key (for a group, which epoch) the frame wants; file
+ * `boards/<sessionId>/<deviceId8>.<seq36>`.
+ */
+export interface BoardFrameDraft {
+  elements: unknown[]
+  /** Newly introduced binary files (id -> Excalidraw BinaryFileData), sent once. */
+  files?: Record<string, unknown>
+  pointer?: { x: number; y: number; tool: 'pointer' | 'laser' }
+  selectedIds?: string[]
+}
+
+export interface BoardFrame extends BoardFrameDraft {
+  sessionId: string
+  device: string
+  name: string
+  seq: number
+  /** Share-calibrated ms when written. */
+  at: number
 }
 
 /**
@@ -301,6 +359,7 @@ export type EventPayload =
   | CalPayload
   | PrsPayload
   | GrpPayload
+  | VotPayload
 
 /** What actually gets encrypted into an .e1 file. */
 export interface SignedRecord<T = unknown> {
@@ -323,6 +382,14 @@ export interface BeaconContent {
   typing?: { conv: ConvId; until: number }
   /** Last N event filenames this device wrote, per conversation (channels only). */
   heads: Record<string, string[]>
+  /**
+   * Heads of event types introduced after 1.2 (`vot`, …), kept out of `heads` so
+   * that a burst of them cannot evict the names an older reader does ingest from
+   * that 16-slot ring (a name it cannot parse is skipped before the gap check, so
+   * it costs nothing in itself — losing the `msg` heads costs it the cheap path).
+   * 1.3 readers ingest both rings; older ones never see this field.
+   */
+  heads2?: Record<string, string[]>
   /** Read/ingest watermarks per conversation (channels only). */
   cursors: Record<string, Cursor>
   /** DM section: pairToken -> SFC1-under-pair-key, base64. Hides DM activity from the team. */
@@ -352,6 +419,8 @@ export interface DmBeaconSection {
    * unknown field instead. Short ring — invites and rekeys are rare.
    */
   grpHeads?: string[]
+  /** Same rule as BeaconContent.heads2, inside the sealed section (1.3). */
+  heads2?: string[]
 }
 
 /** A device's watermarks in one conversation: event stems, plus when it last read. */

@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import type { Attachment, MsgPayload } from '@shared/types'
 import { useStore } from '@/store'
 import { formatBytes } from '@/ui/atoms'
-import { blobUrl, middleTruncate } from './parse'
+import { middleTruncate } from './parse'
+import { useBlobMedia } from './useBlobMedia'
 import { CloseIcon, DownloadIcon } from './icons'
 import './content.css'
 
 // Spec §4.1 — full-window media lightbox. Reads store.lightbox itself; renders
 // nothing when closed. Esc or click-outside closes; Save As streams from the
 // blob service.
+//
+// The media element lives in its own component below so the sfblob:// retry
+// hook runs under the rules of hooks: this one returns null when closed.
 
 function findAttachment(
   events: ReturnType<typeof useStore.getState>['events'][string] | undefined,
@@ -63,8 +68,6 @@ export function Lightbox() {
   if (!open || !att) return null
 
   const close = (): void => useStore.getState().openLightbox(null)
-  const isVideo = att.mime.startsWith('video/')
-  const url = blobUrl(att)
 
   const saveAs = (): void => {
     window.bridge.files.saveBlobAs(att.blobId, att.name).catch((err: unknown) => {
@@ -172,34 +175,91 @@ export function Lightbox() {
 
       {/* Media, centered and scaled to fit */}
       <div className="sem-lightbox-media" onClick={(e) => e.stopPropagation()} style={{ display: 'flex' }}>
-        {isVideo ? (
+        <LightboxMedia att={att} />
+      </div>
+    </div>
+  )
+}
+
+/**
+ * The picture (or video), with the same retry as the inline tile: a blob that
+ * answers 503 because the share is away — or because the app has only just
+ * relaunched — comes back on its own instead of leaving a broken frame open.
+ */
+function LightboxMedia({ att }: { att: Attachment }) {
+  const media = useBlobMedia(att)
+  const isVideo = att.mime.startsWith('video/')
+  const settling = media.phase !== 'ok'
+
+  const fit: CSSProperties = {
+    maxWidth: 'calc(100vw - 96px)',
+    maxHeight: 'calc(100vh - 128px)',
+    borderRadius: 'var(--r-md)',
+    boxShadow: 'var(--elev-3)',
+    // A failed element has no intrinsic size, so the note below would have
+    // nothing to sit on; fade it out rather than unmount it, because the `src`
+    // swap on the element that stayed is what makes the retry a new request.
+    opacity: media.phase === 'retrying' ? 0 : 1,
+  }
+
+  return (
+    <div
+      style={{
+        position: 'relative',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minWidth: settling ? 320 : undefined,
+        minHeight: settling ? 200 : undefined,
+      }}
+    >
+      {media.phase !== 'expired' &&
+        (isVideo ? (
           <video
-            src={url}
+            src={media.src}
             controls
             autoPlay
             aria-label={att.name}
-            style={{
-              maxWidth: 'calc(100vw - 96px)',
-              maxHeight: 'calc(100vh - 128px)',
-              borderRadius: 'var(--r-md)',
-              boxShadow: 'var(--elev-3)',
-            }}
+            onError={media.onError}
+            onLoadedMetadata={media.onLoad}
+            style={fit}
           />
         ) : (
           <img
-            src={url}
+            src={media.src}
             alt={att.name}
             draggable={false}
-            style={{
-              maxWidth: 'calc(100vw - 96px)',
-              maxHeight: 'calc(100vh - 128px)',
-              objectFit: 'contain',
-              borderRadius: 'var(--r-md)',
-              boxShadow: 'var(--elev-3)',
-            }}
+            onError={media.onError}
+            onLoad={media.onLoad}
+            style={{ ...fit, objectFit: 'contain' }}
           />
-        )}
-      </div>
+        ))}
+      {settling && media.phase !== 'loading' && (
+        <span
+          aria-live="polite"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            pointerEvents: 'none',
+          }}
+        >
+          <span
+            style={{
+              padding: '4px 10px',
+              borderRadius: 'var(--r-full)',
+              background: 'rgba(0, 0, 0, 0.55)',
+              color: 'rgba(255, 255, 255, 0.85)',
+              fontSize: 12,
+              lineHeight: '18px',
+            }}
+          >
+            {media.phase === 'expired' ? '🧹 this file was cleaned up by retention' : 'file service warming up'}
+          </span>
+        </span>
+      )}
     </div>
   )
 }

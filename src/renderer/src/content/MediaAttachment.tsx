@@ -1,13 +1,18 @@
-import { useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { Attachment, ConvId } from '@shared/types'
 import { useStore } from '@/store'
-import { blobUrl, fitMediaBox, formatDuration, safeThumbSrc } from './parse'
+import { fitMediaBox, formatDuration, safeThumbSrc } from './parse'
+import { useBlobMedia } from './useBlobMedia'
 import './content.css'
 
 // Spec §4.1 — inline media. The box is reserved from event metadata (w/h) so
 // nothing reflows; the embedded blurred thumb paints instantly underneath and
 // the decrypted stream (sfblob://) crossfades on top when it arrives.
+//
+// A failed stream is a *state*, not a verdict: useBlobMedia retries it on a
+// backoff (and at once when the share comes back), keeping the blurred thumb
+// and the "warming up" pill up meanwhile. Only main saying 404 — which it
+// reserves for a blob the sweep really took — turns into "cleaned up".
 
 function ScrimPill({ children, corner }: { children: string; corner: 'tl' | 'br' }) {
   const pos: CSSProperties =
@@ -50,9 +55,8 @@ export function MediaAttachment({
   /** "+N" scrim for the last visible cell of a 5+ grid. */
   overflowCount?: number
 }) {
-  const [failed, setFailed] = useState(false)
+  const media = useBlobMedia(att)
   const box = cell ?? fitMediaBox(att.w, att.h)
-  const url = blobUrl(att)
   const isVideo = att.mime.startsWith('video/')
   const isGif = att.mime === 'image/gif'
 
@@ -100,18 +104,22 @@ export function MediaAttachment({
     return (
       <div style={frame}>
         {thumbLayer}
-        {failed ? (
-          <WarmingUp />
-        ) : (
+        {media.phase !== 'expired' && (
           <video
-            src={url}
+            src={media.src}
             controls
             preload="metadata"
             aria-label={att.name}
-            onError={() => setFailed(true)}
-            style={{ ...fill, background: 'transparent' }}
+            onError={media.onError}
+            onLoadedMetadata={media.onLoad}
+            // Hidden rather than unmounted while a retry is in flight: the
+            // element that keeps its place is the one whose `src` swap is a
+            // new request, and a broken <video> paints its own error chrome.
+            style={{ ...fill, background: 'transparent', opacity: media.phase === 'retrying' ? 0 : 1 }}
           />
         )}
+        {media.phase === 'retrying' && <WarmingUp />}
+        {media.phase === 'expired' && <CleanedUp />}
         {att.durMs !== undefined && <ScrimPill corner="br">{formatDuration(att.durMs)}</ScrimPill>}
       </div>
     )
@@ -127,19 +135,28 @@ export function MediaAttachment({
       style={{ ...frame, cursor: 'zoom-in' }}
     >
       {thumbLayer}
-      {failed ? (
-        <WarmingUp />
-      ) : isVideo ? (
-        <video src={url} muted preload="metadata" onError={() => setFailed(true)} style={fill} />
-      ) : (
-        <img
-          src={url}
-          alt={att.name}
-          draggable={false}
-          onError={() => setFailed(true)}
-          style={fill}
-        />
-      )}
+      {media.phase !== 'expired' &&
+        (isVideo ? (
+          <video
+            src={media.src}
+            muted
+            preload="metadata"
+            onError={media.onError}
+            onLoadedMetadata={media.onLoad}
+            style={{ ...fill, opacity: media.phase === 'retrying' ? 0 : 1 }}
+          />
+        ) : (
+          <img
+            src={media.src}
+            alt={att.name}
+            draggable={false}
+            onError={media.onError}
+            onLoad={media.onLoad}
+            style={{ ...fill, opacity: media.phase === 'retrying' ? 0 : 1 }}
+          />
+        ))}
+      {media.phase === 'retrying' && <WarmingUp />}
+      {media.phase === 'expired' && <CleanedUp />}
       {isGif && <ScrimPill corner="tl">GIF</ScrimPill>}
       {isVideo && att.durMs !== undefined && (
         <ScrimPill corner="br">{formatDuration(att.durMs)}</ScrimPill>
@@ -166,11 +183,12 @@ export function MediaAttachment({
   )
 }
 
-/** Honest fallback while the sfblob service is not streaming yet. */
-function WarmingUp() {
+/** Honest fallback while the sfblob service is not streaming yet — and while a retry is pending. */
+export function WarmingUp() {
   return (
     <span
       className="sem-shimmer"
+      aria-live="polite"
       style={{
         position: 'absolute',
         inset: 0,
@@ -178,6 +196,7 @@ function WarmingUp() {
         alignItems: 'flex-end',
         justifyContent: 'center',
         paddingBottom: 8,
+        pointerEvents: 'none',
       }}
     >
       <span
@@ -193,6 +212,37 @@ function WarmingUp() {
       >
         file service warming up
       </span>
+    </span>
+  )
+}
+
+/**
+ * The blob is gone: main answered 404, which it now says only for a file the
+ * media sweep actually took — never for a share it could not reach.
+ */
+export function CleanedUp() {
+  return (
+    <span
+      style={{
+        position: 'absolute',
+        inset: 0,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'var(--bg-raised)',
+        color: 'var(--text-3)',
+        fontSize: 12,
+        padding: 12,
+        textAlign: 'center',
+        pointerEvents: 'none',
+      }}
+    >
+      <span aria-hidden style={{ fontSize: 18 }}>
+        🧹
+      </span>
+      this file was cleaned up by retention
     </span>
   )
 }
